@@ -27,6 +27,7 @@ import {
   unstampDelivery,
 } from "./chat-messages.js";
 import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
+import { normalizeOwnerStatus } from "./owner-status.js";
 import { applyDraftWrite, pruneSentDrafts } from "./review-drafts.js";
 import { EXCALIDRAW_SCENE_TARGET_TYPE, normalizeExcalidrawSceneTarget } from "./whiteboard-core.js";
 
@@ -154,6 +155,11 @@ export class SessionStore {
       // Compact prompt_id acks for bubbles evicted by the stored-chat byte bound. Reopening
       // must keep them: they are the settlement/dedup source once the visible entry is gone.
       chat_ack_ids: Array.isArray(existing.chat_ack_ids) ? existing.chat_ack_ids : [],
+      // What the review's owner last said about itself (src/owner-status.js). A reopen keeps it:
+      // the supervisor that set it is still the one vouching for the board.
+      ...(existing.owner_status && typeof existing.owner_status === "object"
+        ? { owner_status: existing.owner_status }
+        : {}),
       // The reviewer's unsent notes (src/review-drafts.js). Reopening must keep them: restoring
       // them in the reopened review is the point of storing them.
       ...(existing.drafts && typeof existing.drafts === "object" ? { drafts: existing.drafts } : {}),
@@ -351,6 +357,21 @@ export class SessionStore {
     session.updated_at = new Date().toISOString();
     await this.writeState(state);
     return { ...session, fresh_feedback: !restoring && acceptedPrompts.length > 0 };
+  }
+
+  // Record (or, for `{ clear: true }`, remove) the owner's statement about itself. Throws
+  // OwnerStatusError for an invalid write; returns null for an unknown session.
+  async setOwnerStatus(key, input) {
+    const record = normalizeOwnerStatus(input);
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      if (record) session.owner_status = record;
+      else delete session.owner_status;
+      await this.writeState(state);
+      return session;
+    });
   }
 
   // One tab's unsent notes and open-card text, mirrored from the chrome as they change

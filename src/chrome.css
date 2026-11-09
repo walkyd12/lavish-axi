@@ -169,6 +169,50 @@ body.lavish {
 .spacer {
   flex: 1;
 }
+/* Who is there to read what the reviewer sends: the review's owner as its supervisor reports it,
+   else Lavish's own poll presence, else that the server itself is gone. Words carry the state;
+   the dot only repeats it. */
+.presence-pill {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 320px;
+  padding: 3px 10px;
+  border: var(--hairline);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+.presence-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.presence-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: var(--fg-label);
+}
+.presence-pill[data-tone="up"] .presence-dot {
+  background: var(--sage-300);
+}
+.presence-pill[data-tone="busy"] .presence-dot {
+  background: var(--accent);
+}
+.presence-pill[data-tone="down"] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.presence-pill[data-tone="down"] .presence-dot {
+  background: var(--danger);
+}
 .annotate-switch {
   display: inline-flex;
   align-items: center;
@@ -560,6 +604,17 @@ body.lavish {
   height: 8px;
   border-radius: var(--radius-pill);
   background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg-bar);
+}
+.sidebar-toggle.is-alert::after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--danger);
   box-shadow: 0 0 0 2px var(--bg-bar);
 }
 .menu {
@@ -1738,6 +1793,10 @@ body.layout-gate-active iframe#artifact {
   .brand-support {
     display: none;
   }
+  .presence-pill {
+    padding: 3px 8px;
+    font-size: 11px;
+  }
   .warnings-drawer {
     position: fixed;
     top: calc(var(--bar-h) + 6px);
@@ -1864,6 +1923,29 @@ body.layout-gate-active iframe#artifact {
   .panel-summary.is-accent {
     color: var(--accent);
     font-weight: var(--w-semi);
+  }
+  /* Trouble the closed sheet would otherwise hide: a failed send, a stopped server. */
+  .panel-summary.is-alert {
+    color: var(--danger);
+    font-weight: var(--w-semi);
+  }
+  .panel-summary.is-warn {
+    color: var(--accent);
+    font-weight: var(--w-semi);
+  }
+  .panel-summary.is-alert::before,
+  .panel-summary.is-warn::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-right: 6px;
+    border-radius: var(--radius-pill);
+    background: currentColor;
+    vertical-align: 1px;
+  }
+  body:not(.sheet-open) .panel-head.has-alert {
+    box-shadow: inset 0 2px 0 var(--danger);
   }
   .panel-summary.is-unread::before {
     content: "";

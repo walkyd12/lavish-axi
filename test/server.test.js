@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { on, once } from "node:events";
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect } from "node:net";
 import { homedir, networkInterfaces, tmpdir } from "node:os";
@@ -1573,7 +1573,7 @@ test("Tailscale mode binds concrete listeners, serves the MagicDNS link, and tea
       headers: { accept: "text/html" },
     });
     assert.equal(landing.status, 200);
-    assert.match(landing.body, /Lavish Editor is running/);
+    assert.match(landing.body, /Your boards\./);
 
     const shutdown = await rawRequest(server.port, "/shutdown", {
       method: "POST",
@@ -3546,6 +3546,214 @@ test("/chrome-client.js serves the extracted chrome client script", async () => 
   }
 });
 
+// The board's presence pill: a supervisor relaying this review to another agent says whether
+// that owner is there. Display state only - it must not need the chrome's origin (the CLI calls it
+// header-less), but a foreign page must not be able to set it.
+test("owner status is set by file or key, validated, broadcast live, and served to the chrome", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    const post = (route, body, headers = {}) =>
+      fetch(`${base}${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body),
+      });
+
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/events/${key}`, { origin: base });
+    const messages = on(socket, "message");
+    const nextOfType = async (type) => {
+      for (;;) {
+        const message = JSON.parse(String((await messages.next()).value[0]));
+        if (message.type === type) return message.data;
+      }
+    };
+    await once(socket, "open");
+    assert.deepEqual(await nextOfType("owner-status"), { owner: null });
+
+    assert.equal((await post("/api/owner", { file: artifact, state: "asleep" })).status, 400);
+    assert.equal((await post("/api/owner", { file: artifact, state: "live", ttl_seconds: 0 })).status, 400);
+    assert.equal((await post("/api/owner", { file: path.join(dir, "missing.html"), state: "live" })).status, 404);
+    assert.equal((await post(`/api/0000000000000000/owner`, { state: "live" })).status, 404);
+    assert.equal(
+      (await post(`/api/${key}/owner`, { state: "live" }, { origin: "https://evil.example" })).status,
+      403,
+      "a foreign page cannot claim someone is watching",
+    );
+
+    const set = await post("/api/owner", {
+      file: artifact,
+      state: "live",
+      label: "task\nlavish-fork-hub",
+      detail: "relayed by the supervisor",
+      ttl_seconds: 120,
+    });
+    assert.equal(set.status, 200);
+    const owner = (await set.json()).owner;
+    assert.equal(owner.state, "live");
+    assert.equal(owner.label, "task lavish-fork-hub", "control characters never reach the pill");
+    assert.equal(owner.stale, false);
+    assert.ok(owner.expires_in_ms > 100_000 && owner.expires_in_ms <= 120_000);
+    assert.equal((await nextOfType("owner-status")).owner.state, "live");
+
+    const page = chromeSessionData(await fetch(`${base}/session/${key}`).then((response) => response.text()));
+    assert.equal(page.initialOwnerStatus.label, "task lavish-fork-hub");
+
+    assert.equal((await post(`/api/${key}/owner`, { state: "finished", detail: "handed to first mate" })).status, 200);
+    assert.equal((await nextOfType("owner-status")).owner.state, "finished");
+
+    assert.equal((await post(`/api/${key}/owner`, { clear: true })).status, 200);
+    assert.deepEqual(await nextOfType("owner-status"), { owner: null });
+    await messages.return();
+    socket.close();
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// The hub: the front page lists every board with a computed state and closes, reopens and shows
+// the conversation of any of them; closing runs the operator's end hook so a closed board's copy
+// and conversation can be kept.
+test("the hub lists boards with their state, closes and reopens them, and runs the end hook", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-hub-"));
+  const live = path.join(dir, "live.html");
+  const quiet = path.join(dir, "quiet.html");
+  const gone = path.join(dir, "gone.html");
+  for (const file of [live, quiet, gone]) {
+    await writeFile(
+      file,
+      `<!doctype html><html><head><title>${path.basename(file)} title</title></head><body></body></html>`,
+    );
+  }
+  const hookLog = path.join(dir, "hook.log");
+  const hook = path.join(dir, "on-end.sh");
+  await writeFile(hook, `#!/bin/sh\necho "$1|$2|$3|$4|$LAVISH_AXI_ENDED_KEY" >> "${hookLog}"\n`);
+  await chmod(hook, 0o755);
+  const previousHook = process.env.LAVISH_AXI_ON_END;
+  process.env.LAVISH_AXI_ON_END = hook;
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const open = (file) =>
+      fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file }),
+      }).then((response) => response.json());
+    const liveKey = (await open(live)).key;
+    const quietKey = (await open(quiet)).key;
+    await open(gone);
+    await rm(gone);
+    await fetch(`${base}/api/${liveKey}/owner`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ state: "live", label: "task 42" }),
+    });
+    await fetch(`${base}/api/${quietKey}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ prompts: [{ prompt: "Tighten the intro", tag: "message", prompt_id: "n1" }] }),
+    });
+
+    const page = await fetch(`${base}/`);
+    assert.equal(page.status, 200);
+    assert.equal(page.headers.get("x-frame-options"), "DENY");
+    const html = await page.text();
+    assert.match(html, /Your boards\./);
+    assert.match(html, /<script src="\/hub-client\.js"><\/script>/);
+    assert.equal((await fetch(`${base}/hub-client.js`)).status, 200);
+    assert.equal((await fetch(`${base}/hub.css`)).status, 200);
+
+    const hub = await fetch(`${base}/api/hub`).then((response) => response.json());
+    const byTitle = Object.fromEntries(hub.boards.map((board) => [board.title, board]));
+    assert.equal(byTitle["live.html title"].state, "taking-input");
+    assert.equal(byTitle["live.html title"].owner.label, "task 42");
+    assert.equal(byTitle["quiet.html title"].state, "unread");
+    assert.equal(byTitle["quiet.html title"].notes, 1);
+    assert.equal(byTitle.gone.state, "file-gone", "a deleted board falls back to its file name");
+    assert.deepEqual(
+      hub.boards.map((board) => board.state),
+      ["taking-input", "unread", "file-gone"],
+    );
+
+    // Closing is the hub page's alone: a foreign page or a header-less caller cannot.
+    const close = (headers) => fetch(`${base}/api/hub/${quietKey}/close`, { method: "POST", headers });
+    assert.equal((await close({ origin: "https://evil.example" })).status, 403);
+    assert.equal((await close({})).status, 403);
+    assert.equal(
+      (await fetch(`${base}/api/hub/0000000000000000/close`, { method: "POST", headers: { origin: base } })).status,
+      404,
+    );
+    // Closing every open board must not stop the server under the hub that is showing them.
+    assert.equal((await close({ origin: base })).status, 200);
+    assert.equal(
+      (await fetch(`${base}/api/hub/${liveKey}/close`, { method: "POST", headers: { origin: base } })).status,
+      200,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await fetch(`${base}/health`)).status, 200, "the server is still up");
+    const closed = await fetch(`${base}/api/hub`).then((response) => response.json());
+    assert.deepEqual(
+      closed.boards.filter((board) => board.status === "ended").map((board) => [board.title, board.state]),
+      [
+        ["live.html title", "closed-user"],
+        ["quiet.html title", "closed-user"],
+      ],
+    );
+
+    // The end hook ran for each close, with the file, key, who ended it, and the loopback base.
+    const deadline = Date.now() + 5000;
+    let hookLines = [];
+    while (Date.now() < deadline) {
+      hookLines = (await readFile(hookLog, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+      if (hookLines.length >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const quietReal = await realpath(quiet);
+    assert.ok(
+      hookLines.includes(`${quietReal}|${quietKey}|user|http://127.0.0.1:${server.port}|${quietKey}`),
+      hookLines.join("\n"),
+    );
+
+    // The conversation stays readable after the close, as JSON and as Markdown.
+    const conversation = await fetch(`${base}/api/${quietKey}/conversation`).then((response) => response.json());
+    assert.equal(conversation.status, "ended");
+    assert.equal(conversation.ended_by, "user");
+    assert.deepEqual(
+      conversation.chat.map((entry) => [entry.role, entry.text]),
+      [["user", "Tighten the intro"]],
+    );
+    const markdown = await fetch(`${base}/api/${quietKey}/conversation?format=markdown`);
+    assert.match(markdown.headers.get("content-type") || "", /text\/markdown/);
+    assert.match(await markdown.text(), /> Tighten the intro/);
+    assert.equal((await fetch(`${base}/api/0000000000000000/conversation`)).status, 404);
+
+    // Reopen goes through the ordinary explicit-reopen path.
+    const reopened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ file: quiet, reopen: true }),
+    }).then((response) => response.json());
+    assert.equal(reopened.status, "opened");
+    const after = await fetch(`${base}/api/hub`).then((response) => response.json());
+    assert.equal(after.boards.find((board) => board.key === quietKey).status, "open");
+  } finally {
+    if (previousHook === undefined) delete process.env.LAVISH_AXI_ON_END;
+    else process.env.LAVISH_AXI_ON_END = previousHook;
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("event WebSocket preserves initial state and named live-event semantics", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
@@ -3567,6 +3775,7 @@ test("event WebSocket preserves initial state and named live-event semantics", a
       data: { chat: [], ack_ids: [], chat_revision: 0 },
     });
     assert.deepEqual(await nextMessage(), { type: "agent-presence", data: { state: "waiting" } });
+    assert.deepEqual(await nextMessage(), { type: "owner-status", data: { owner: null } });
 
     const reply = await fetch(`${base}/api/${opened.key}/agent-reply`, {
       method: "POST",

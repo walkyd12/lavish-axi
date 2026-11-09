@@ -209,6 +209,22 @@ let annotationOverridden = false;
 let annotationDefaultReceived = false;
 let ended = false;
 let agentPresence = "waiting";
+// The presence pill reads state declared further down this file, so it stays quiet until boot.
+let presencePillReady = false;
+const OWNER_STATES = ["live", "working", "finished", "gone"];
+/** @type {{ state: string, label: string, detail: string, updated_at: string, stale: boolean } | null} */
+let ownerStatus = null;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let ownerStatusStaleTimer;
+// The server said it was stopping, or its live stream has stayed down: nobody can receive a send.
+let serverStopped = false;
+// The phone dock and the collapsed desktop toggle summarize trouble the open panel would show,
+// because on a phone the panel is a closed sheet and its warnings are otherwise invisible. The
+// summary reads state declared further down this file, so it stays quiet until boot reaches it.
+let dockSummaryReady = false;
+let lastDockAlertText = "";
+let handoffSupersededVisible = false;
+let chromeOutdatedVisible = false;
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -974,6 +990,7 @@ function showSendHint(message = DEFAULT_SEND_HINT, holdMs = 2600, focusInput = t
   clearTimeout(sendHintTimer);
   sendHintPersistent = holdMs === null;
   sendHint.classList.toggle("persistent", sendHintPersistent);
+  renderSheetSummary();
   if (sendHintPersistent) {
     sendHintTimer = undefined;
     if (focusInput) chatInput.focus();
@@ -995,6 +1012,7 @@ function hideSendHint(force = false) {
   sendHint.classList.remove("persistent");
   sendHintPersistent = false;
   sendAcknowledgementWarningVisible = false;
+  renderSheetSummary();
 }
 
 function armSendAcknowledgementWarning() {
@@ -1004,6 +1022,7 @@ function armSendAcknowledgementWarning() {
     if (pendingAcknowledgements.size > 0 && !sendFailureOwner) {
       sendAcknowledgementWarningVisible = true;
       showSendHint(SEND_STALLED_COPY, null, false);
+      renderSheetSummary();
     }
   }, SEND_ACKNOWLEDGEMENT_WARNING_MS);
 }
@@ -1012,6 +1031,7 @@ function clearSendAcknowledgementWarning() {
   clearTimeout(sendAcknowledgementTimer);
   sendAcknowledgementTimer = undefined;
   sendAcknowledgementWarningVisible = false;
+  renderSheetSummary();
 }
 
 function showQueuedSendFailure(message = SEND_FAILED_COPY, owner = null) {
@@ -1303,11 +1323,13 @@ function syncChat(chat, revision) {
   for (const note of retiredDraftNodes) chatLog.appendChild(note);
   const anchor = retiredDraftNodes[retiredDraftNodes.length - 1] || workingBubble || lastChatBubble;
   if (anchor) scrollElementIntoView(anchor);
+  renderSheetSummary();
   return true;
 }
 
 function setAgentPresence(state) {
   agentPresence = state === "listening" || state === "external" || state === "working" ? state : "waiting";
+  renderPresencePill();
   updateSendState();
   renderSheetSummary();
   refreshUnseenReceipts();
@@ -1330,8 +1352,78 @@ function setAgentPresence(state) {
   scrollElementIntoView(workingBubble);
 }
 
+// ---- Presence pill ----
+// The top bar says who is there to read what the reviewer sends. A supervisor that relays this
+// review to another agent reports that owner through `lavish-axi owner` (src/owner-status.js);
+// without one the pill shows Lavish's own poll presence. A server that is gone outranks both.
+const presencePill = /** @type {HTMLSpanElement | null} */ (document.getElementById("presencePill"));
+const presencePillText = /** @type {HTMLSpanElement | null} */ (document.getElementById("presencePillText"));
+
+function setOwnerStatus(owner) {
+  clearTimeout(ownerStatusStaleTimer);
+  ownerStatusStaleTimer = undefined;
+  if (!owner || typeof owner !== "object" || !OWNER_STATES.includes(owner.state)) {
+    ownerStatus = null;
+  } else {
+    ownerStatus = {
+      state: owner.state,
+      label: String(owner.label || ""),
+      detail: String(owner.detail || ""),
+      updated_at: String(owner.updated_at || ""),
+      stale: owner.stale === true,
+    };
+    // The lapse is counted on this page's clock from the server's remaining time, so the two
+    // clocks never have to agree.
+    const remaining = Number(owner.expires_in_ms);
+    if (!ownerStatus.stale && owner.expires_in_ms !== null && Number.isFinite(remaining)) {
+      ownerStatusStaleTimer = setTimeout(
+        () => {
+          ownerStatusStaleTimer = undefined;
+          if (ownerStatus) ownerStatus.stale = true;
+          renderPresencePill();
+        },
+        Math.min(Math.max(0, remaining), 2_147_483_647),
+      );
+    }
+  }
+  renderPresencePill();
+}
+
+function presencePillState() {
+  if (ended) return { tone: "off", text: "Session ended", title: "" };
+  if (serverStopped || liveEventFailures >= LIVE_EVENT_UNREACHABLE_FAILURES) {
+    return { tone: "down", text: "Lavish offline", title: "This page cannot reach the Lavish server." };
+  }
+  if (ownerStatus) {
+    const name = ownerStatus.label || "Owner";
+    const since = ownerStatus.updated_at
+      ? "Last update " + new Date(ownerStatus.updated_at).toLocaleString() + "."
+      : "";
+    const title = [ownerStatus.detail, since].filter(Boolean).join(" ");
+    if (ownerStatus.stale) return { tone: "off", text: name + " · not heard from", title };
+    if (ownerStatus.state === "live") return { tone: "up", text: name + " · live", title };
+    if (ownerStatus.state === "working") return { tone: "busy", text: name + " · working", title };
+    if (ownerStatus.state === "finished") return { tone: "off", text: name + " · finished", title };
+    return { tone: "down", text: name + " · gone", title };
+  }
+  if (agentPresence === "listening") return { tone: "up", text: "Agent listening", title: "" };
+  if (agentPresence === "external") return { tone: "up", text: "Listener active", title: "" };
+  if (agentPresence === "working") return { tone: "busy", text: "Agent working", title: "" };
+  return { tone: "off", text: "No agent listening", title: "Notes you send wait on the server for the next poll." };
+}
+
+function renderPresencePill() {
+  if (!presencePillReady || !presencePill || !presencePillText) return;
+  const state = presencePillState();
+  presencePill.dataset.tone = state.tone;
+  presencePillText.textContent = state.text;
+  presencePill.title = state.title || state.text;
+}
+
 function setHandoffSuperseded(visible) {
   if (handoffBanner) handoffBanner.hidden = ended || !visible;
+  handoffSupersededVisible = !ended && Boolean(visible);
+  renderSheetSummary();
 }
 
 // The server this page was connected to went away. What is true beyond that depends on why, so
@@ -1356,6 +1448,11 @@ function setChromeOutdated(visible, reason = chromeOutdatedReason) {
   outdatedReloadInFlight = false;
   if (outdatedReloadButton) outdatedReloadButton.disabled = false;
   if (outdatedBanner) outdatedBanner.hidden = ended || !visible;
+  // An upgrade or local build replaced the server, which is running; any other shutdown left none.
+  serverStopped = Boolean(visible) && chromeOutdatedReason !== "upgrade" && chromeOutdatedReason !== "local-build";
+  renderPresencePill();
+  chromeOutdatedVisible = !ended && Boolean(visible);
+  renderSheetSummary();
 }
 
 function setReviewState(state) {
@@ -1457,12 +1554,174 @@ function scrollPanelToBottom() {
   panelScroll.scrollTop = panelScroll.scrollHeight;
 }
 
+// ---- Layout lock ----
+// chrome.css picks the phone layout by viewport width alone. A phone that reports a desktop-width
+// viewport - "Desktop site" / "Request Desktop Website", or an in-app browser that defaults to it -
+// got the side-by-side desktop layout shrunk onto a phone screen, with a conversation column too
+// small to read. So a touch phone gets the phone layout whatever width it reports, a link can ask
+// for one with `?layout=phone|desktop|auto`, and the More menu offers a toggle remembered on the
+// device. A forced layout rewrites the width conditions of chrome.css's own media rules, so the
+// stylesheet stays the one source of the layouts' geometry.
+const MOBILE_SHEET_MAX_PX = 860;
+const LAYOUT_STORAGE_KEY = "lavish-axi:layout";
+// A phone's short screen side is at most this many CSS px; tablets start well above it.
+const PHONE_SCREEN_MAX_PX = 600;
+// Below this ratio the browser is already close enough to the device width to need no zoom.
+const LAYOUT_ZOOM_MIN = 1.15;
+const LAYOUT_ZOOM_MAX = 4;
+const layoutToggle = /** @type {HTMLButtonElement | null} */ (document.getElementById("layoutToggle"));
+const layoutToggleText = /** @type {HTMLSpanElement | null} */ (document.getElementById("layoutToggleText"));
+// The link's request wins for this page until the user picks a layout from the menu.
+let layoutOverride = readLayoutQuery();
+let layoutPreference = readLayoutPreference();
+/** @type {{ rule: any, original: string }[] | null} */
+let breakpointRules = null;
+let appliedLayout = "";
+let layoutZoom = 1;
+
+function readLayoutQuery() {
+  try {
+    const value = new URLSearchParams(String(location.search || "")).get("layout");
+    return value === "phone" || value === "desktop" || value === "auto" ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+function readLayoutPreference() {
+  try {
+    const value = localStorage.getItem(LAYOUT_STORAGE_KEY);
+    return value === "phone" || value === "desktop" ? value : "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+function mediaMatches(query) {
+  return typeof window.matchMedia === "function" && Boolean(window.matchMedia(query)?.matches);
+}
+
+// A touch-first device with a phone-sized screen. `screen` reports the device, not the layout
+// viewport, so this holds when the browser asks for a desktop page.
+function isTouchPhone() {
+  const screenInfo = window.screen;
+  const shortSide = Math.min(Number(screenInfo?.width) || 0, Number(screenInfo?.height) || 0);
+  return shortSide > 0 && shortSide <= PHONE_SCREEN_MAX_PX && mediaMatches("(pointer: coarse)");
+}
+
+function layoutMode() {
+  return layoutOverride || layoutPreference;
+}
+
+// "phone" or "desktop" when the layout is locked, "" when the viewport width decides.
+function resolvedLayout() {
+  const mode = layoutMode();
+  if (mode === "phone" || mode === "desktop") return mode;
+  return isTouchPhone() ? "phone" : "";
+}
+
+function chromeBreakpointRules() {
+  if (breakpointRules) return breakpointRules;
+  const found = [];
+  const visit = (rules) => {
+    for (const rule of Array.from(rules || [])) {
+      const media = /** @type {any} */ (rule).media;
+      if (media && typeof media.mediaText === "string" && /\(max-width:\s*\d+px\)/.test(media.mediaText)) {
+        found.push({ rule, original: media.mediaText });
+      }
+      if (/** @type {any} */ (rule).cssRules) visit(/** @type {any} */ (rule).cssRules);
+    }
+  };
+  for (const sheet of Array.from(document.styleSheets || [])) {
+    if (!/\/chrome\.css(?:[?#]|$)/.test(String(sheet.href || ""))) continue;
+    try {
+      visit(sheet.cssRules);
+    } catch {
+      // An unreadable sheet keeps its own media rules; the lock then only affects the JS layout.
+    }
+  }
+  breakpointRules = found;
+  return found;
+}
+
+// Each `(max-width: Npx)` becomes always-true or never-true for a locked layout. The phone lock keeps
+// the narrower refinements (640px, 320px) honest against the width the page is laid out at.
+function lockedMediaText(original, layout, width) {
+  return original.replace(/\(max-width:\s*(\d+)px\)/g, (_match, px) => {
+    const limit = Number(px);
+    const matches = layout === "phone" && (limit >= MOBILE_SHEET_MAX_PX || width <= limit);
+    return matches ? "(min-width: 0px)" : "(max-width: 0px)";
+  });
+}
+
+// A phone showing a desktop-width viewport scales the whole page down to fit; zoom the chrome back
+// up so the phone layout reads at phone size.
+function phoneLayoutZoom() {
+  const viewportWidth = Number(window.innerWidth) || 0;
+  if (viewportWidth <= MOBILE_SHEET_MAX_PX) return 1;
+  const screenInfo = window.screen;
+  const width = Number(screenInfo?.width) || 0;
+  const height = Number(screenInfo?.height) || 0;
+  const landscape = viewportWidth > (Number(window.innerHeight) || 0);
+  const deviceWidth = landscape ? Math.max(width, height) : Math.min(width, height);
+  if (!(deviceWidth > 0)) return 1;
+  const zoom = viewportWidth / deviceWidth;
+  return zoom >= LAYOUT_ZOOM_MIN ? Math.min(zoom, LAYOUT_ZOOM_MAX) : 1;
+}
+
+function applyLayoutLock() {
+  const layout = resolvedLayout();
+  // Only a phone needs the zoom: a desktop that asks for the phone layout lays it out at its own size.
+  const zoom = layout === "phone" && isTouchPhone() ? phoneLayoutZoom() : 1;
+  const root = document.documentElement;
+  if (root?.style && zoom !== layoutZoom) root.style.zoom = zoom === 1 ? "" : String(Math.round(zoom * 1000) / 1000);
+  layoutZoom = zoom;
+  const width = (Number(window.innerWidth) || 0) / zoom;
+  for (const { rule, original } of chromeBreakpointRules()) {
+    const next = layout ? lockedMediaText(original, layout, width) : original;
+    if (rule.media.mediaText !== next) rule.media.mediaText = next;
+  }
+  if (root?.dataset) {
+    if (layout) root.dataset.lavishLayout = layout;
+    else delete root.dataset.lavishLayout;
+  }
+  appliedLayout = layout;
+  renderLayoutToggle();
+}
+
+function renderLayoutToggle() {
+  if (!layoutToggleText) return;
+  const mode = layoutMode();
+  if (mode === "phone") layoutToggleText.textContent = "Layout: Phone";
+  else if (mode === "desktop") layoutToggleText.textContent = "Layout: Desktop";
+  else layoutToggleText.textContent = appliedLayout === "phone" ? "Layout: Auto (phone)" : "Layout: Auto";
+}
+
+// Auto, then Phone, then Desktop. The choice is the viewer's, so it is kept per device for every
+// review, like the desktop panel collapse.
+function cycleLayoutPreference() {
+  const order = ["auto", "phone", "desktop"];
+  const next = order[(order.indexOf(layoutMode()) + 1) % order.length];
+  layoutOverride = "";
+  layoutPreference = next;
+  try {
+    if (next === "auto") localStorage.removeItem(LAYOUT_STORAGE_KEY);
+    else localStorage.setItem(LAYOUT_STORAGE_KEY, next);
+  } catch {
+    // Storage refused: the choice still applies to this page.
+  }
+  applyLayoutLock();
+  onLayoutChange();
+}
+
+applyLayoutLock();
+
 // ---- Phone-width conversation sheet ----
 // Below this width chrome.css turns the conversation panel into a dock the user raises as a
 // bottom sheet over the artifact. This controller owns intent, accessibility state, gestures,
 // visual-viewport measurements, and the dock summary; CSS owns the geometry. The query must match
 // the one chrome.css lays the sheet out under.
-const MOBILE_SHEET_MEDIA = "(max-width: 860px)";
+const MOBILE_SHEET_MEDIA = "(max-width: " + MOBILE_SHEET_MAX_PX + "px)";
 // How far a drag on the dock must travel before it counts as a gesture rather than a tap.
 const SHEET_DRAG_THRESHOLD_PX = 48;
 const sheetStorageKey = "lavish-axi:sheet-open:" + key;
@@ -1486,6 +1745,7 @@ function readSheetOpen() {
 }
 
 function isMobileSheet() {
+  if (appliedLayout) return appliedLayout === "phone";
   return Boolean(sheetMedia && sheetMedia.matches);
 }
 
@@ -1526,24 +1786,68 @@ function applySheetState() {
 
 // What the closed dock says. One line, most actionable state first: work the user has queued,
 // then a reply they have not seen, then whether the agent is there to receive a send.
-function sheetSummary() {
-  if (ended) return { text: "Session ended", accent: false, unread: false };
-  if (queued.length > 0) {
-    return { text: queued.length === 1 ? "1 queued" : queued.length + " queued", accent: true, unread: false };
+// Trouble the reviewer has to act on, in priority order. Each one is also shown in full inside the
+// panel; this is the one-line version for when the panel is closed.
+function dockAlert() {
+  if (ended) return null;
+  const serverReplaced = chromeOutdatedReason === "upgrade" || chromeOutdatedReason === "local-build";
+  const outdatedVisible = chromeOutdatedVisible;
+  if ((outdatedVisible && !serverReplaced) || liveEventFailures >= LIVE_EVENT_UNREACHABLE_FAILURES) {
+    return { text: chromeOutdatedReason === "stop" ? "Lavish stopped" : "Lavish unreachable", level: "error" };
   }
-  if (unreadAgentReply) return { text: unreadAgentReply, accent: false, unread: true };
-  if (agentPresence === "working") return { text: "Agent is working…", accent: false, unread: false };
-  if (agentPresence === "external") return { text: "External listener active", accent: false, unread: false };
-  if (agentPresence === "listening") return { text: "Agent listening", accent: false, unread: false };
-  return { text: "Agent not listening", accent: false, unread: false };
+  if (sendHintPersistent && !sendAcknowledgementWarningVisible) return { text: "Could not send", level: "error" };
+  if (sendAcknowledgementWarningVisible) return { text: "Still sending…", level: "warn" };
+  if (outdatedVisible) return { text: "Lavish updated · reload", level: "warn" };
+  if (handoffSupersededVisible) return { text: "Open in another tab", level: "warn" };
+  return null;
+}
+
+// A sent note no agent has picked up yet, while nothing is listening: the panel says so on each
+// bubble, and the closed dock must not read as if all is well.
+function hasUnseenSentNotes() {
+  return displayedChat.some((entry) => entry?.role === "user" && hasReceipt(entry) && !entry.delivered_at);
+}
+
+function sheetSummary() {
+  if (ended) return { text: "Session ended", accent: false, unread: false, alert: "" };
+  const alert = dockAlert();
+  if (alert) {
+    const count = queued.length;
+    const suffix = count === 0 ? "" : count === 1 ? " · 1 queued" : " · " + count + " queued";
+    return { text: alert.text + suffix, accent: false, unread: false, alert: alert.level };
+  }
+  if (queued.length > 0) {
+    return {
+      text: queued.length === 1 ? "1 queued" : queued.length + " queued",
+      accent: true,
+      unread: false,
+      alert: "",
+    };
+  }
+  if (unreadAgentReply) return { text: unreadAgentReply, accent: false, unread: true, alert: "" };
+  if (agentPresence === "working") return { text: "Agent is working…", accent: false, unread: false, alert: "" };
+  if (agentPresence === "external") {
+    return { text: "External listener active", accent: false, unread: false, alert: "" };
+  }
+  if (agentPresence === "listening") return { text: "Agent listening", accent: false, unread: false, alert: "" };
+  if (hasUnseenSentNotes()) return { text: "Sent · no agent listening", accent: false, unread: false, alert: "warn" };
+  return { text: "Agent not listening", accent: false, unread: false, alert: "" };
 }
 
 function renderSheetSummary() {
+  if (!dockSummaryReady) return;
   const summary = sheetSummary();
   panelSummary.textContent = summary.text;
   panelSummary.classList.toggle("is-accent", summary.accent);
   panelSummary.classList.toggle("is-unread", summary.unread);
-  renderSidebarToggle();
+  panelSummary.classList.toggle("is-alert", summary.alert === "error");
+  panelSummary.classList.toggle("is-warn", summary.alert === "warn");
+  panelHead.classList.toggle("has-alert", summary.alert === "error");
+  // A newly raised problem pulses the closed dock once, like a reply does.
+  const alertText = summary.alert ? summary.text : "";
+  if (alertText && alertText !== lastDockAlertText) pulseSheetDock();
+  lastDockAlertText = alertText;
+  renderSidebarToggle(summary);
 }
 
 // A brief pulse on the dock when something the user should notice lands while the sheet is
@@ -1571,8 +1875,9 @@ function syncVisualViewport() {
   const root = document.documentElement;
   if (!root || !root.style || typeof root.style.setProperty !== "function") return;
   const viewport = window.visualViewport;
-  const height = viewport ? viewport.height : window.innerHeight;
-  const top = viewport ? viewport.offsetTop : 0;
+  // The visual viewport is measured outside the layout zoom, and these lengths are used inside it.
+  const height = (viewport ? viewport.height : window.innerHeight) / layoutZoom;
+  const top = (viewport ? viewport.offsetTop : 0) / layoutZoom;
   if (!(height > 0)) return;
   root.style.setProperty("--vv-height", Math.round(height) + "px");
   root.style.setProperty("--vv-top", Math.round(Math.max(0, top || 0)) + "px");
@@ -1631,8 +1936,34 @@ panelHead.addEventListener("pointercancel", (event) => {
   clearSheetDrag();
   suppressSheetClick = false;
 });
+// The phone layout was entered or left, by a viewport crossing the breakpoint or by the layout lock.
+function onLayoutChange() {
+  if (!isMobileSheet()) {
+    sheetOpen = false;
+    try {
+      sessionStorage.removeItem(sheetStorageKey);
+    } catch {
+      // Storage refusal only prevents persistence; the in-memory state is already reset.
+    }
+  }
+  if (!isConversationHidden()) unreadAgentReply = "";
+  applySheetState();
+  applyPanelCollapsed();
+}
+
+if (layoutToggle) layoutToggle.onclick = () => cycleLayoutPreference();
+// An orientation change moves a zoomed phone layout to a different device width.
+window.addEventListener("resize", () => {
+  if (!appliedLayout) return;
+  const before = appliedLayout + layoutZoom;
+  applyLayoutLock();
+  if (appliedLayout + layoutZoom !== before) syncVisualViewport();
+});
+
 if (sheetMedia && typeof sheetMedia.addEventListener === "function") {
   sheetMedia.addEventListener("change", (event) => {
+    // A locked layout ignores the viewport width.
+    if (appliedLayout) return;
     if (!event.matches) {
       sheetOpen = false;
       try {
@@ -1707,15 +2038,18 @@ function applyPanelCollapsed() {
 
 // While collapsed the toggle stands in for the panel: it counts queued notes (the thing still to
 // send) or, failing that, marks an agent reply that arrived out of sight.
-function renderSidebarToggle() {
+function renderSidebarToggle(summary = dockSummaryReady ? sheetSummary() : null) {
   const collapsed = panelCollapsed && !isMobileSheet();
   const count = collapsed ? queued.length : 0;
   const unread = collapsed && count === 0 && Boolean(unreadAgentReply);
+  const alert = collapsed && summary?.alert === "error";
   sidebarToggleCount.textContent = count > 0 ? String(count) : "";
   sidebarToggleCount.hidden = count === 0;
-  sidebarToggle.classList.toggle("is-unread", unread);
+  sidebarToggle.classList.toggle("is-unread", unread && !alert);
+  sidebarToggle.classList.toggle("is-alert", alert);
   let label = collapsed ? "Show conversation" : "Hide conversation";
-  if (count > 0) label += count === 1 ? " (1 queued)" : " (" + count + " queued)";
+  if (alert) label += " (" + summary.text + ")";
+  else if (count > 0) label += count === 1 ? " (1 queued)" : " (" + count + " queued)";
   else if (unread) label += " (new reply)";
   sidebarToggle.setAttribute("aria-label", label);
   sidebarToggle.title = label;
@@ -3347,6 +3681,7 @@ function markSessionEnded() {
   updateSendState();
   applySheetState();
   if (presenceBanner) presenceBanner.hidden = true;
+  renderPresencePill();
   if (handoffBanner) handoffBanner.hidden = true;
   if (outdatedBanner) outdatedBanner.hidden = true;
   layoutGateManuallyBypassed = true;
@@ -4937,7 +5272,11 @@ function connectLiveEvents() {
   const socket = new WebSocket(protocol + "//" + location.host + "/events/" + encodeURIComponent(key));
   socket.addEventListener("open", () => {
     eventReconnectDelayMs = 500;
+    const wasUnreachable = liveEventFailures >= LIVE_EVENT_UNREACHABLE_FAILURES;
     liveEventFailures = 0;
+    serverStopped = false;
+    renderPresencePill();
+    if (wasUnreachable) renderSheetSummary();
     unreachableDismissed = false;
     if (unreachableBannerOwned) {
       unreachableBannerOwned = false;
@@ -4955,7 +5294,9 @@ function connectLiveEvents() {
   });
   socket.addEventListener("close", () => {
     liveEventFailures += 1;
+    renderPresencePill();
     noteLiveEventsUnreachable();
+    if (liveEventFailures === LIVE_EVENT_UNREACHABLE_FAILURES) renderSheetSummary();
     setTimeout(connectLiveEvents, eventReconnectDelayMs);
     eventReconnectDelayMs = Math.min(eventReconnectDelayMs * 2, 5000);
   });
@@ -4997,8 +5338,11 @@ events.set("chat-sync", (data) => {
 events.set("agent-presence", (data) => setAgentPresence(data.mode === "external-listener" ? "external" : data.state));
 events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
 events.set("ended", () => markSessionEnded());
+events.set("owner-status", (data) => setOwnerStatus(data.owner || null));
 connectLiveEvents();
 
+presencePillReady = true;
+setOwnerStatus(sessionData.initialOwnerStatus || null);
 draftTabId = loadDraftTabId();
 const restoredDraftCount = adoptStoredDrafts();
 window.addEventListener("pagehide", flushDraftsOnHide);
@@ -5006,6 +5350,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") flushDraftsOnHide();
 });
 
+dockSummaryReady = true;
 applySheetState();
 applyPanelCollapsed();
 settleQueuedFromTranscript(initialChat, false);

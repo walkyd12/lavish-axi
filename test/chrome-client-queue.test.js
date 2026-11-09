@@ -19,7 +19,7 @@ const servedChromeIds = new Set(
 
 const SERVED_TAB_ICON = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>";
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, initialDrafts?: any[], revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, initialOwnerStatus?: any, initialDrafts?: any[], revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = {
   key: "abc",
@@ -97,6 +97,10 @@ async function createChromeHarness({
   // chrome's sheet breakpoint, with `setMobile` flipping it the way a resize would. Left off, the
   // window has no matchMedia at all, which is the desktop the other tests run against.
   mobile = false,
+  // Opt-in device model for the layout lock: what `screen`, the viewport, the pointer, the page URL,
+  // and chrome.css's media rules report. Its matchMedia answers the width queries from `innerWidth`
+  // and the pointer query from `coarse`, the way a real browser would.
+  device = null,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
   // Seed sessionStorage before the client boots, to model a tab whose queue was
@@ -406,6 +410,7 @@ async function createChromeHarness({
   let clockNow = Date.now();
   const context = {
     AbortController,
+    URLSearchParams,
     clearTimeout: fakeClearTimeout,
     console,
     ...(fakeClock ? { Date: { now: () => clockNow, parse: Date.parse } } : {}),
@@ -530,7 +535,30 @@ async function createChromeHarness({
     },
   };
   const mediaQueries = [];
-  if (mobile) {
+  const documentElement = { style: { zoom: "", setProperty() {} }, dataset: {} };
+  if (device) {
+    context.window.screen = device.screen;
+    context.window.innerWidth = device.innerWidth;
+    context.window.innerHeight = device.innerHeight;
+    context.location.search = device.search || "";
+    context.document.documentElement = documentElement;
+    context.document.styleSheets = device.styleSheets || [];
+    context.window.matchMedia = (query) => {
+      const width = query.match(/^\(max-width: (\d+)px\)$/);
+      const list = {
+        media: query,
+        matches: width
+          ? device.innerWidth <= Number(width[1])
+          : query === "(pointer: coarse)" && Boolean(device.coarse),
+        changeHandlers: [],
+        addEventListener(type, handler) {
+          if (type === "change") this.changeHandlers.push(handler);
+        },
+      };
+      mediaQueries.push(list);
+      return list;
+    };
+  } else if (mobile) {
     context.window.matchMedia = (query) => {
       const list = {
         media: query,
@@ -699,6 +727,7 @@ async function createChromeHarness({
     },
     artifactLoadToken: frameLoadToken,
     mediaQueries,
+    documentElement,
     setMobile(matches) {
       for (const list of mediaQueries) {
         list.matches = matches;
@@ -7328,6 +7357,126 @@ test("the dock summarizes what the user should know while the sheet is down", as
   assert.equal(sheetState(chrome).summary, "Agent is working…");
 });
 
+// Regression: on a phone the conversation is a closed sheet, and "Could not send" or "Lavish was
+// stopped" lived only inside it - the visible dock just read "1 queued", so the page looked fine.
+test("the closed dock shows a failed send and a stopped server, not just the queue count", async () => {
+  const chrome = await createChromeHarness({
+    mobile: true,
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) throw new TypeError("Failed to fetch");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Call this Payment method", selector: "h2", tag: "element", text: "Payment" },
+  });
+  assert.equal(sheetState(chrome).summary, "1 queued");
+
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  for (let i = 0; i < 4; i += 1) await flushPromises();
+  let state = sheetState(chrome);
+  assert.equal(state.open, false, "the sheet stays closed");
+  assert.equal(state.summary, "Could not send · 1 queued");
+  assert.match(state.summaryClass, /is-alert/);
+  assert.doesNotMatch(state.summaryClass, /is-accent/);
+  assert.match(String(chrome.element("panelHead").classList), /has-alert/);
+  assert.match(String(chrome.element("panelHead").classList), /is-fresh/, "a new problem pulses the dock");
+
+  // The server going away outranks the failed send: it is why the send failed.
+  chrome.eventSource().listeners.get("chrome-outdated")({ data: JSON.stringify({ reason: "stop" }) });
+  state = sheetState(chrome);
+  assert.equal(state.summary, "Lavish stopped · 1 queued");
+  assert.match(state.summaryClass, /is-alert/);
+
+  // Dismissing the banner inside the sheet brings back the send failure it was covering.
+  chrome.element("outdatedDismiss").onclick();
+  assert.equal(sheetState(chrome).summary, "Could not send · 1 queued");
+});
+
+test("the closed dock says when the live connection to Lavish is lost", async () => {
+  const chrome = await createChromeHarness({ mobile: true });
+  for (let failure = 0; failure < 5; failure += 1) {
+    const socket = chrome.webSocketAt(chrome.webSocketCount() - 1);
+    socket.protocolListeners.get("close")({});
+    chrome.runTimers();
+  }
+  let state = sheetState(chrome);
+  assert.equal(state.summary, "Lavish unreachable");
+  assert.match(state.summaryClass, /is-alert/);
+
+  // Dismissing the banner does not make the dock claim all is well while it is still down.
+  chrome.element("outdatedDismiss").onclick();
+  assert.equal(sheetState(chrome).summary, "Lavish unreachable");
+
+  const socket = chrome.webSocketAt(chrome.webSocketCount() - 1);
+  socket.protocolListeners.get("open")({});
+  state = sheetState(chrome);
+  assert.equal(state.summary, "Agent not listening");
+  assert.doesNotMatch(state.summaryClass, /is-alert/);
+  assert.doesNotMatch(String(chrome.element("panelHead").classList), /has-alert/);
+});
+
+test("the closed dock flags sent notes no agent has picked up", async () => {
+  const chrome = await createChromeHarness({
+    mobile: true,
+    sessionData: {
+      ...defaultSessionData,
+      initialChat: [
+        { role: "user", kind: "message", text: "Ship it", at: "2026-11-09T10:00:00.000Z", prompt_id: "n1" },
+      ],
+      initialChatRevision: 1,
+    },
+  });
+  let state = sheetState(chrome);
+  assert.equal(state.summary, "Sent · no agent listening");
+  assert.match(state.summaryClass, /is-warn/);
+
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(sheetState(chrome).summary, "Agent listening");
+
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "waiting" }) });
+  chrome.eventSource().listeners.get("chat-sync")({
+    data: JSON.stringify({
+      chat: [
+        {
+          role: "user",
+          kind: "message",
+          text: "Ship it",
+          at: "2026-11-09T10:00:00.000Z",
+          prompt_id: "n1",
+          delivered_at: "2026-11-09T10:01:00.000Z",
+        },
+      ],
+      chat_revision: 2,
+    }),
+  });
+  state = sheetState(chrome);
+  assert.equal(state.summary, "Agent not listening", "a note an agent has seen is not flagged");
+  assert.doesNotMatch(state.summaryClass, /is-warn/);
+});
+
+test("a collapsed desktop panel marks its toggle when a send fails", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) throw new TypeError("Failed to fetch");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.element("sidebarToggle").dispatch("click", {});
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Tighten", selector: "h2", tag: "element", text: "Payment" },
+  });
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 body");
+  for (let i = 0; i < 4; i += 1) await flushPromises();
+  const toggle = chrome.element("sidebarToggle");
+  assert.match(String(toggle.classList), /is-alert/);
+  assert.match(toggle["aria-label"], /Could not send/);
+});
+
 test("the dock reports an ended session", async () => {
   const chrome = await createChromeHarness({
     mobile: true,
@@ -9423,6 +9572,106 @@ test("a window that is not the artifact frame cannot set the tab", async () => {
   assert.equal(chrome.tab().title, "Plan \u00b7 Lavish");
 });
 
+function pill(chrome) {
+  const element = chrome.element("presencePill");
+  return { tone: element.dataset.tone, text: chrome.element("presencePillText").textContent, title: element.title };
+}
+
+// The reviewer asked: "when looking at a board, is there any way to tell if it is online / the
+// worker is online or not?" The pill answers from the owner's own report, else the poll presence.
+test("the presence pill shows Lavish's own poll presence when no owner has reported", async () => {
+  const chrome = await createChromeHarness();
+  assert.deepEqual(pill(chrome), {
+    tone: "off",
+    text: "No agent listening",
+    title: "Notes you send wait on the server for the next poll.",
+  });
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(pill(chrome).text, "Agent listening");
+  assert.equal(pill(chrome).tone, "up");
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["busy", "Agent working"]);
+});
+
+test("the presence pill shows the owner's report, and outranks the poll presence", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: {
+      ...defaultSessionData,
+      initialOwnerStatus: {
+        state: "live",
+        label: "lavish-fork-hub",
+        detail: "Relayed by first mate",
+        updated_at: "2026-11-09T21:00:00.000Z",
+        stale: false,
+        expires_in_ms: null,
+      },
+    },
+  });
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["up", "lavish-fork-hub · live"]);
+  assert.match(pill(chrome).title, /^Relayed by first mate Last update /);
+
+  const owner = (state, extra = {}) =>
+    chrome.eventSource().listeners.get("owner-status")({
+      data: JSON.stringify({ owner: { state, label: "lavish-fork-hub", detail: "", stale: false, ...extra } }),
+    });
+  owner("working");
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["busy", "lavish-fork-hub · working"]);
+  owner("finished", { detail: "Handed to first mate" });
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["off", "lavish-fork-hub · finished"]);
+  assert.match(pill(chrome).title, /Handed to first mate/);
+  owner("gone");
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["down", "lavish-fork-hub · gone"]);
+  owner("live", { label: "" });
+  assert.equal(pill(chrome).text, "Owner · live");
+
+  chrome.eventSource().listeners.get("owner-status")({ data: JSON.stringify({ owner: null }) });
+  assert.equal(pill(chrome).text, "No agent listening", "a cleared status returns to the poll presence");
+});
+
+test("an owner report with a ttl lapses on this page's clock unless refreshed", async () => {
+  const chrome = await createChromeHarness();
+  const report = () =>
+    chrome.eventSource().listeners.get("owner-status")({
+      data: JSON.stringify({ owner: { state: "live", label: "task 42", stale: false, expires_in_ms: 120000 } }),
+    });
+  report();
+  assert.equal(pill(chrome).text, "task 42 · live");
+  // A heartbeat replaces the pending lapse rather than adding a second one.
+  report();
+  chrome.runTimers(120000);
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["off", "task 42 · not heard from"]);
+
+  chrome.eventSource().listeners.get("owner-status")({
+    data: JSON.stringify({ owner: { state: "live", label: "task 42", stale: true, expires_in_ms: 0 } }),
+  });
+  assert.equal(pill(chrome).text, "task 42 · not heard from", "a status that lapsed before load says so");
+});
+
+test("the presence pill says Lavish is offline when the server stops or the stream stays down", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: {
+      ...defaultSessionData,
+      initialOwnerStatus: { state: "live", label: "task 42", stale: false, expires_in_ms: null },
+    },
+  });
+  chrome.eventSource().listeners.get("chrome-outdated")({ data: JSON.stringify({ reason: "stop" }) });
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["down", "Lavish offline"]);
+  chrome.element("outdatedDismiss").onclick();
+  assert.equal(pill(chrome).text, "task 42 · live");
+
+  // An upgrade replaced the server, which is running: not offline.
+  chrome.eventSource().listeners.get("chrome-outdated")({ data: JSON.stringify({ reason: "upgrade" }) });
+  assert.equal(pill(chrome).text, "task 42 · live");
+
+  for (let failure = 0; failure < 5; failure += 1) {
+    chrome.webSocketAt(chrome.webSocketCount() - 1).protocolListeners.get("close")({});
+    chrome.runTimers();
+  }
+  assert.equal(pill(chrome).text, "Lavish offline");
+  chrome.webSocketAt(chrome.webSocketCount() - 1).protocolListeners.get("open")({});
+  assert.equal(pill(chrome).text, "task 42 · live");
+});
+
 // Unsent notes used to live only in the tab's sessionStorage: closing the tab (or an in-app
 // browser that discards it) lost them, and reopening the link showed an empty queue. The chrome
 // now mirrors them to the server, and a tab opened later adopts them.
@@ -9593,4 +9842,129 @@ test("an ended review neither adopts nor saves drafts", async () => {
   await flushPromises();
   assert.deepEqual(chrome.queued(), []);
   assert.equal(chrome.draftRequests.length, 0);
+});
+
+// The media rules chrome.css carries, as the CSSOM exposes them. The lock rewrites `mediaText`.
+function chromeCssSheet(href = "http://lavish.test/chrome.css") {
+  const texts = [
+    "not all and (max-width: 860px)",
+    "(max-width: 320px)",
+    "(max-width: 640px)",
+    "(max-width: 860px)",
+    "(max-width: 860px) and (max-height: 520px)",
+  ];
+  return { href, cssRules: texts.map((mediaText) => ({ media: { mediaText }, cssRules: [] })) };
+}
+
+function mediaTexts(sheet) {
+  return sheet.cssRules.map((rule) => rule.media.mediaText);
+}
+
+const DESKTOP_SITE_PHONE = { screen: { width: 412, height: 915 }, innerWidth: 980, innerHeight: 2176, coarse: true };
+
+// Regression: a phone that asks for the desktop site (or an in-app browser that does it for it)
+// reports a ~980px viewport, so the width breakpoint handed it the desktop layout shrunk onto the
+// screen - a conversation column too small to read, the reviewer zooming in to use it.
+test("a touch phone reporting a desktop-width viewport gets the phone layout, zoomed to phone size", async () => {
+  const sheet = chromeCssSheet();
+  const foreign = chromeCssSheet("http://lavish.test/artifact-theme.css");
+  const chrome = await createChromeHarness({ device: { ...DESKTOP_SITE_PHONE, styleSheets: [sheet, foreign] } });
+
+  assert.deepEqual(mediaTexts(sheet), [
+    "not all and (min-width: 0px)",
+    "(max-width: 0px)",
+    "(min-width: 0px)",
+    "(min-width: 0px)",
+    "(min-width: 0px) and (max-height: 520px)",
+  ]);
+  assert.deepEqual(mediaTexts(foreign), mediaTexts(chromeCssSheet()), "only Lavish's own stylesheet is touched");
+  assert.equal(chrome.documentElement.style.zoom, "2.379");
+  assert.equal(chrome.documentElement.dataset.lavishLayout, "phone");
+  assert.equal(chrome.element("layoutToggleText").textContent, "Layout: Auto (phone)");
+
+  // The sheet controller follows the lock, not the viewport query.
+  assert.equal(sheetState(chrome).open, false);
+  chrome.element("panelHead").dispatch("click", {});
+  assert.equal(sheetState(chrome).open, true);
+});
+
+test("a board link can ask for a layout with ?layout=", async () => {
+  const phoneSheet = chromeCssSheet();
+  const phone = await createChromeHarness({
+    device: { ...DESKTOP_SITE_PHONE, search: "?layout=desktop", styleSheets: [phoneSheet] },
+  });
+  assert.ok(mediaTexts(phoneSheet).every((text) => !text.includes("(min-width: 0px)")));
+  assert.equal(phone.documentElement.style.zoom, "");
+  assert.equal(phone.element("layoutToggleText").textContent, "Layout: Desktop");
+  phone.element("panelHead").dispatch("click", {});
+  assert.equal(sheetState(phone).open, false, "the desktop layout has no sheet");
+
+  const desktopSheet = chromeCssSheet();
+  const desktop = await createChromeHarness({
+    device: {
+      screen: { width: 1920, height: 1080 },
+      innerWidth: 1280,
+      innerHeight: 900,
+      coarse: false,
+      search: "?layout=phone",
+      styleSheets: [desktopSheet],
+    },
+  });
+  assert.equal(mediaTexts(desktopSheet)[3], "(min-width: 0px)");
+  assert.equal(mediaTexts(desktopSheet)[2], "(max-width: 0px)", "a 1280px phone layout is not a 640px one");
+  assert.equal(desktop.documentElement.style.zoom, "", "a desktop is not zoomed");
+  desktop.element("panelHead").dispatch("click", {});
+  assert.equal(sheetState(desktop).open, true);
+});
+
+test("a desktop and a tablet keep the width breakpoint unless asked", async () => {
+  for (const device of [
+    { screen: { width: 1920, height: 1080 }, innerWidth: 1280, innerHeight: 900, coarse: false },
+    { screen: { width: 820, height: 1180 }, innerWidth: 820, innerHeight: 1180, coarse: true },
+  ]) {
+    const sheet = chromeCssSheet();
+    const chrome = await createChromeHarness({ device: { ...device, styleSheets: [sheet] } });
+    assert.deepEqual(mediaTexts(sheet), mediaTexts(chromeCssSheet()));
+    assert.equal(chrome.documentElement.dataset.lavishLayout, undefined);
+    assert.equal(chrome.element("layoutToggleText").textContent, "Layout: Auto");
+  }
+});
+
+test("the layout menu item cycles Auto, Phone, Desktop and is remembered on the device", async () => {
+  const sheet = chromeCssSheet();
+  const localStore = new Map();
+  const chrome = await createChromeHarness({
+    localStore,
+    device: {
+      screen: { width: 1920, height: 1080 },
+      innerWidth: 1280,
+      innerHeight: 900,
+      coarse: false,
+      styleSheets: [sheet],
+    },
+  });
+  const toggle = chrome.element("layoutToggle");
+  toggle.onclick();
+  assert.equal(localStore.get("lavish-axi:layout"), "phone");
+  assert.equal(chrome.element("layoutToggleText").textContent, "Layout: Phone");
+  assert.equal(mediaTexts(sheet)[3], "(min-width: 0px)");
+  chrome.element("panelHead").dispatch("click", {});
+  assert.equal(sheetState(chrome).open, true);
+
+  toggle.onclick();
+  assert.equal(localStore.get("lavish-axi:layout"), "desktop");
+  assert.equal(sheetState(chrome).open, false, "leaving the phone layout closes the sheet");
+  assert.ok(mediaTexts(sheet).every((text) => !text.includes("(min-width: 0px)")));
+
+  toggle.onclick();
+  assert.equal(localStore.has("lavish-axi:layout"), false);
+  assert.deepEqual(mediaTexts(sheet), mediaTexts(chromeCssSheet()), "Auto restores chrome.css as written");
+
+  // A later page on this device starts from the stored choice.
+  localStore.set("lavish-axi:layout", "phone");
+  const later = await createChromeHarness({
+    localStore,
+    device: { screen: { width: 1920, height: 1080 }, innerWidth: 1280, innerHeight: 900, coarse: false },
+  });
+  assert.equal(later.element("layoutToggleText").textContent, "Layout: Phone");
 });
