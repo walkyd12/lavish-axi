@@ -28,6 +28,7 @@ import {
 } from "./chat-messages.js";
 import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
 import { normalizeOwnerStatus } from "./owner-status.js";
+import { applyDraftWrite, pruneSentDrafts } from "./review-drafts.js";
 import { EXCALIDRAW_SCENE_TARGET_TYPE, normalizeExcalidrawSceneTarget } from "./whiteboard-core.js";
 
 export const LAYOUT_WARNINGS_TARGET_TYPE = "layout-warnings";
@@ -159,6 +160,9 @@ export class SessionStore {
       ...(existing.owner_status && typeof existing.owner_status === "object"
         ? { owner_status: existing.owner_status }
         : {}),
+      // The reviewer's unsent notes (src/review-drafts.js). Reopening must keep them: restoring
+      // them in the reopened review is the point of storing them.
+      ...(existing.drafts && typeof existing.drafts === "object" ? { drafts: existing.drafts } : {}),
       // Counts the takes that stamped Seen on chat entries (docs/delivery-acks.md). Reset on reopen
       // and a later restore could un-stamp an older take's entries, so it is carried like chat.
       delivery_seq: normalizeRevision(existing.delivery_seq),
@@ -319,6 +323,14 @@ export class SessionStore {
     const existingPrompts = Array.isArray(session.prompts) ? session.prompts : [];
     const storedPrompts = restoring ? acceptedPrompts : acceptedPrompts.map(agentFacingPrompt);
     session.prompts = restoring ? [...storedPrompts, ...existingPrompts] : [...existingPrompts, ...storedPrompts];
+    // A sent note is no longer a draft, in any tab's stored record. Done here, under the same
+    // lock as the accept, because the tab that queued it may close before it writes its emptied
+    // queue - and a stale record would bring the note back in the next tab as unsent.
+    if (!restoring)
+      pruneSentDrafts(
+        session,
+        prompts.map((prompt) => prompt?.prompt_id),
+      );
     session.chat = [...(session.chat || []), ...userMessages];
     applyTranscriptBound(session);
     if (userMessages.length > 0) session.chat_revision = normalizeRevision(session.chat_revision) + 1;
@@ -359,6 +371,21 @@ export class SessionStore {
       else delete session.owner_status;
       await this.writeState(state);
       return session;
+    });
+  }
+
+  // One tab's unsent notes and open-card text, mirrored from the chrome as they change
+  // (src/review-drafts.js). Returns null for an unknown session and `{ ended: true }` for an ended
+  // one; state.json is rewritten only when the stored drafts actually changed.
+  async saveDrafts(key, payload) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      if (session.status === "ended") return { ended: true, ended_by: session.ended_by };
+      const changed = applyDraftWrite(session, payload);
+      if (changed) await this.writeState(state);
+      return { changed };
     });
   }
 
