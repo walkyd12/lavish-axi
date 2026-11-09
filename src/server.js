@@ -1,10 +1,11 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
-import { readFile, realpath } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { open as openFile, readFile, realpath } from "node:fs/promises";
 import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
-import { homedir } from "node:os";
+import { homedir, hostname as osHostname } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -57,6 +58,7 @@ import {
 import { hostRejectedShareWrite, publishedDespiteError, publishToHtmlApp } from "./html-app.js";
 import { serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
 import { OwnerStatusError, serializeOwnerStatus } from "./owner-status.js";
+import { boardTitle, conversationMarkdown, createHubHtml, serializeHubBoard, sortHubBoards } from "./hub.js";
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { injectLavishSdk } from "./html-transform.js";
 import {
@@ -90,6 +92,8 @@ import {
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
 const chromeCssUrl = new URL("./chrome.css", import.meta.url);
+const hubClientUrl = new URL("./hub-client.js", import.meta.url);
+const hubCssUrl = new URL("./hub.css", import.meta.url);
 const designAssetUrls = {
   "daisyui.css": {
     packaged: new URL("./design/daisyui.css", import.meta.url),
@@ -409,6 +413,33 @@ export async function serve({
   events.on("layout-warnings", (key, warnings) => broadcastLiveEvent("layout-warnings", key, { warnings }));
   events.on("owner-status", (key, owner) => broadcastLiveEvent("owner-status", key, { owner: owner || null }));
   events.on("ended", (key, endedBy) => broadcastLiveEvent("ended", key, { ended_by: endedBy || null }));
+  events.on("ended", (key, endedBy) => {
+    runEndHook(key, endedBy).catch((error) => writeLog(`[lavish] end hook failed: ${error?.message || error}`));
+  });
+
+  // LAVISH_AXI_ON_END names an executable run (no shell) whenever a session ends - from the
+  // browser, Send & End, the hub, or `lavish-axi end` - with the board file, session key, who
+  // ended it, and this server's loopback base URL as arguments, so an operator can keep a closed
+  // board's copy (GET /api/:key/export) and conversation (GET /api/:key/conversation). Detached and
+  // fire-and-forget: a slow or failing hook never delays or fails the end.
+  async function runEndHook(key, endedBy) {
+    const command = String(process.env.LAVISH_AXI_ON_END || "").trim();
+    if (!command) return;
+    if (!path.isAbsolute(command)) {
+      writeLog("[lavish] LAVISH_AXI_ON_END must be an absolute path to an executable; skipped");
+      return;
+    }
+    const session = await store.findByKey(key);
+    if (!session) return;
+    const base = `http://${hostForUrl(LOOPBACK_HOST)}:${publicPort}`;
+    const child = spawn(command, [session.file, key, endedBy === "user" ? "user" : "agent", base], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, LAVISH_AXI_ENDED_FILE: session.file, LAVISH_AXI_ENDED_KEY: key },
+    });
+    child.on("error", (error) => writeLog(`[lavish] end hook ${command} failed to start: ${error.message}`));
+    child.unref();
+  }
 
   function hasLiveEventClient(key) {
     for (const clientKey of liveEventClients.values()) {
@@ -766,8 +797,129 @@ export async function serve({
     return defaultJsonParser(req, res, next);
   });
 
-  app.get("/", (_req, res) => {
-    res.type("html").send(createLandingHtml());
+  // ---- The hub (src/hub.js) ----
+  // The front page lists every board with a state computed from what this server already knows.
+  async function readBoardHead(file) {
+    let handle;
+    try {
+      handle = await openFile(file, "r");
+      const buffer = Buffer.alloc(64 * 1024);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      return { exists: true, title: extractArtifactHead(buffer.subarray(0, bytesRead).toString("utf8")).title };
+    } catch (error) {
+      return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "" };
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  function liveClientCount(key) {
+    let count = 0;
+    for (const clientKey of liveEventClients.values()) if (clientKey === key) count += 1;
+    return count;
+  }
+
+  async function hubBoards() {
+    const sessions = await store.listSessions();
+    const now = Date.now();
+    const boards = await Promise.all(
+      sessions.map(async (session) => {
+        const head = await readBoardHead(session.file);
+        const holder = activePolls.get(session.key);
+        return serializeHubBoard(session, {
+          listener: holder ? listenerLabel(holder) : null,
+          tabs: liveClientCount(session.key),
+          fileExists: head.exists,
+          title: head.title,
+          now,
+        });
+      }),
+    );
+    return sortHubBoards(boards);
+  }
+
+  app.get("/", async (_req, res, next) => {
+    try {
+      res.setHeader("x-frame-options", "DENY");
+      res.setHeader("content-security-policy", "frame-ancestors 'none'");
+      res.type("html").send(createHubHtml({ boards: await hubBoards(), hostname: osHostname() }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/hub", async (_req, res, next) => {
+    try {
+      res.json({ boards: await hubBoards(), generated_at: new Date().toISOString() });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Close from the hub. Same-origin like /prompts: only the hub page may close a board this way.
+  // Unlike the board's own End, it never shuts the server down - the reviewer is still on the hub.
+  app.post("/api/hub/:key/close", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin close rejected" });
+        return;
+      }
+      const session = await store.endSession(req.params.key, "user");
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+      events.emit("ended", req.params.key, session.ended_by);
+      res.json({ status: "ended", ended_by: session.ended_by });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // A board's conversation, for the hub's history view and for keeping a closed board's record.
+  // Read-only, like the session page that already shows it. `?format=markdown` returns Markdown.
+  app.get("/api/:key/conversation", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const { title } = await readBoardHead(session.file);
+      if (req.query.format === "markdown") {
+        res.type("text/markdown").send(conversationMarkdown(session, { title }));
+        return;
+      }
+      res.json({
+        key: session.key,
+        file: session.file,
+        title: boardTitle(session, title),
+        status: session.status === "ended" ? "ended" : "open",
+        ended_by: session.status === "ended" ? session.ended_by || "agent" : null,
+        updated_at: session.updated_at || "",
+        owner: serializeOwnerStatus(session.owner_status),
+        chat: serializeChat(session.chat || []),
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/hub-client.js", async (_req, res, next) => {
+    try {
+      res.type("application/javascript").send(await readFile(hubClientUrl, "utf8"));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/hub.css", async (_req, res, next) => {
+    try {
+      res.type("text/css").send(await readFile(hubCssUrl, "utf8"));
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.get("/health", async (req, res) => {
@@ -2540,10 +2692,6 @@ function probeLavishHealth(host, port) {
 function wantsHtml(req) {
   const accept = String(req.get("accept") || "");
   return accept.toLowerCase().includes("text/html");
-}
-
-function createLandingHtml() {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lavish Editor</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f4ef;color:#25221f;font:16px/1.5 system-ui,sans-serif}.card{width:min(560px,calc(100% - 40px));padding:32px;border:1px solid #d9d0c5;border-radius:16px;background:#fffdf9;box-shadow:0 12px 40px #25221f18}h1{margin:0 0 12px;font-size:26px}p{margin:0}</style></head><body><main class="card"><h1>Lavish Editor is running</h1><p>Open the review session URL printed by your agent.</p></main></body></html>`;
 }
 
 function createDeniedHtml({ title, message, workingUrl }) {
