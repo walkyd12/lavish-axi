@@ -169,6 +169,50 @@ body.lavish {
 .spacer {
   flex: 1;
 }
+/* Who is there to read what the reviewer sends: the review's owner as its supervisor reports it,
+   else Lavish's own poll presence, else that the server itself is gone. Words carry the state;
+   the dot only repeats it. */
+.presence-pill {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 320px;
+  padding: 3px 10px;
+  border: var(--hairline);
+  border-radius: var(--radius-pill);
+  background: var(--bg-elevated);
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+.presence-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.presence-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: var(--fg-label);
+}
+.presence-pill[data-tone="up"] .presence-dot {
+  background: var(--sage-300);
+}
+.presence-pill[data-tone="busy"] .presence-dot {
+  background: var(--accent);
+}
+.presence-pill[data-tone="down"] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.presence-pill[data-tone="down"] .presence-dot {
+  background: var(--danger);
+}
 .annotate-switch {
   display: inline-flex;
   align-items: center;
@@ -1737,6 +1781,10 @@ body.layout-gate-active iframe#artifact {
   }
   .brand-support {
     display: none;
+  }
+  .presence-pill {
+    padding: 3px 8px;
+    font-size: 11px;
   }
   .warnings-drawer {
     position: fixed;

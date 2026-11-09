@@ -200,6 +200,15 @@ let annotationOverridden = false;
 let annotationDefaultReceived = false;
 let ended = false;
 let agentPresence = "waiting";
+// The presence pill reads state declared further down this file, so it stays quiet until boot.
+let presencePillReady = false;
+const OWNER_STATES = ["live", "working", "finished", "gone"];
+/** @type {{ state: string, label: string, detail: string, updated_at: string, stale: boolean } | null} */
+let ownerStatus = null;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let ownerStatusStaleTimer;
+// The server said it was stopping, or its live stream has stayed down: nobody can receive a send.
+let serverStopped = false;
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -1139,6 +1148,7 @@ function syncChat(chat, revision) {
 
 function setAgentPresence(state) {
   agentPresence = state === "listening" || state === "external" || state === "working" ? state : "waiting";
+  renderPresencePill();
   updateSendState();
   renderSheetSummary();
   refreshUnseenReceipts();
@@ -1159,6 +1169,74 @@ function setAgentPresence(state) {
     chatLog.appendChild(workingBubble);
   }
   scrollElementIntoView(workingBubble);
+}
+
+// ---- Presence pill ----
+// The top bar says who is there to read what the reviewer sends. A supervisor that relays this
+// review to another agent reports that owner through `lavish-axi owner` (src/owner-status.js);
+// without one the pill shows Lavish's own poll presence. A server that is gone outranks both.
+const presencePill = /** @type {HTMLSpanElement | null} */ (document.getElementById("presencePill"));
+const presencePillText = /** @type {HTMLSpanElement | null} */ (document.getElementById("presencePillText"));
+
+function setOwnerStatus(owner) {
+  clearTimeout(ownerStatusStaleTimer);
+  ownerStatusStaleTimer = undefined;
+  if (!owner || typeof owner !== "object" || !OWNER_STATES.includes(owner.state)) {
+    ownerStatus = null;
+  } else {
+    ownerStatus = {
+      state: owner.state,
+      label: String(owner.label || ""),
+      detail: String(owner.detail || ""),
+      updated_at: String(owner.updated_at || ""),
+      stale: owner.stale === true,
+    };
+    // The lapse is counted on this page's clock from the server's remaining time, so the two
+    // clocks never have to agree.
+    const remaining = Number(owner.expires_in_ms);
+    if (!ownerStatus.stale && owner.expires_in_ms !== null && Number.isFinite(remaining)) {
+      ownerStatusStaleTimer = setTimeout(
+        () => {
+          ownerStatusStaleTimer = undefined;
+          if (ownerStatus) ownerStatus.stale = true;
+          renderPresencePill();
+        },
+        Math.min(Math.max(0, remaining), 2_147_483_647),
+      );
+    }
+  }
+  renderPresencePill();
+}
+
+function presencePillState() {
+  if (ended) return { tone: "off", text: "Session ended", title: "" };
+  if (serverStopped || liveEventFailures >= LIVE_EVENT_UNREACHABLE_FAILURES) {
+    return { tone: "down", text: "Lavish offline", title: "This page cannot reach the Lavish server." };
+  }
+  if (ownerStatus) {
+    const name = ownerStatus.label || "Owner";
+    const since = ownerStatus.updated_at
+      ? "Last update " + new Date(ownerStatus.updated_at).toLocaleString() + "."
+      : "";
+    const title = [ownerStatus.detail, since].filter(Boolean).join(" ");
+    if (ownerStatus.stale) return { tone: "off", text: name + " · not heard from", title };
+    if (ownerStatus.state === "live") return { tone: "up", text: name + " · live", title };
+    if (ownerStatus.state === "working") return { tone: "busy", text: name + " · working", title };
+    if (ownerStatus.state === "finished") return { tone: "off", text: name + " · finished", title };
+    return { tone: "down", text: name + " · gone", title };
+  }
+  if (agentPresence === "listening") return { tone: "up", text: "Agent listening", title: "" };
+  if (agentPresence === "external") return { tone: "up", text: "Listener active", title: "" };
+  if (agentPresence === "working") return { tone: "busy", text: "Agent working", title: "" };
+  return { tone: "off", text: "No agent listening", title: "Notes you send wait on the server for the next poll." };
+}
+
+function renderPresencePill() {
+  if (!presencePillReady || !presencePill || !presencePillText) return;
+  const state = presencePillState();
+  presencePill.dataset.tone = state.tone;
+  presencePillText.textContent = state.text;
+  presencePill.title = state.title || state.text;
 }
 
 function setHandoffSuperseded(visible) {
@@ -1187,6 +1265,9 @@ function setChromeOutdated(visible, reason = chromeOutdatedReason) {
   outdatedReloadInFlight = false;
   if (outdatedReloadButton) outdatedReloadButton.disabled = false;
   if (outdatedBanner) outdatedBanner.hidden = ended || !visible;
+  // An upgrade or local build replaced the server, which is running; any other shutdown left none.
+  serverStopped = Boolean(visible) && chromeOutdatedReason !== "upgrade" && chromeOutdatedReason !== "local-build";
+  renderPresencePill();
 }
 
 function setReviewState(state) {
@@ -3177,6 +3258,7 @@ function markSessionEnded() {
   updateSendState();
   applySheetState();
   if (presenceBanner) presenceBanner.hidden = true;
+  renderPresencePill();
   if (handoffBanner) handoffBanner.hidden = true;
   if (outdatedBanner) outdatedBanner.hidden = true;
   layoutGateManuallyBypassed = true;
@@ -4768,6 +4850,8 @@ function connectLiveEvents() {
   socket.addEventListener("open", () => {
     eventReconnectDelayMs = 500;
     liveEventFailures = 0;
+    serverStopped = false;
+    renderPresencePill();
     unreachableDismissed = false;
     if (unreachableBannerOwned) {
       unreachableBannerOwned = false;
@@ -4785,6 +4869,7 @@ function connectLiveEvents() {
   });
   socket.addEventListener("close", () => {
     liveEventFailures += 1;
+    renderPresencePill();
     noteLiveEventsUnreachable();
     setTimeout(connectLiveEvents, eventReconnectDelayMs);
     eventReconnectDelayMs = Math.min(eventReconnectDelayMs * 2, 5000);
@@ -4827,8 +4912,11 @@ events.set("chat-sync", (data) => {
 events.set("agent-presence", (data) => setAgentPresence(data.mode === "external-listener" ? "external" : data.state));
 events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
 events.set("ended", () => markSessionEnded());
+events.set("owner-status", (data) => setOwnerStatus(data.owner || null));
 connectLiveEvents();
 
+presencePillReady = true;
+setOwnerStatus(sessionData.initialOwnerStatus || null);
 applySheetState();
 applyPanelCollapsed();
 settleQueuedFromTranscript(initialChat, false);

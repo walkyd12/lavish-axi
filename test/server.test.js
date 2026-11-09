@@ -3465,6 +3465,80 @@ test("/chrome-client.js serves the extracted chrome client script", async () => 
   }
 });
 
+// The board's presence pill: a supervisor relaying this review to another agent says whether
+// that owner is there. Display state only - it must not need the chrome's origin (the CLI calls it
+// header-less), but a foreign page must not be able to set it.
+test("owner status is set by file or key, validated, broadcast live, and served to the chrome", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { key } = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+    const post = (route, body, headers = {}) =>
+      fetch(`${base}${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body),
+      });
+
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/events/${key}`, { origin: base });
+    const messages = on(socket, "message");
+    const nextOfType = async (type) => {
+      for (;;) {
+        const message = JSON.parse(String((await messages.next()).value[0]));
+        if (message.type === type) return message.data;
+      }
+    };
+    await once(socket, "open");
+    assert.deepEqual(await nextOfType("owner-status"), { owner: null });
+
+    assert.equal((await post("/api/owner", { file: artifact, state: "asleep" })).status, 400);
+    assert.equal((await post("/api/owner", { file: artifact, state: "live", ttl_seconds: 0 })).status, 400);
+    assert.equal((await post("/api/owner", { file: path.join(dir, "missing.html"), state: "live" })).status, 404);
+    assert.equal((await post(`/api/0000000000000000/owner`, { state: "live" })).status, 404);
+    assert.equal(
+      (await post(`/api/${key}/owner`, { state: "live" }, { origin: "https://evil.example" })).status,
+      403,
+      "a foreign page cannot claim someone is watching",
+    );
+
+    const set = await post("/api/owner", {
+      file: artifact,
+      state: "live",
+      label: "task\nlavish-fork-hub",
+      detail: "relayed by the supervisor",
+      ttl_seconds: 120,
+    });
+    assert.equal(set.status, 200);
+    const owner = (await set.json()).owner;
+    assert.equal(owner.state, "live");
+    assert.equal(owner.label, "task lavish-fork-hub", "control characters never reach the pill");
+    assert.equal(owner.stale, false);
+    assert.ok(owner.expires_in_ms > 100_000 && owner.expires_in_ms <= 120_000);
+    assert.equal((await nextOfType("owner-status")).owner.state, "live");
+
+    const page = chromeSessionData(await fetch(`${base}/session/${key}`).then((response) => response.text()));
+    assert.equal(page.initialOwnerStatus.label, "task lavish-fork-hub");
+
+    assert.equal((await post(`/api/${key}/owner`, { state: "finished", detail: "handed to first mate" })).status, 200);
+    assert.equal((await nextOfType("owner-status")).owner.state, "finished");
+
+    assert.equal((await post(`/api/${key}/owner`, { clear: true })).status, 200);
+    assert.deepEqual(await nextOfType("owner-status"), { owner: null });
+    await messages.return();
+    socket.close();
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("event WebSocket preserves initial state and named live-event semantics", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
@@ -3486,6 +3560,7 @@ test("event WebSocket preserves initial state and named live-event semantics", a
       data: { chat: [], ack_ids: [], chat_revision: 0 },
     });
     assert.deepEqual(await nextMessage(), { type: "agent-presence", data: { state: "waiting" } });
+    assert.deepEqual(await nextMessage(), { type: "owner-status", data: { owner: null } });
 
     const reply = await fetch(`${base}/api/${opened.key}/agent-reply`, {
       method: "POST",

@@ -19,7 +19,7 @@ const servedChromeIds = new Set(
 
 const SERVED_TAB_ICON = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>";
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, initialOwnerStatus?: any, revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = {
   key: "abc",
@@ -9405,4 +9405,104 @@ test("a window that is not the artifact frame cannot set the tab", async () => {
     });
   }
   assert.equal(chrome.tab().title, "Plan \u00b7 Lavish");
+});
+
+function pill(chrome) {
+  const element = chrome.element("presencePill");
+  return { tone: element.dataset.tone, text: chrome.element("presencePillText").textContent, title: element.title };
+}
+
+// The reviewer asked: "when looking at a board, is there any way to tell if it is online / the
+// worker is online or not?" The pill answers from the owner's own report, else the poll presence.
+test("the presence pill shows Lavish's own poll presence when no owner has reported", async () => {
+  const chrome = await createChromeHarness();
+  assert.deepEqual(pill(chrome), {
+    tone: "off",
+    text: "No agent listening",
+    title: "Notes you send wait on the server for the next poll.",
+  });
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(pill(chrome).text, "Agent listening");
+  assert.equal(pill(chrome).tone, "up");
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["busy", "Agent working"]);
+});
+
+test("the presence pill shows the owner's report, and outranks the poll presence", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: {
+      ...defaultSessionData,
+      initialOwnerStatus: {
+        state: "live",
+        label: "lavish-fork-hub",
+        detail: "Relayed by first mate",
+        updated_at: "2026-11-09T21:00:00.000Z",
+        stale: false,
+        expires_in_ms: null,
+      },
+    },
+  });
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["up", "lavish-fork-hub · live"]);
+  assert.match(pill(chrome).title, /^Relayed by first mate Last update /);
+
+  const owner = (state, extra = {}) =>
+    chrome.eventSource().listeners.get("owner-status")({
+      data: JSON.stringify({ owner: { state, label: "lavish-fork-hub", detail: "", stale: false, ...extra } }),
+    });
+  owner("working");
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["busy", "lavish-fork-hub · working"]);
+  owner("finished", { detail: "Handed to first mate" });
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["off", "lavish-fork-hub · finished"]);
+  assert.match(pill(chrome).title, /Handed to first mate/);
+  owner("gone");
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["down", "lavish-fork-hub · gone"]);
+  owner("live", { label: "" });
+  assert.equal(pill(chrome).text, "Owner · live");
+
+  chrome.eventSource().listeners.get("owner-status")({ data: JSON.stringify({ owner: null }) });
+  assert.equal(pill(chrome).text, "No agent listening", "a cleared status returns to the poll presence");
+});
+
+test("an owner report with a ttl lapses on this page's clock unless refreshed", async () => {
+  const chrome = await createChromeHarness();
+  const report = () =>
+    chrome.eventSource().listeners.get("owner-status")({
+      data: JSON.stringify({ owner: { state: "live", label: "task 42", stale: false, expires_in_ms: 120000 } }),
+    });
+  report();
+  assert.equal(pill(chrome).text, "task 42 · live");
+  // A heartbeat replaces the pending lapse rather than adding a second one.
+  report();
+  chrome.runTimers(120000);
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["off", "task 42 · not heard from"]);
+
+  chrome.eventSource().listeners.get("owner-status")({
+    data: JSON.stringify({ owner: { state: "live", label: "task 42", stale: true, expires_in_ms: 0 } }),
+  });
+  assert.equal(pill(chrome).text, "task 42 · not heard from", "a status that lapsed before load says so");
+});
+
+test("the presence pill says Lavish is offline when the server stops or the stream stays down", async () => {
+  const chrome = await createChromeHarness({
+    sessionData: {
+      ...defaultSessionData,
+      initialOwnerStatus: { state: "live", label: "task 42", stale: false, expires_in_ms: null },
+    },
+  });
+  chrome.eventSource().listeners.get("chrome-outdated")({ data: JSON.stringify({ reason: "stop" }) });
+  assert.deepEqual([pill(chrome).tone, pill(chrome).text], ["down", "Lavish offline"]);
+  chrome.element("outdatedDismiss").onclick();
+  assert.equal(pill(chrome).text, "task 42 · live");
+
+  // An upgrade replaced the server, which is running: not offline.
+  chrome.eventSource().listeners.get("chrome-outdated")({ data: JSON.stringify({ reason: "upgrade" }) });
+  assert.equal(pill(chrome).text, "task 42 · live");
+
+  for (let failure = 0; failure < 5; failure += 1) {
+    chrome.webSocketAt(chrome.webSocketCount() - 1).protocolListeners.get("close")({});
+    chrome.runTimers();
+  }
+  assert.equal(pill(chrome).text, "Lavish offline");
+  chrome.webSocketAt(chrome.webSocketCount() - 1).protocolListeners.get("open")({});
+  assert.equal(pill(chrome).text, "task 42 · live");
 });

@@ -27,6 +27,7 @@ import {
   unstampDelivery,
 } from "./chat-messages.js";
 import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
+import { normalizeOwnerStatus } from "./owner-status.js";
 import { EXCALIDRAW_SCENE_TARGET_TYPE, normalizeExcalidrawSceneTarget } from "./whiteboard-core.js";
 
 export const LAYOUT_WARNINGS_TARGET_TYPE = "layout-warnings";
@@ -153,6 +154,11 @@ export class SessionStore {
       // Compact prompt_id acks for bubbles evicted by the stored-chat byte bound. Reopening
       // must keep them: they are the settlement/dedup source once the visible entry is gone.
       chat_ack_ids: Array.isArray(existing.chat_ack_ids) ? existing.chat_ack_ids : [],
+      // What the review's owner last said about itself (src/owner-status.js). A reopen keeps it:
+      // the supervisor that set it is still the one vouching for the board.
+      ...(existing.owner_status && typeof existing.owner_status === "object"
+        ? { owner_status: existing.owner_status }
+        : {}),
       // Counts the takes that stamped Seen on chat entries (docs/delivery-acks.md). Reset on reopen
       // and a later restore could un-stamp an older take's entries, so it is carried like chat.
       delivery_seq: normalizeRevision(existing.delivery_seq),
@@ -339,6 +345,21 @@ export class SessionStore {
     session.updated_at = new Date().toISOString();
     await this.writeState(state);
     return { ...session, fresh_feedback: !restoring && acceptedPrompts.length > 0 };
+  }
+
+  // Record (or, for `{ clear: true }`, remove) the owner's statement about itself. Throws
+  // OwnerStatusError for an invalid write; returns null for an unknown session.
+  async setOwnerStatus(key, input) {
+    const record = normalizeOwnerStatus(input);
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      if (record) session.owner_status = record;
+      else delete session.owner_status;
+      await this.writeState(state);
+      return session;
+    });
   }
 
   async issueReviewerHandoff(key) {
