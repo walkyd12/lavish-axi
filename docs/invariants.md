@@ -200,6 +200,10 @@ The build also inlines `package.json`'s version as `process.env.LAVISH_AXI_BUILD
 Users opt out with `LAVISH_AXI_TELEMETRY=0`.
 The client is best-effort and must never affect CLI behavior - all errors are swallowed.
 
+### Interface theme
+
+`LAVISH_AXI_THEME` (`src/host-theme.js`) themes Lavish's own interface only: the hub, the board chrome, the SDK's annotation UI, and the server's denied page. `serve()` resolves it once from its environment; an unknown value is the stock look, so an unset install looks exactly as before. A preset is only a token set: the stock tokens stay in `chrome.css`/`hub.css` `:root` and the SDK's `:host` block, and the server lays the preset over them as one `<style id="lavish-host-theme">` after the page's stylesheet link (`hostThemeMarkup`) or, for the SDK, appended to its shadow stylesheet (`options.themeCss`, plus `options.themeAccent` for the outline drawn on artifact elements). So every interface colour must be a custom property; a hard-coded colour silently ignores the preset, and `test/host-theme.test.js` fails on one, on a colour token a preset does not reach, on a text pair below WCAG AA, and on a blue hue in `night`. Board content is never themed: `--frame-bg` behind the artifact iframe stays white in every preset, and the revision legend keeps its colour-blind-safe palette. Because a detached server inherits the environment of whichever CLI started it, an install that wants a theme sets the variable where every server is started (or runs one long-lived server, as an always-on service does).
+
 ## Things to know when editing
 
 - `run()` short-circuits `--version`/`-v`/`-V` (`isVersionOnlyArgv`) before `ensureStateDir` and `initDefaultTelemetry`, because agent harnesses probe every tool's version at session start and the telemetry drain in the `finally` block costs up to a full second. Any new startup work must go after that short-circuit; `test/cli-version.test.js` guards both the latency budget and the "no telemetry request, no state dir" property.

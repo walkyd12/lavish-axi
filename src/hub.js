@@ -4,6 +4,7 @@
 // the server passes in, so the state rules are unit-testable without a server.
 
 import { serializeOwnerStatus } from "./owner-status.js";
+import { hostThemeMarkup } from "./host-theme.js";
 
 /**
  * @typedef {{ listener?: string | null, tabs?: number, fileExists?: boolean, title?: string, now?: number }} HubFacts
@@ -193,7 +194,7 @@ function jsonScript(value) {
 
 // The beach-and-mountains header from the captain's default style, as one inline SVG anchored to
 // the bottom so a phone shows the middle of the range and a desktop the whole of it.
-const HUB_SCAPE = `<svg class="scape" viewBox="0 0 1200 600" preserveAspectRatio="xMidYMax slice" aria-hidden="true"><defs><linearGradient id="hubsky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0d1836"/><stop offset="0.45" stop-color="#1c3d6e"/><stop offset="0.7" stop-color="#3f86a8"/><stop offset="0.86" stop-color="#9fd3cf"/></linearGradient><linearGradient id="hubsun" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff4d2"/><stop offset="1" stop-color="#ffd98e"/></linearGradient><mask id="hubstripes"><rect width="1200" height="600" fill="#fff"/><rect x="740" y="196" width="280" height="5" fill="#000"/><rect x="740" y="214" width="280" height="7" fill="#000"/><rect x="740" y="234" width="280" height="9" fill="#000"/><rect x="740" y="256" width="280" height="12" fill="#000"/></mask></defs><rect width="1200" height="600" fill="url(#hubsky)"/><circle cx="880" cy="190" r="128" fill="#ffd98e" opacity="0.12"/><circle cx="880" cy="190" r="104" fill="url(#hubsun)" mask="url(#hubstripes)"/><path d="M0 330 L120 250 L230 300 L360 210 L470 290 L600 230 L720 300 L840 240 L960 300 L1080 220 L1200 280 L1200 600 L0 600 Z" fill="#34557f" opacity="0.85"/><polygon points="60,240 -100,430 40,430" fill="#2a5d7c"/><polygon points="60,240 40,430 220,430" fill="#16294a"/><polygon points="330,120 120,430 300,430" fill="#2e6a8a"/><polygon points="330,120 300,430 560,430" fill="#1b3456"/><polygon points="760,170 560,430 720,430" fill="#2a6383"/><polygon points="760,170 720,430 1000,430" fill="#172d4c"/><polygon points="1060,230 900,430 1020,430" fill="#2a5d7c"/><polygon points="1060,230 1020,430 1260,430" fill="#16294a"/><path d="M0 360 C150 330 260 380 400 350 C540 320 660 380 800 355 C940 330 1060 370 1200 345 L1200 600 L0 600 Z" fill="#0f1d38"/><path d="M0 470 C200 455 400 485 600 468 C800 452 1000 482 1200 466 L1200 600 L0 600 Z" fill="#1d6a86"/><path d="M40 492 C140 484 220 498 320 490 M470 500 C560 492 650 506 740 498 M860 488 C950 480 1040 494 1140 486" fill="none" stroke="#8fd0d3" stroke-width="2.5" stroke-linecap="round" opacity="0.6"/><path d="M0 540 C250 520 450 560 700 538 C900 520 1050 548 1200 532 L1200 600 L0 600 Z" fill="#e9d5ae"/><path d="M0 540 C250 520 450 560 700 538 C900 520 1050 548 1200 532" fill="none" stroke="#f7ecd6" stroke-width="5"/></svg>`;
+const HUB_SCAPE = `<svg class="scape" viewBox="0 0 1200 600" preserveAspectRatio="xMidYMax slice" aria-hidden="true"><defs><linearGradient id="hubsky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--sky-0)"/><stop offset="0.45" style="stop-color:var(--sky-1)"/><stop offset="0.7" style="stop-color:var(--sky-2)"/><stop offset="0.86" style="stop-color:var(--sky-3)"/></linearGradient><linearGradient id="hubsun" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--sun-0)"/><stop offset="1" style="stop-color:var(--sun-1)"/></linearGradient><mask id="hubstripes"><rect width="1200" height="600" fill="#fff"/><rect x="740" y="196" width="280" height="5" fill="#000"/><rect x="740" y="214" width="280" height="7" fill="#000"/><rect x="740" y="234" width="280" height="9" fill="#000"/><rect x="740" y="256" width="280" height="12" fill="#000"/></mask></defs><rect width="1200" height="600" fill="url(#hubsky)"/><circle cx="880" cy="190" r="128" style="fill:var(--glow)" opacity="0.12"/><circle cx="880" cy="190" r="104" fill="url(#hubsun)" mask="url(#hubstripes)"/><path d="M0 330 L120 250 L230 300 L360 210 L470 290 L600 230 L720 300 L840 240 L960 300 L1080 220 L1200 280 L1200 600 L0 600 Z" style="fill:var(--ridge)" opacity="0.85"/><polygon points="60,240 -100,430 40,430" style="fill:var(--peak-lit)"/><polygon points="60,240 40,430 220,430" style="fill:var(--peak-shade)"/><polygon points="330,120 120,430 300,430" style="fill:var(--peak-lit-2)"/><polygon points="330,120 300,430 560,430" style="fill:var(--peak-shade-2)"/><polygon points="760,170 560,430 720,430" style="fill:var(--peak-lit-3)"/><polygon points="760,170 720,430 1000,430" style="fill:var(--peak-shade-3)"/><polygon points="1060,230 900,430 1020,430" style="fill:var(--peak-lit)"/><polygon points="1060,230 1020,430 1260,430" style="fill:var(--peak-shade)"/><path d="M0 360 C150 330 260 380 400 350 C540 320 660 380 800 355 C940 330 1060 370 1200 345 L1200 600 L0 600 Z" style="fill:var(--shore)"/><path d="M0 470 C200 455 400 485 600 468 C800 452 1000 482 1200 466 L1200 600 L0 600 Z" style="fill:var(--sea)"/><path d="M40 492 C140 484 220 498 320 490 M470 500 C560 492 650 506 740 498 M860 488 C950 480 1040 494 1140 486" fill="none" style="stroke:var(--surf)" stroke-width="2.5" stroke-linecap="round" opacity="0.6"/><path d="M0 540 C250 520 450 560 700 538 C900 520 1050 548 1200 532 L1200 600 L0 600 Z" style="fill:var(--sand)"/><path d="M0 540 C250 520 450 560 700 538 C900 520 1050 548 1200 532" fill="none" style="stroke:var(--sand-edge)" stroke-width="5"/></svg>`;
 
 const HUB_FONTS =
   '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,800;9..144,900&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">';
@@ -205,19 +206,21 @@ function markHtml(mark) {
 /**
  * The hub page. It renders from `/api/hub`, so the shell carries only the bootstrap.
  *
- * @param {{ boards: any[], hostname: string, generatedAt?: string }} data
+ * @param {{ boards: any[], hostname: string, generatedAt?: string, theme?: string }} data
  */
-export function createHubHtml({ boards, hostname, generatedAt = new Date().toISOString() }) {
+export function createHubHtml({ boards, hostname, generatedAt = new Date().toISOString(), theme = "" }) {
   const mark = hostMark(hostname);
+  const themed = hostThemeMarkup(theme, "hub");
   const bootstrap = jsonScript({ boards, generated_at: generatedAt });
   return `<!doctype html>
-<html lang="en">
+<html lang="en"${themed.htmlAttribute}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>${escapeHtml(mark.accent + mark.rest)} boards · Lavish</title>
 ${HUB_FONTS}
 <link rel="stylesheet" href="/hub.css">
+${themed.style}
 </head>
 <body>
 <header class="hero">${HUB_SCAPE}<div class="wrap inner"><div class="topline">${markHtml(mark)}<span class="pill" id="hubPill" role="status">Loading…</span></div><p class="kicker">Lavish hub</p><h1>Your boards.</h1><p class="lede" id="hubLede">Every review this server knows, and who is there to read what you send.</p></div></header>

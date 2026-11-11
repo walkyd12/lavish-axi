@@ -1,24 +1,60 @@
-/* The Lavish hub, phone first. Captain's default style: warm off-white pages, heavy serif
-   headlines, coral labels, teal links, a cool beach-and-mountains header. The reference coral
-   (#ff5935) and teal (#56c5a5) are used for marks only; small text uses their deeper shades,
-   which hold 4.5:1 on the page. */
+/* The Lavish hub, phone first. Stock look: warm off-white pages, heavy serif headlines, coral
+   labels, teal links, a cool beach-and-mountains header. The mark colours (--mark, --link-mark) are
+   used for marks only; small text uses their deeper shades (--mark-text, --link), which hold 4.5:1
+   on the page. */
 :root {
-  color-scheme: light;
+  /* Every hub colour is a token, so a theme preset (src/host-theme.js) is just a token set laid
+     over this block. These are the stock values. */
+  --color-scheme: light;
+  color-scheme: var(--color-scheme);
   --paper: #faf7f2;
   --card: #ffffff;
   --line: #e8e1d6;
   --line-strong: #d9d0c2;
   --ink: #1b1a16;
   --body: #6a655f;
-  --coral: #ff5935;
-  --coral-text: #c43a17;
-  --teal: #56c5a5;
-  --teal-text: #18705a;
+  --mark: #ff5935;
+  --mark-text: #c43a17;
+  --link-mark: #56c5a5;
+  --link: #18705a;
   --good: #1f7a4d;
   --bad: #b42318;
   --warn-ink: #8a5300;
   --warn-fill: #fff3dc;
   --warn-line: #f2c46d;
+  --you-fill: #f3e7ed;
+  --you-line: #e6d2dc;
+  --hero-bg: #0d1836;
+  --hero-ink: #fff;
+  --hero-kicker: #dbe8f3;
+  --hero-lede: #e3edf5;
+  --hero-shadow: rgba(13, 24, 54, 0.45);
+  --pill-ink: #ffd98e;
+  --pill-good: #9fe3c4;
+  --band: #0b1530;
+  --tab-ink: #c9d6e3;
+  --tab-active: #fff;
+  --backdrop: rgba(13, 24, 54, 0.45);
+  /* The header landscape (HUB_SCAPE in src/hub.js). */
+  --sky-0: #0d1836;
+  --sky-1: #1c3d6e;
+  --sky-2: #3f86a8;
+  --sky-3: #9fd3cf;
+  --sun-0: #fff4d2;
+  --sun-1: #ffd98e;
+  --glow: #ffd98e;
+  --ridge: #34557f;
+  --peak-lit: #2a5d7c;
+  --peak-shade: #16294a;
+  --peak-lit-2: #2e6a8a;
+  --peak-shade-2: #1b3456;
+  --peak-lit-3: #2a6383;
+  --peak-shade-3: #172d4c;
+  --shore: #0f1d38;
+  --sea: #1d6a86;
+  --surf: #8fd0d3;
+  --sand: #e9d5ae;
+  --sand-edge: #f7ecd6;
   --serif: "Fraunces", "Recoleta", Georgia, "Times New Roman", serif;
   --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
@@ -37,7 +73,7 @@ body {
   -webkit-text-size-adjust: 100%;
 }
 a {
-  color: var(--teal-text);
+  color: var(--link);
 }
 .wrap {
   max-width: 760px;
@@ -49,8 +85,8 @@ a {
 .hero {
   position: relative;
   overflow: hidden;
-  color: #fff;
-  background: #0d1836;
+  color: var(--hero-ink);
+  background: var(--hero-bg);
 }
 .hero svg.scape {
   position: absolute;
@@ -76,10 +112,10 @@ a {
   letter-spacing: -0.04em;
 }
 .mk-accent {
-  color: var(--teal);
+  color: var(--link-mark);
 }
 .mk-rest {
-  color: #fff;
+  color: var(--hero-ink);
 }
 .pill {
   display: inline-flex;
@@ -89,20 +125,20 @@ a {
   padding: 5px 12px;
   font: 650 13px/1.2 var(--sans);
   border: 1.5px solid currentColor;
-  color: #ffd98e;
-  background: #0d1836;
+  color: var(--pill-ink);
+  background: var(--hero-bg);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .pill[data-tone="good"] {
-  color: #9fe3c4;
+  color: var(--pill-good);
 }
 .kicker {
   font: 700 12.5px/1.3 var(--sans);
   letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: #dbe8f3;
+  color: var(--hero-kicker);
   margin: 0 0 10px;
 }
 h1,
@@ -116,19 +152,19 @@ h2 {
 .hero h1 {
   font-size: clamp(40px, 12vw, 64px);
   line-height: 0.98;
-  text-shadow: 0 2px 18px rgba(13, 24, 54, 0.45);
+  text-shadow: 0 2px 18px var(--hero-shadow);
 }
 .lede {
   font-size: 17px;
   line-height: 1.5;
-  color: #e3edf5;
+  color: var(--hero-lede);
   margin: 16px 0 0;
   max-width: 34em;
 }
 
 /* Tabs on the dark band under the header */
 .ctaband {
-  background: #0b1530;
+  background: var(--band);
 }
 .tabs {
   display: flex;
@@ -139,14 +175,14 @@ h2 {
   background: none;
   border: 0;
   border-bottom: 2.5px solid transparent;
-  color: #c9d6e3;
+  color: var(--tab-ink);
   font: 600 17px/1.3 var(--sans);
   padding: 4px 0 5px;
   cursor: pointer;
 }
 .tab[aria-pressed="true"] {
-  color: #fff;
-  border-bottom-color: #fff;
+  color: var(--tab-active);
+  border-bottom-color: var(--tab-active);
 }
 .tab span {
   font-weight: 700;
@@ -249,8 +285,8 @@ main.wrap {
   cursor: pointer;
 }
 .act.primary {
-  color: var(--teal-text);
-  border-bottom-color: var(--teal-text);
+  color: var(--link);
+  border-bottom-color: var(--link);
 }
 .act:disabled {
   opacity: 0.5;
@@ -276,7 +312,7 @@ main.wrap {
   color: var(--ink);
 }
 .history::backdrop {
-  background: rgba(13, 24, 54, 0.45);
+  background: var(--backdrop);
 }
 .history-head {
   position: sticky;
@@ -298,7 +334,7 @@ main.wrap {
   font: 700 12px/1.3 var(--sans);
   letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: var(--coral-text);
+  color: var(--mark-text);
   margin: 0 0 6px;
 }
 .close-x {
@@ -308,6 +344,7 @@ main.wrap {
   border: 1px solid var(--line-strong);
   border-radius: 999px;
   background: var(--card);
+  color: var(--ink);
   font-size: 20px;
   line-height: 1;
   cursor: pointer;
@@ -337,19 +374,19 @@ main.wrap {
   margin-bottom: 0;
 }
 .msg-you {
-  background: #f3e7ed;
-  border: 1px solid #e6d2dc;
+  background: var(--you-fill);
+  border: 1px solid var(--you-line);
 }
 .msg-agent {
   background: var(--card);
   border: 1px solid var(--line);
-  border-left: 4px solid var(--teal);
+  border-left: 4px solid var(--link-mark);
 }
 .who {
   font: 700 11.5px/1.3 var(--sans);
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--coral-text);
+  color: var(--mark-text);
 }
 .anchor {
   font-size: 12.5px;
