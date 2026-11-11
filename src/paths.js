@@ -130,6 +130,33 @@ export function extraAllowedHosts(env = process.env) {
   return (env.LAVISH_AXI_ALLOWED_HOSTS || "").split(/\s+/).filter(Boolean);
 }
 
+// Install-level public base URL for every board link the server emits
+// (LAVISH_AXI_PUBLIC_URL), e.g. "https://boards.example.com" when Lavish sits behind a
+// reverse proxy. Returns the normalized origin (no trailing slash), "" when unset, and
+// throws for a value that is not an absolute http(s) origin: Lavish serves its chrome and
+// artifact assets from root-relative paths, so a path prefix, query, fragment, or
+// credentials could never produce working links.
+export function publicBaseUrl(env = process.env) {
+  const raw = env.LAVISH_AXI_PUBLIC_URL?.trim();
+  if (!raw) return "";
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`LAVISH_AXI_PUBLIC_URL is not a valid URL: ${raw}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`LAVISH_AXI_PUBLIC_URL must use http or https: ${raw}`);
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash || raw.includes("?") || raw.includes("#")) {
+    throw new Error(`LAVISH_AXI_PUBLIC_URL must be a bare origin without credentials, query, or fragment: ${raw}`);
+  }
+  if (parsed.pathname.replace(/\/+$/, "") !== "") {
+    throw new Error(`LAVISH_AXI_PUBLIC_URL must not include a path; Lavish serves from the root of its host: ${raw}`);
+  }
+  return parsed.origin;
+}
+
 // Brackets an IPv6 literal so it can be safely interpolated into a URL authority.
 // IPv4 addresses and hostnames pass through unchanged.
 export function hostForUrl(host) {

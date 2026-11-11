@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { bindHost, clientHost, extraAllowedHosts, hostForUrl, LOOPBACK_HOST, linkHost } from "../src/paths.js";
+import {
+  bindHost,
+  clientHost,
+  extraAllowedHosts,
+  hostForUrl,
+  LOOPBACK_HOST,
+  linkHost,
+  publicBaseUrl,
+} from "../src/paths.js";
 
 test("bindHost defaults to loopback and honors LAVISH_AXI_HOST", () => {
   assert.equal(bindHost({}), LOOPBACK_HOST);
@@ -52,4 +60,31 @@ test("hostForUrl brackets IPv6 literals but leaves IPv4 and hostnames alone", ()
   assert.equal(hostForUrl("host.example"), "host.example");
   assert.equal(hostForUrl("::1"), "[::1]");
   assert.equal(hostForUrl("[::1]"), "[::1]");
+});
+
+test("publicBaseUrl normalizes LAVISH_AXI_PUBLIC_URL to a bare origin", () => {
+  assert.equal(publicBaseUrl({}), "");
+  assert.equal(publicBaseUrl({ LAVISH_AXI_PUBLIC_URL: "   " }), "");
+  assert.equal(publicBaseUrl({ LAVISH_AXI_PUBLIC_URL: "https://boards.schip.as" }), "https://boards.schip.as");
+  assert.equal(publicBaseUrl({ LAVISH_AXI_PUBLIC_URL: " https://boards.schip.as/ " }), "https://boards.schip.as");
+  assert.equal(publicBaseUrl({ LAVISH_AXI_PUBLIC_URL: "https://boards.schip.as//" }), "https://boards.schip.as");
+  assert.equal(
+    publicBaseUrl({ LAVISH_AXI_PUBLIC_URL: "HTTPS://Boards.Schip.AS:8443" }),
+    "https://boards.schip.as:8443",
+  );
+  assert.equal(publicBaseUrl({ LAVISH_AXI_PUBLIC_URL: "http://boards.lan" }), "http://boards.lan");
+});
+
+test("publicBaseUrl refuses values that cannot produce working root-relative links", () => {
+  for (const value of [
+    "boards.schip.as",
+    "ftp://boards.schip.as",
+    "https://boards.schip.as/lavish",
+    "https://boards.schip.as/?x=1",
+    "https://boards.schip.as/#top",
+    "https://user:pw@boards.schip.as",
+    "not a url",
+  ]) {
+    assert.throws(() => publicBaseUrl({ LAVISH_AXI_PUBLIC_URL: value }), /LAVISH_AXI_PUBLIC_URL/, value);
+  }
 });

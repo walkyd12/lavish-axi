@@ -7143,3 +7143,93 @@ test("chat-sync stamps a note seen when a poll takes it, working when the artifa
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("LAVISH_AXI_PUBLIC_URL rewrites every emitted board link and allows its host", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body><img src='pic.png'></body></html>");
+  await writeFile(path.join(dir, "pic.png"), "png-bytes");
+  const server = await serve({
+    env: { LAVISH_AXI_HOST: "127.0.0.1", LAVISH_AXI_PUBLIC_URL: "https://Boards.Example.com/" },
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    host: "127.0.0.1",
+    linkHost: "host.example",
+    allowedHosts: [],
+  });
+  try {
+    const opened = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((res) => res.json());
+    const key = sessionKey(await canonicalFile(artifact));
+    assert.equal(opened.url, `https://boards.example.com/session/${key}`);
+
+    const stored = await new SessionStore(path.join(dir, "state.json")).findByKey(key);
+    assert.equal(stored.url, `https://boards.example.com/session/${key}`);
+
+    // A reverse proxy that preserves Host, and one that rewrites Host to loopback and forwards
+    // the public name, both reach the chrome page and its root-relative assets.
+    const proxied = [
+      { host: "boards.example.com" },
+      {
+        host: `127.0.0.1:${server.port}`,
+        headers: { "x-forwarded-host": "boards.example.com", "x-forwarded-proto": "https" },
+      },
+    ];
+    for (const options of proxied) {
+      const page = await rawRequest(server.port, `/session/${key}`, options);
+      assert.equal(page.status, 200);
+      assert.match(page.body, /"\/chrome\.css/);
+      assert.equal((await rawRequest(server.port, "/chrome.css", options)).status, 200);
+      assert.equal((await rawRequest(server.port, "/chrome-client.js", options)).status, 200);
+      // The artifact document itself needs a live load token; reaching that check (409, not 403)
+      // proves the proxied host passed the allowlist.
+      assert.equal((await rawRequest(server.port, `/artifact/${key}/index.html`, options)).status, 409);
+      assert.equal((await rawRequest(server.port, `/artifact/${key}/pic.png`, options)).status, 200);
+      assert.equal((await rawRequest(server.port, "/", options)).status, 200);
+      assert.equal((await rawRequest(server.port, "/hub.css", options)).status, 200);
+    }
+
+    // Other hosts stay rejected, and the denied page points at the public URL.
+    const forged = await rawRequest(server.port, `/session/${key}`, {
+      host: "evil.example",
+      headers: { accept: "text/html" },
+    });
+    assert.equal(forged.status, 403);
+    assert.match(forged.body, new RegExp(`https://boards\\.example\\.com/session/${key}`));
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("without LAVISH_AXI_PUBLIC_URL board links keep the link host and port", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({
+    env: { LAVISH_AXI_HOST: "127.0.0.1" },
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    host: "127.0.0.1",
+    linkHost: "host.example",
+    allowedHosts: [],
+  });
+  try {
+    const opened = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((res) => res.json());
+    const key = sessionKey(await canonicalFile(artifact));
+    assert.equal(opened.url, `http://host.example:${server.port}/session/${key}`);
+    assert.equal((await rawRequest(server.port, "/health", { host: "boards.example.com" })).status, 403);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
