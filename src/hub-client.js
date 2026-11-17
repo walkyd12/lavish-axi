@@ -7,6 +7,7 @@ const REFRESH_MS = 10_000;
 const dataElement = document.getElementById("hub-data");
 const initial = JSON.parse(dataElement?.textContent || "{}");
 let boards = Array.isArray(initial.boards) ? initial.boards : [];
+let peers = Array.isArray(initial.peers) ? initial.peers : [];
 let generatedAt = String(initial.generated_at || "");
 let showing = "open";
 /** @type {Set<string>} */
@@ -17,6 +18,7 @@ let refreshTimer;
 const list = /** @type {HTMLOListElement} */ (document.getElementById("boards"));
 const empty = /** @type {HTMLParagraphElement} */ (document.getElementById("hubEmpty"));
 const note = /** @type {HTMLParagraphElement} */ (document.getElementById("hubNote"));
+const peerNote = /** @type {HTMLParagraphElement} */ (document.getElementById("peerNote"));
 const pill = /** @type {HTMLSpanElement} */ (document.getElementById("hubPill"));
 const lede = /** @type {HTMLParagraphElement} */ (document.getElementById("hubLede"));
 const updated = /** @type {HTMLSpanElement} */ (document.getElementById("hubUpdated"));
@@ -96,7 +98,27 @@ function shortPath(file) {
   return parts.length > 3 ? "…/" + parts.slice(-3).join("/") : String(file || "");
 }
 
+// Whether a URL is safe to put in an href: only http(s). Peer links are built by this hub's server
+// from its configured peer origin, but the page still refuses anything else.
+function safeHref(url) {
+  try {
+    const parsed = new URL(String(url || ""), location.href);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+
+// A peer's board lives on the peer's server: this hub only links to it. Close, Reopen and History
+// are the peer's to offer, so a peer card has Open and nothing else.
+function peerActionsHtml(board) {
+  const href = safeHref(board.url);
+  if (board.status === "ended" || board.state === "file-gone" || !href) return "";
+  return `<a class="act primary" href="${escapeHtml(href)}">Open on ${escapeHtml(board.source)} →</a>`;
+}
+
 function actionsHtml(board) {
+  if (board.source) return peerActionsHtml(board);
   const key = escapeHtml(board.key);
   const disabled = busy.has(board.key) ? " disabled" : "";
   const actions = [];
@@ -123,8 +145,9 @@ function boardHtml(board) {
     `<li class="board" data-key="${escapeHtml(board.key)}">` +
     `<div class="board-head"><h2 class="board-title">${escapeHtml(board.title)}</h2>` +
     `<span class="st st-${escapeHtml(board.tone)}">${escapeHtml(board.state_label)}</span></div>` +
+    (board.source ? `<p class="peer-badge">On ${escapeHtml(board.source)}</p>` : "") +
     `<p class="meta">${escapeHtml(metaLine(board))}</p>` +
-    `<p class="path" title="${escapeHtml(board.file)}">${escapeHtml(shortPath(board.file))}</p>` +
+    (board.source ? "" : `<p class="path" title="${escapeHtml(board.file)}">${escapeHtml(shortPath(board.file))}</p>`) +
     `<div class="acts">${actionsHtml(board)}</div>` +
     `</li>`
   );
@@ -162,6 +185,14 @@ function render() {
     (openBoards.length ? "." : "");
   if (!openBoards.length) lede.textContent = "No open boards. Closed ones can be reopened below.";
   updated.textContent = generatedAt ? new Date(generatedAt).toLocaleTimeString() : "";
+  const down = peers.filter((peer) => peer && peer.ok === false).map((peer) => String(peer.name));
+  peerNote.textContent = down.length
+    ? (down.length === 1 ? down[0] + " is" : down.join(", ") + " are") +
+      " not answering, so " +
+      (down.length === 1 ? "its" : "their") +
+      " boards are missing from this list."
+    : "";
+  peerNote.hidden = !down.length;
 }
 
 function showNote(text, tone = "") {
@@ -177,6 +208,7 @@ async function refresh() {
     if (!response.ok) throw new Error("hub request failed: " + response.status);
     const data = await response.json();
     boards = Array.isArray(data.boards) ? data.boards : [];
+    peers = Array.isArray(data.peers) ? data.peers : [];
     generatedAt = String(data.generated_at || "");
     if (note.dataset.tone === "offline") showNote("");
     render();
@@ -281,7 +313,7 @@ list.addEventListener("click", (event) => {
   const button = /** @type {HTMLButtonElement | null} */ (target.closest?.("button[data-act]") || null);
   if (!button || button.disabled) return;
   const board = boards.find((candidate) => candidate.key === button.dataset.key);
-  if (!board) return;
+  if (!board || board.source) return;
   if (button.dataset.act === "close") closeBoard(board);
   else if (button.dataset.act === "reopen") reopenBoard(board);
   else if (button.dataset.act === "history") showHistory(board);

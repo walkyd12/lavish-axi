@@ -206,12 +206,12 @@ function markHtml(mark) {
 /**
  * The hub page. It renders from `/api/hub`, so the shell carries only the bootstrap.
  *
- * @param {{ boards: any[], hostname: string, generatedAt?: string, theme?: string }} data
+ * @param {{ boards: any[], peers?: any[], hostname: string, generatedAt?: string, theme?: string }} data
  */
-export function createHubHtml({ boards, hostname, generatedAt = new Date().toISOString(), theme = "" }) {
+export function createHubHtml({ boards, peers = [], hostname, generatedAt = new Date().toISOString(), theme = "" }) {
   const mark = hostMark(hostname);
   const themed = hostThemeMarkup(theme, "hub");
-  const bootstrap = jsonScript({ boards, generated_at: generatedAt });
+  const bootstrap = jsonScript({ boards, peers, generated_at: generatedAt });
   return `<!doctype html>
 <html lang="en"${themed.htmlAttribute}>
 <head>
@@ -227,6 +227,7 @@ ${themed.style}
 <div class="ctaband"><div class="wrap"><nav class="tabs" aria-label="Boards"><button type="button" class="tab" id="tabOpen" aria-pressed="true">Open <span id="countOpen">0</span></button><button type="button" class="tab" id="tabClosed" aria-pressed="false">Closed <span id="countClosed">0</span></button></nav></div></div>
 <main class="wrap">
 <p class="note" id="hubNote" role="status" hidden></p>
+<p class="note" id="peerNote" data-tone="offline" role="status" hidden></p>
 <ol class="boards" id="boards" aria-live="polite"></ol>
 <p class="empty" id="hubEmpty" hidden></p>
 <p class="foot">Updated <span id="hubUpdated"></span>. Close keeps the board's file and its conversation; Reopen brings it back. Lavish Editor</p>

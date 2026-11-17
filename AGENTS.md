@@ -55,7 +55,7 @@ Each line is the rule. [docs/invariants.md](docs/invariants.md) has the failure 
 - The detached server entrypoint logs `uncaughtException` and exits 1 explicitly. Each listener keeps its `error` handler after `listening`. [Process model](docs/invariants.md#process-model).
 - `/api/:key/prompts`, `/share`, whiteboard writes, and attachment upload/delete are same-origin guarded. The key alone must never queue a prompt or publish. [Request flow](docs/invariants.md#request-flow).
 - Poll control `GET` and `POST` requests reject a present foreign Origin or Referer while header-less CLI requests keep working. [Request flow](docs/invariants.md#request-flow).
-- The chrome page (`/session/:key`) answers `X-Frame-Options: DENY` and `frame-ancestors 'none'`. Keep that header off `/artifact/*` and `/whiteboard-frame`, which are framed. [Request flow](docs/invariants.md#request-flow).
+- The chrome page (`/session/:key`) answers `X-Frame-Options: DENY` and `frame-ancestors 'none'; frame-src 'self'`. Keep that header off `/artifact/*` and `/whiteboard-frame`, which are framed. [Request flow](docs/invariants.md#request-flow).
 - The artifact route injects only the one SDK `<script>` tag. Served artifact bytes otherwise match the file on disk. [Request flow](docs/invariants.md#request-flow).
 - `/api/sessions` refuses a path that is not a regular `.html`/`.htm` file after `realpath`. [Request flow](docs/invariants.md#request-flow).
 - Artifact asset serving (`/artifact/:key/<path>`) stays inside that session's HTML-file directory, resolves with `realpath`, and never serves a symlink target outside that tree. [Request flow](docs/invariants.md#request-flow).
@@ -66,6 +66,7 @@ Each line is the rule. [docs/invariants.md](docs/invariants.md) has the failure 
 - Only agent chat entries render as HTML. User entries are always escaped. [Request flow](docs/invariants.md#request-flow).
 - A note's Sending state is derived from the existing send bookkeeping, never tracked separately. [Request flow](docs/invariants.md#request-flow).
 - Hub board state is computed per request, never stored. `/api/hub/:key/close` is same-origin guarded and never shuts the server down. `LAVISH_AXI_ON_END` runs detached, without a shell, and never delays an end. [The hub](docs/invariants.md#the-hub).
+- Hub peer boards (`LAVISH_AXI_HUB_PEERS`) are read-only and untrusted: rebuilt field by field in `src/hub-peers.js`, linked from the configured origin, never closed (`peer:` keys are refused). [The hub](docs/invariants.md#the-hub).
 - `/api/:key/prompts` rejects every new batch for an ended session. Only the internal `restore` replay is exempt. [Request flow](docs/invariants.md#request-flow).
 - A session the user ended never reopens without explicit opt-in (`reopen: true`, the CLI's `--reopen`). [Request flow](docs/invariants.md#request-flow).
 - Poll ownership is exclusive per session in `activePolls`. Takeover installs the new holder before releasing the old one, and claims, including the reply write, serialize through `pollOwnershipLock`. [Request flow](docs/invariants.md#request-flow).
