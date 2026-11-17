@@ -59,6 +59,7 @@ import { hostRejectedShareWrite, publishedDespiteError, publishToHtmlApp } from 
 import { serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
 import { OwnerStatusError, serializeOwnerStatus } from "./owner-status.js";
 import { boardTitle, conversationMarkdown, createHubHtml, serializeHubBoard, sortHubBoards } from "./hub.js";
+import { createPeerBoardSource, HUB_PEERS_ENV, isPeerKey, parseHubPeers } from "./hub-peers.js";
 import { DraftTooLargeError, normalizeDraftTabId, serializeDrafts } from "./review-drafts.js";
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { injectLavishSdk } from "./html-transform.js";
@@ -320,6 +321,8 @@ export async function serve({
   bindRecoveryDelaysMs = BIND_RECOVERY_DELAYS_MS,
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
   theme = resolveHostTheme(env),
+  hubPeers = env[HUB_PEERS_ENV],
+  hubPeerOptions = {},
 } = {}) {
   // Keep the transport dependency off fast metadata paths such as `--version`.
   const { WebSocket, WebSocketServer } = await import("ws");
@@ -836,6 +839,22 @@ export async function serve({
     return count;
   }
 
+  // LAVISH_AXI_HUB_PEERS (src/hub-peers.js): other Lavish servers whose boards this hub also
+  // lists, read from their /api/hub. A bad entry is logged and dropped, never fatal.
+  const parsedPeers = parseHubPeers(hubPeers);
+  for (const error of parsedPeers.errors) writeLog(`[lavish] ${error}; skipped`);
+  const collectPeerBoards = parsedPeers.peers.length ? createPeerBoardSource(parsedPeers.peers, hubPeerOptions) : null;
+
+  /** @param {{ includePeers?: boolean }} [options] */
+  async function hubView({ includePeers = true } = {}) {
+    const [local, remote] = await Promise.all([
+      hubBoards(),
+      includePeers && collectPeerBoards ? collectPeerBoards() : null,
+    ]);
+    if (!remote) return { boards: local, peers: [] };
+    return { boards: sortHubBoards([...local, ...remote.boards]), peers: remote.peers };
+  }
+
   async function hubBoards() {
     const sessions = await store.listSessions();
     const now = Date.now();
@@ -859,15 +878,19 @@ export async function serve({
     try {
       res.setHeader("x-frame-options", "DENY");
       res.setHeader("content-security-policy", "frame-ancestors 'none'");
-      res.type("html").send(createHubHtml({ boards: await hubBoards(), hostname: osHostname(), theme }));
+      const view = await hubView();
+      res.type("html").send(createHubHtml({ ...view, hostname: osHostname(), theme }));
     } catch (error) {
       next(error);
     }
   });
 
-  app.get("/api/hub", async (_req, res, next) => {
+  app.get("/api/hub", async (req, res, next) => {
     try {
-      res.json({ boards: await hubBoards(), generated_at: new Date().toISOString() });
+      // `?peers=0` is what a peer hub asks for: this server's own boards only, so hubs that list
+      // each other never loop.
+      const view = await hubView({ includePeers: req.query.peers !== "0" });
+      res.json({ ...view, generated_at: new Date().toISOString() });
     } catch (error) {
       next(error);
     }
@@ -879,6 +902,11 @@ export async function serve({
     try {
       if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
         res.status(403).json({ error: "cross-origin close rejected" });
+        return;
+      }
+      // A peer's board belongs to the peer: this hub only links to it and never ends it.
+      if (isPeerKey(req.params.key)) {
+        res.status(400).json({ error: "a peer's board is closed on its own server" });
         return;
       }
       const session = await store.endSession(req.params.key, "user");
@@ -1740,7 +1768,10 @@ export async function serve({
       // that artifact document, whose sandbox gives it an opaque origin no
       // frame-ancestors expression can name.
       res.setHeader("x-frame-options", "DENY");
-      res.setHeader("content-security-policy", "frame-ancestors 'none'");
+      // `frame-src 'self'` keeps the artifact iframe on this server: a board script that
+      // navigates its own frame to another site (`location.href = "https://x/?data"`) is refused
+      // by the browser before any request leaves. Links meant for elsewhere open a new tab.
+      res.setHeader("content-security-policy", "frame-ancestors 'none'; frame-src 'self'");
       res.type("html").send(
         createChromeHtml(session, {
           layoutGateEnabled: shouldEnableLayoutGate(req.query || {}),

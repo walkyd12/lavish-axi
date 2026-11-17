@@ -2084,6 +2084,8 @@ test("the session chrome page refuses to be framed", async () => {
     assert.equal(chrome.status, 200);
     assert.equal(chrome.headers.get("x-frame-options"), "DENY");
     assert.match(String(chrome.headers.get("content-security-policy")), /frame-ancestors 'none'/);
+    // A board may not navigate its own frame to another site and carry data with it.
+    assert.match(String(chrome.headers.get("content-security-policy")), /frame-src 'self'/);
 
     // The artifact route must stay framable: the chrome itself frames it.
     const load = await beginArtifactLoad(base, key);
@@ -7235,6 +7237,79 @@ test("without LAVISH_AXI_PUBLIC_URL board links keep the link host and port", as
     assert.equal((await rawRequest(server.port, "/health", { host: "boards.example.com" })).status, 403);
   } finally {
     await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Hub peers (LAVISH_AXI_HUB_PEERS): this hub also lists another server's boards, linked to that
+// server, and never closes them; a dead peer costs only the short timeout.
+test("the hub lists a peer's boards beside its own and never closes them", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-hub-peers-"));
+  const mine = path.join(dir, "mine.html");
+  const theirs = path.join(dir, "theirs.html");
+  await writeFile(mine, "<!doctype html><html><head><title>Mine</title></head><body></body></html>");
+  await writeFile(theirs, "<!doctype html><html><head><title>Theirs <b></title></head><body></body></html>");
+  const peer = await serve({ port: 0, stateFile: path.join(dir, "peer-state.json"), version: "9.9.9-test" });
+  const peerBase = `http://127.0.0.1:${peer.port}`;
+  const hub = await serve({
+    port: 0,
+    stateFile: path.join(dir, "hub-state.json"),
+    version: "9.9.9-test",
+    hubPeers: `walkmate=${peerBase},dead=http://127.0.0.1:9,bad=ftp://x`,
+    hubPeerOptions: { timeoutMs: 500 },
+  });
+  const base = `http://127.0.0.1:${hub.port}`;
+  try {
+    const open = (server, file) =>
+      fetch(`${server}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file }),
+      }).then((response) => response.json());
+    const mineKey = (await open(base, mine)).key;
+    const theirsKey = (await open(peerBase, theirs)).key;
+
+    const view = await fetch(`${base}/api/hub`).then((response) => response.json());
+    const byTitle = Object.fromEntries(view.boards.map((board) => [board.title, board]));
+    assert.equal(byTitle.Mine.key, mineKey);
+    assert.equal(byTitle.Mine.source, undefined);
+    const peerBoard = byTitle["Theirs <b>"];
+    assert.equal(peerBoard.key, `peer:walkmate:${theirsKey}`);
+    assert.equal(peerBoard.source, "walkmate");
+    assert.equal(peerBoard.url, `${peerBase}/session/${theirsKey}`);
+    assert.equal(peerBoard.file, "", "a peer's file path never reaches this hub");
+    assert.deepEqual(
+      view.peers.map((entry) => [entry.name, entry.ok]),
+      [
+        ["walkmate", true],
+        ["dead", false],
+      ],
+    );
+
+    // A peer is asked for its own boards only, so two hubs that list each other never loop.
+    const own = await fetch(`${base}/api/hub?peers=0`).then((response) => response.json());
+    assert.deepEqual(
+      own.boards.map((board) => board.key),
+      [mineKey],
+    );
+    assert.deepEqual(own.peers, []);
+
+    // The page bootstraps with the peer boards too.
+    const html = await fetch(`${base}/`).then((response) => response.text());
+    assert.match(html, /peer:walkmate:/);
+    assert.doesNotMatch(html, /Theirs <b>/, "peer strings are JSON-escaped in the bootstrap");
+
+    // Closing a peer's board from this hub is refused, even from the hub page itself.
+    const closePeer = await fetch(`${base}/api/hub/${encodeURIComponent(peerBoard.key)}/close`, {
+      method: "POST",
+      headers: { origin: base },
+    });
+    assert.equal(closePeer.status, 400);
+    const still = await fetch(`${peerBase}/api/hub`).then((response) => response.json());
+    assert.equal(still.boards.find((board) => board.key === theirsKey).status, "open");
+  } finally {
+    await hub.close();
+    await peer.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
