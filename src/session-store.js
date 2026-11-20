@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { BoardMetadataError, normalizeCreator, normalizeTags, serializeBoardMetadata } from "./board-metadata.js";
 import {
   applyDiagnosticPass,
   dismissLayoutWarning as dismissWarningRecord,
@@ -114,15 +115,16 @@ export class SessionStore {
     });
   }
 
-  async upsertSession(file, url) {
+  async upsertSession(file, url, { creator = undefined, version = "" } = {}) {
+    creator = normalizeCreator(creator);
     // `canonicalFile` (a realpath) does not touch state, so resolve it before
     // taking the lock and keep only the read-modify-write inside the critical
     // section.
     const absolute = await canonicalFile(file);
-    return this.lock.runExclusive(() => this.#upsertSessionLocked(absolute, url));
+    return this.lock.runExclusive(() => this.#upsertSessionLocked(absolute, url, creator, version));
   }
 
-  async #upsertSessionLocked(absolute, url) {
+  async #upsertSessionLocked(absolute, url, creator, version) {
     const key = sessionKey(absolute);
     const state = await this.readState();
     const existing = state.sessions[key] || {};
@@ -133,6 +135,10 @@ export class SessionStore {
       file: absolute,
       url,
       status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
+      tags: serializeBoardMetadata(existing).tags,
+      creator: existing.creator || (!existing.key ? creator : ""),
+      created_version: existing.created_version || (!existing.key ? version : ""),
+      served_version: version || existing.served_version || "",
       pending_prompts: existing.pending_prompts || 0,
       prompts: existingPrompts,
       // The warning inbox is durable review state, not deliverable feedback: reopening a session
@@ -176,6 +182,41 @@ export class SessionStore {
     state.sessions[key] = session;
     await this.writeState(state);
     return session;
+  }
+
+  async updateBoardTags(key, patch) {
+    if (
+      !patch ||
+      typeof patch !== "object" ||
+      Array.isArray(patch) ||
+      Object.keys(patch).some((key) => !["add", "remove"].includes(key))
+    ) {
+      throw new BoardMetadataError("Use add and remove tag lists");
+    }
+    const add = normalizeTags(patch.add || []);
+    const remove = new Set(normalizeTags(patch.remove || []).map((tag) => tag.toLowerCase()));
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      const tags = normalizeTags([...(session.tags || []).filter((tag) => !remove.has(tag.toLowerCase())), ...add]);
+      if (JSON.stringify(tags) === JSON.stringify(session.tags || [])) return session;
+      session.tags = tags;
+      session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return session;
+    });
+  }
+
+  async recordServedVersion(key, version) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session || session.served_version === version) return session || null;
+      session.served_version = version;
+      await this.writeState(state);
+      return session;
+    });
   }
 
   // `options.resolveAttachment(key, id) => Promise<metadata|null>` is the trust

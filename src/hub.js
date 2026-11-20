@@ -3,11 +3,12 @@
 // read a board's conversation. These are pure functions over stored sessions plus the live facts
 // the server passes in, so the state rules are unit-testable without a server.
 
+import { serializeBoardMetadata, boardVersionBehind } from "./board-metadata.js";
 import { serializeOwnerStatus } from "./owner-status.js";
 import { hostThemeMarkup } from "./host-theme.js";
 
 /**
- * @typedef {{ listener?: string | null, tabs?: number, fileExists?: boolean, title?: string, now?: number }} HubFacts
+ * @typedef {{ listener?: string | null, tabs?: number, fileExists?: boolean, title?: string, searchText?: string, version?: string, now?: number }} HubFacts
  */
 
 // One state per board, most urgent first. Each is something the reviewer can act on:
@@ -83,6 +84,9 @@ export function serializeHubBoard(session, facts = {}) {
   const chat = Array.isArray(session?.chat) ? session.chat : [];
   const state = hubBoardState(session, facts);
   return {
+    ...serializeBoardMetadata(session),
+    version_behind: boardVersionBehind(session, facts.version),
+    search_text: facts.searchText || "",
     key: String(session.key),
     file: String(session.file || ""),
     title: boardTitle(session, facts.title),
@@ -219,13 +223,16 @@ export function createHubHtml({ boards, peers = [], hostname, generatedAt = new 
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>${escapeHtml(mark.accent + mark.rest)} boards · Lavish</title>
 ${HUB_FONTS}
+<link rel="stylesheet" href="/board-metadata.css">
 <link rel="stylesheet" href="/hub.css">
 ${themed.style}
 </head>
 <body>
-<header class="hero">${HUB_SCAPE}<div class="wrap inner"><div class="topline">${markHtml(mark)}<span class="pill" id="hubPill" role="status">Loading…</span></div><p class="kicker">Lavish hub</p><h1>Your boards.</h1><p class="lede" id="hubLede">Every review this server knows, and who is there to read what you send.</p></div></header>
+<header class="hero">${HUB_SCAPE}<div class="wrap inner"><div class="topline">${markHtml(mark)}<span class="pill" id="hubPill" role="status">Loading…</span></div><p class="kicker">Fusion Hub</p><h1>Your boards.</h1><p class="lede" id="hubLede">Every review this server knows, and who is there to read what you send.</p></div></header>
 <div class="ctaband"><div class="wrap"><nav class="tabs" aria-label="Boards"><button type="button" class="tab" id="tabOpen" aria-pressed="true">Open <span id="countOpen">0</span></button><button type="button" class="tab" id="tabClosed" aria-pressed="false">Closed <span id="countClosed">0</span></button></nav></div></div>
 <main class="wrap">
+<div class="hub-search"><label>Search boards<input id="hubSearch" type="search" placeholder="Title, tag or board text" aria-describedby="searchHint"></label><label>Filter by tag<select id="hubTag"><option value="">All tags</option></select></label></div>
+<p class="meta" id="searchHint">Search and tag filters include open and closed boards from every relay.</p>
 <p class="note" id="hubNote" role="status" hidden></p>
 <p class="note" id="peerNote" data-tone="offline" role="status" hidden></p>
 <ol class="boards" id="boards" aria-live="polite"></ol>
@@ -234,6 +241,7 @@ ${themed.style}
 </main>
 <dialog class="history" id="history" aria-labelledby="historyTitle"><div class="history-head"><div><p class="eyebrow">Conversation</p><h2 id="historyTitle"></h2></div><button type="button" class="close-x" id="historyClose" aria-label="Close conversation">×</button></div><div class="history-body" id="historyBody"></div></dialog>
 <script id="hub-data" type="application/json">${bootstrap}</script>
+<script src="/board-metadata-client.js"></script>
 <script src="/hub-client.js"></script>
 </body>
 </html>`;

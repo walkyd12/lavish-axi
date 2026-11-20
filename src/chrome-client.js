@@ -3663,6 +3663,7 @@ async function endSession(terminal = null) {
 function markSessionEnded() {
   if (ended) return;
   ended = true;
+  window["lavishBoardMetadata"]?.update({ key, closed: true });
   pendingAcknowledgements.clear();
   clearSendAcknowledgementWarning();
   terminalSubmission = null;
@@ -5338,6 +5339,7 @@ events.set("chat-sync", (data) => {
 events.set("agent-presence", (data) => setAgentPresence(data.mode === "external-listener" ? "external" : data.state));
 events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
 events.set("ended", () => markSessionEnded());
+events.set("board-metadata", (data) => window["lavishBoardMetadata"]?.update({ key, ...data }));
 events.set("owner-status", (data) => setOwnerStatus(data.owner || null));
 connectLiveEvents();
 

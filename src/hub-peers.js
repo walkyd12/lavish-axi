@@ -121,6 +121,21 @@ export function serializePeerBoard(peer, board) {
   return {
     key: `${PEER_KEY_PREFIX}${peer.name}:${board.key}`,
     peer_key: board.key,
+    tags: Array.isArray(board.tags)
+      ? [
+          ...new Set(
+            board.tags
+              .slice(0, 32)
+              .map((tag) => text(tag, 64))
+              .filter(Boolean),
+          ),
+        ]
+      : [],
+    creator: text(board.creator, 120),
+    created_version: text(board.created_version, 40),
+    served_version: text(board.served_version, 40),
+    closed: status === "ended",
+    search_text: text(board.search_text, 64 * 1024),
     source: peer.name,
     file: "",
     title: text(board.title, 200) || "Untitled board",

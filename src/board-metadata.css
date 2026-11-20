@@ -1,0 +1,95 @@
+/* Inherit each host surface's theme tokens. Board content never uses these styles. */
+[data-board-metadata] {
+  --metadata-ink: var(--body);
+  --metadata-bg: var(--card);
+  --metadata-line: var(--line-strong);
+  --metadata-accent: var(--link);
+  margin: 12px 0;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--metadata-ink);
+}
+.chrome-board-metadata {
+  --metadata-ink: var(--fg-muted);
+  --metadata-bg: var(--bg-panel);
+  --metadata-line: var(--border);
+  --metadata-accent: var(--accent);
+  padding: 0 16px 12px;
+  border-bottom: 1px solid var(--metadata-line);
+}
+.board-provenance {
+  margin: 0 0 8px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.board-provenance strong {
+  color: var(--metadata-accent);
+}
+.board-tags,
+.person-tags,
+.tag-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+[data-board-metadata] button,
+[data-board-metadata] input,
+.board-tag {
+  font: inherit;
+  color: inherit;
+  background: var(--metadata-bg);
+  border: 1px solid var(--metadata-line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+[data-board-metadata] button,
+.tag-editor summary {
+  cursor: pointer;
+}
+[data-board-metadata] button:focus-visible,
+[data-board-metadata] input:focus-visible,
+.tag-editor summary:focus-visible {
+  outline: 2px solid var(--metadata-accent);
+  outline-offset: 2px;
+}
+[data-board-metadata] button[aria-pressed="true"] {
+  border-color: var(--metadata-accent);
+  color: var(--metadata-accent);
+}
+.board-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  min-width: 0;
+}
+.board-tag button {
+  border: 0;
+  background: none;
+}
+span.board-tag:not(:has(button)) {
+  padding: 6px 10px;
+}
+.tag-editor {
+  margin-top: 8px;
+}
+.tag-editor summary {
+  width: fit-content;
+  color: var(--metadata-accent);
+}
+.person-tags,
+.tag-form {
+  margin-top: 8px;
+}
+.tag-form input {
+  min-width: 0;
+  flex: 1 1 100px;
+}
+.board-close {
+  margin-top: 10px;
+}
+.metadata-notice {
+  margin: 8px 0 0;
+}

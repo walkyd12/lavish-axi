@@ -47,6 +47,8 @@ await chmod("dist/server.mjs", 0o755);
 
 await copyFile("src/chrome-client.js", "dist/chrome-client.js");
 await copyFile("src/chrome.css", "dist/chrome.css");
+await copyFile("src/board-metadata.css", "dist/board-metadata.css");
+await copyFile("src/board-metadata-client.js", "dist/board-metadata-client.js");
 await copyFile("src/hub-client.js", "dist/hub-client.js");
 await copyFile("src/hub.css", "dist/hub.css");
 await mkdir("dist/design", { recursive: true });

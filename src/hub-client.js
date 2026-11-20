@@ -24,6 +24,8 @@ const lede = /** @type {HTMLParagraphElement} */ (document.getElementById("hubLe
 const updated = /** @type {HTMLSpanElement} */ (document.getElementById("hubUpdated"));
 const tabOpen = /** @type {HTMLButtonElement} */ (document.getElementById("tabOpen"));
 const tabClosed = /** @type {HTMLButtonElement} */ (document.getElementById("tabClosed"));
+const search = /** @type {HTMLInputElement} */ (document.getElementById("hubSearch"));
+const tagFilter = /** @type {HTMLSelectElement} */ (document.getElementById("hubTag"));
 const countOpen = /** @type {HTMLSpanElement} */ (document.getElementById("countOpen"));
 const countClosed = /** @type {HTMLSpanElement} */ (document.getElementById("countClosed"));
 const history = /** @type {HTMLDialogElement} */ (document.getElementById("history"));
@@ -148,6 +150,7 @@ function boardHtml(board) {
     (board.source ? `<p class="peer-badge">On ${escapeHtml(board.source)}</p>` : "") +
     `<p class="meta">${escapeHtml(metaLine(board))}</p>` +
     (board.source ? "" : `<p class="path" title="${escapeHtml(board.file)}">${escapeHtml(shortPath(board.file))}</p>`) +
+    `<div data-board-metadata="${escapeHtml(board.key)}" data-readonly="${Boolean(board.source)}" data-metadata="${escapeHtml(JSON.stringify(board))}"></div>` +
     `<div class="acts">${actionsHtml(board)}</div>` +
     `</li>`
   );
@@ -160,10 +163,35 @@ function render() {
   countClosed.textContent = String(closedBoards.length);
   tabOpen.setAttribute("aria-pressed", showing === "open" ? "true" : "false");
   tabClosed.setAttribute("aria-pressed", showing === "closed" ? "true" : "false");
-  const shown = showing === "open" ? openBoards : closedBoards;
+  const selected = tagFilter.value;
+  const names = new Map();
+  for (const tag of boards.flatMap((board) => board.tags || [])) {
+    if (!names.has(tag.toLowerCase())) names.set(tag.toLowerCase(), tag);
+  }
+  const tags = [...names.values()].sort((a, b) => a.localeCompare(b));
+  tagFilter.innerHTML =
+    '<option value="">All tags</option>' +
+    tags.map((tag) => `<option value="${escapeHtml(tag)}">${escapeHtml(tag)}</option>`).join("");
+  tagFilter.value = tags.find((tag) => tag.toLowerCase() === selected.toLowerCase()) || "";
+  const query = search.value.trim().toLowerCase();
+  const searching = Boolean(query || tagFilter.value);
+  const candidates = searching ? boards : showing === "open" ? openBoards : closedBoards;
+  const shown = candidates.filter((board) => {
+    const tags = board.tags || [];
+    const haystack = [board.title, board.search_text, ...tags].join(" ").toLowerCase();
+    return (
+      (!tagFilter.value || tags.some((tag) => tag.toLowerCase() === tagFilter.value.toLowerCase())) &&
+      query.split(/\s+/).every((word) => haystack.includes(word))
+    );
+  });
   list.innerHTML = shown.map(boardHtml).join("");
+  window.dispatchEvent(new CustomEvent("lavish:render-metadata"));
   empty.hidden = shown.length > 0;
-  empty.textContent = showing === "open" ? "No open boards." : "No closed boards yet.";
+  empty.textContent = searching
+    ? "No matching boards."
+    : showing === "open"
+      ? "No open boards."
+      : "No closed boards yet.";
 
   const listening = openBoards.filter((board) => board.state === "taking-input").length;
   const unread = openBoards.filter((board) => board.state === "unread").length;
@@ -211,7 +239,7 @@ async function refresh() {
     peers = Array.isArray(data.peers) ? data.peers : [];
     generatedAt = String(data.generated_at || "");
     if (note.dataset.tone === "offline") showNote("");
-    render();
+    if (!list.contains(document.activeElement) || !document.activeElement?.matches("input")) render();
   } catch {
     showNote("Lavish is not answering. The list below may be out of date.", "offline");
   } finally {
@@ -220,7 +248,6 @@ async function refresh() {
 }
 
 async function closeBoard(board) {
-  if (!window.confirm(`Close "${board.title}"? The file and its conversation are kept; you can reopen it.`)) return;
   busy.add(board.key);
   render();
   try {
@@ -335,5 +362,12 @@ document.addEventListener("visibilitychange", () => {
 });
 if (location.hash === "#closed") showing = "closed";
 
+search.addEventListener("input", render);
+tagFilter.addEventListener("change", render);
+window.addEventListener("lavish:metadata-saved", (event) => {
+  const detail = /** @type {CustomEvent} */ (event).detail;
+  boards = boards.map((board) => (board.key === detail.key ? { ...board, ...detail } : board));
+  render();
+});
 render();
 refreshTimer = setTimeout(refresh, REFRESH_MS);

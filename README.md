@@ -273,6 +273,27 @@ pnpm link
 - **Public URL (reverse proxy)** - Set `LAVISH_AXI_PUBLIC_URL` to an `http(s)` origin, such as `LAVISH_AXI_PUBLIC_URL=https://boards.example.com`, when Lavish sits behind a reverse proxy at that name. Every board link Lavish emits then starts with it instead of `http://<link host>:<port>`: `lavish-axi <file>` output (the `url` field and the browser it opens), `lavish-axi` session listings, the session `url` stored for each board, and the 403 page's working link. A trailing slash is ignored. A path, query, fragment, or credentials are refused, because Lavish serves its chrome and artifact assets from root-relative paths (`/chrome.css`, `/artifact/<key>/...`), so the proxy must serve Lavish at the root of its host. The public hostname is added to the allowed hosts automatically, so `LAVISH_AXI_ALLOWED_HOSTS` is not needed for it. The proxy may either keep the original `Host` or send `X-Forwarded-Host` with the public name. Unset, links are exactly as described under **Network binding**. Like the other server settings it is read when the server starts: set it in the environment every `lavish-axi` invocation inherits (a server replaced by a CLI without it drops it), and run `lavish-axi stop` once after changing it. Existing boards pick up the public link the next time they are opened.
 - **Browser opening** - Set `LAVISH_AXI_NO_OPEN=1`, equivalent to `--no-open`, to create or resume a session without launching a browser window.
 
+## Fusion Hub
+
+Open the server root (`/`) for every board on this relay and the peers configured by `LAVISH_AXI_HUB_PEERS`. Access is open to anyone who can reach the server; there are no logins or approval gates. Boards keep their own HTML and layout.
+
+The default list shows open boards. Search matches title, tags, and board text; a search or tag filter includes closed boards too. Text search reads the first 1 MiB of each local artifact, retains up to 64 KiB of text, and excludes scripts, styles, templates, and noscript content. It searches saved HTML text, not content generated later by JavaScript. Peers contribute their own bounded search text when supported; older peers still contribute titles and available metadata.
+
+Click **Close** on a hub card or **Close board** in the board's Conversation panel to remove it from the open list. **Reopen** on the hub or **Reactivate board** in the chrome brings it back with its conversation and tags. Closing never deletes the file. These actions need one click. Agents reuse `lavish-axi end <file>` and `lavish-axi <file> --reopen`.
+
+Tags live in session metadata, outside the HTML, and survive artifact rewrites and end/reopen. In the hub or chrome, open **Tags** for the person shortcuts (Walker, Broc, Gibson, Zach, Roxanne) and a free tag field. Click an existing tag to change its name, or its × to remove it. Tags match without case and allow up to 32 tags of 64 characters each. Bots read or edit the same metadata:
+
+```sh
+lavish-axi board.html --creator Cortana --no-open
+lavish-axi tag board.html --add Walker --add urgent
+lavish-axi tag board.html --remove urgent --add review
+lavish-axi tag board.html
+```
+
+Creator is the name supplied on the first open with `--creator`, otherwise the invoking agent identity (or `generic`). Later opens preserve it. Boards created before metadata was recorded display **Unknown**. Each card also shows the created and last-served Lavish versions. Registration/reopen and serving board chrome update the last-served version; the hub flags a known version older than its own server, with unknown versions left unflagged. CLI session listings (including closed boards), open, tag, and end output expose the metadata as TOON.
+
+Peer metadata comes only from the peer relay. Cards remain read-only here; **Open** takes you to that peer's chrome to edit tags or close/reactivate there. No central database, relay write proxy, or authentication layer is added.
+
 ## CLI Reference
 
 | Command                         | Description                                                                                                                                                                                                                                                                                                                                               |
@@ -286,6 +307,7 @@ pnpm link
 | `lavish-axi owner <html-file>`  | For a supervisor relaying a review to another agent or task: say whether that owner is there (`--state live\|working\|finished\|gone`, `--label`, `--detail`, `--ttl <seconds>`, or `--clear`). The board's presence pill shows it. Never touches the poll.                                                                                               |
 | `lavish-axi export <html-file>` | Write a portable copy of the artifact: one HTML file with its local assets inlined, so it opens with no server and no sibling files. Remote CDN/font references are left as links.                                                                                                                                                                        |
 | `lavish-axi share <html-file>`  | Publish the artifact (local assets inlined) to [ht-ml.app](https://ht-ml.app), a third-party host not part of Lavish, and print a visitable URL plus a secret update key; shares are public by default, `--private` locks one behind a generated password, and the same command republishes or unpublishes an existing page with `--site`/`--update-key`. |
+| `lavish-axi tag <html-file>`    | Read durable board metadata; repeat `--add <tag>` / `--remove <tag>` to edit tags.                                                                                                                                                                                                                                                                        |
 | `lavish-axi stop`               | Shut down the background server.                                                                                                                                                                                                                                                                                                                          |
 | `lavish-axi playbook [id]`      | List focused artifact guidance or show one playbook; agents must open each matching playbook before writing HTML.                                                                                                                                                                                                                                         |
 | `lavish-axi libraries`          | List the Excalidraw libraries in the whiteboard library directory; `--search <text>` or `--library <id>` lists item refs for `%% lavish-icon` nodes.                                                                                                                                                                                                      |
