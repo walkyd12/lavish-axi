@@ -23,11 +23,15 @@ const pill = /** @type {HTMLSpanElement} */ (document.getElementById("hubPill"))
 const lede = /** @type {HTMLParagraphElement} */ (document.getElementById("hubLede"));
 const updated = /** @type {HTMLSpanElement} */ (document.getElementById("hubUpdated"));
 const tabOpen = /** @type {HTMLButtonElement} */ (document.getElementById("tabOpen"));
+const tabNeedsInput = /** @type {HTMLButtonElement | null} */ (document.getElementById("tabNeedsInput"));
 const tabClosed = /** @type {HTMLButtonElement} */ (document.getElementById("tabClosed"));
+const tabCancelled = /** @type {HTMLButtonElement | null} */ (document.getElementById("tabCancelled"));
 const search = /** @type {HTMLInputElement} */ (document.getElementById("hubSearch"));
 const tagFilter = /** @type {HTMLSelectElement} */ (document.getElementById("hubTag"));
 const countOpen = /** @type {HTMLSpanElement} */ (document.getElementById("countOpen"));
+const countNeedsInput = /** @type {HTMLSpanElement | null} */ (document.getElementById("countNeedsInput"));
 const countClosed = /** @type {HTMLSpanElement} */ (document.getElementById("countClosed"));
+const countCancelled = /** @type {HTMLSpanElement | null} */ (document.getElementById("countCancelled"));
 const history = /** @type {HTMLDialogElement} */ (document.getElementById("history"));
 const historyTitle = /** @type {HTMLHeadingElement} */ (document.getElementById("historyTitle"));
 const historyBody = /** @type {HTMLDivElement} */ (document.getElementById("historyBody"));
@@ -42,6 +46,24 @@ function escapeHtml(value) {
 
 function isClosed(board) {
   return board.status === "ended" || board.state === "file-gone";
+}
+
+function isCancelled(board) {
+  return Boolean(board.cancelled);
+}
+
+function isNeedsInput(board) {
+  if (isClosed(board)) return false;
+  if (board.board_state === "needs-input") return true;
+  return Array.isArray(board.tags) && board.tags.some((tag) => String(tag).toLowerCase() === "needs-input");
+}
+
+function displayBadge(board) {
+  if (board.state === "file-gone") return { label: board.state_label || "File gone", tone: "bad" };
+  if (isCancelled(board)) return { label: "Cancelled", tone: "muted" };
+  if (board.status === "ended") return { label: "Done", tone: "muted" };
+  if (isNeedsInput(board)) return { label: "Needs input", tone: "warn" };
+  return { label: "Working", tone: board.tone === "warn" ? "warn" : "good" };
 }
 
 function relativeTime(iso) {
@@ -128,6 +150,7 @@ function actionsHtml(board) {
     actions.push(`<button type="button" class="act" data-act="history" data-key="${key}">History</button>`);
     if (board.status !== "ended") {
       actions.push(`<button type="button" class="act" data-act="close" data-key="${key}"${disabled}>Close</button>`);
+      actions.push(`<button type="button" class="act" data-act="cancel" data-key="${key}"${disabled}>Cancel</button>`);
     }
     return actions.join("");
   }
@@ -139,14 +162,16 @@ function actionsHtml(board) {
   actions.push(`<a class="act primary" href="${escapeHtml(board.url)}">Open →</a>`);
   actions.push(`<button type="button" class="act" data-act="history" data-key="${key}">History</button>`);
   actions.push(`<button type="button" class="act" data-act="close" data-key="${key}"${disabled}>Close</button>`);
+  actions.push(`<button type="button" class="act" data-act="cancel" data-key="${key}"${disabled}>Cancel</button>`);
   return actions.join("");
 }
 
 function boardHtml(board) {
+  const badge = displayBadge(board);
   return (
     `<li class="board" data-key="${escapeHtml(board.key)}">` +
     `<div class="board-head"><h2 class="board-title">${escapeHtml(board.title)}</h2>` +
-    `<span class="st st-${escapeHtml(board.tone)}">${escapeHtml(board.state_label)}</span></div>` +
+    `<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span></div>` +
     (board.source ? `<p class="peer-badge">On ${escapeHtml(board.source)}</p>` : "") +
     `<p class="meta">${escapeHtml(metaLine(board))}</p>` +
     (board.source ? "" : `<p class="path" title="${escapeHtml(board.file)}">${escapeHtml(shortPath(board.file))}</p>`) +
@@ -158,11 +183,17 @@ function boardHtml(board) {
 
 function render() {
   const openBoards = boards.filter((board) => !isClosed(board));
-  const closedBoards = boards.filter(isClosed);
+  const needsInputBoards = openBoards.filter(isNeedsInput);
+  const closedBoards = boards.filter((board) => isClosed(board) && !isCancelled(board));
+  const cancelledBoards = boards.filter(isCancelled);
   countOpen.textContent = String(openBoards.length);
+  if (countNeedsInput) countNeedsInput.textContent = String(needsInputBoards.length);
   countClosed.textContent = String(closedBoards.length);
+  if (countCancelled) countCancelled.textContent = String(cancelledBoards.length);
   tabOpen.setAttribute("aria-pressed", showing === "open" ? "true" : "false");
+  if (tabNeedsInput) tabNeedsInput.setAttribute("aria-pressed", showing === "needs-input" ? "true" : "false");
   tabClosed.setAttribute("aria-pressed", showing === "closed" ? "true" : "false");
+  if (tabCancelled) tabCancelled.setAttribute("aria-pressed", showing === "cancelled" ? "true" : "false");
   const selected = tagFilter.value;
   const names = new Map();
   for (const tag of boards.flatMap((board) => board.tags || [])) {
@@ -175,7 +206,15 @@ function render() {
   tagFilter.value = tags.find((tag) => tag.toLowerCase() === selected.toLowerCase()) || "";
   const query = search.value.trim().toLowerCase();
   const searching = Boolean(query || tagFilter.value);
-  const candidates = searching ? boards : showing === "open" ? openBoards : closedBoards;
+  const candidates = searching
+    ? boards
+    : showing === "needs-input"
+      ? needsInputBoards
+      : showing === "cancelled"
+        ? cancelledBoards
+        : showing === "closed"
+          ? closedBoards
+          : openBoards;
   const shown = candidates.filter((board) => {
     const tags = board.tags || [];
     const haystack = [board.title, board.search_text, ...tags].join(" ").toLowerCase();
@@ -189,9 +228,13 @@ function render() {
   empty.hidden = shown.length > 0;
   empty.textContent = searching
     ? "No matching boards."
-    : showing === "open"
-      ? "No open boards."
-      : "No closed boards yet.";
+    : showing === "needs-input"
+      ? "No boards waiting on input."
+      : showing === "cancelled"
+        ? "No cancelled boards."
+        : showing === "closed"
+          ? "No closed boards yet."
+          : "No open boards.";
 
   const listening = openBoards.filter((board) => board.state === "taking-input").length;
   const unread = openBoards.filter((board) => board.state === "unread").length;
@@ -262,6 +305,21 @@ async function closeBoard(board) {
   }
 }
 
+async function cancelBoard(board) {
+  busy.add(board.key);
+  render();
+  try {
+    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/cancel", { method: "POST" });
+    if (!response.ok) throw new Error(String(response.status));
+    showNote(`Cancelled "${board.title}".`, "done");
+  } catch {
+    showNote(`Could not cancel "${board.title}". Try again.`, "error");
+  } finally {
+    busy.delete(board.key);
+    await refresh();
+  }
+}
+
 async function reopenBoard(board) {
   busy.add(board.key);
   render();
@@ -312,7 +370,7 @@ async function showHistory(board) {
       (chat.length
         ? chat
             .map((entry) => {
-              const who = entry.role === "agent" ? "Agent" : "You";
+              const who = entry.role === "agent" ? "Agent" : escapeHtml(entry.author || "You");
               const anchor = entry.anchor ? [entry.anchor.label, entry.anchor.excerpt].filter(Boolean).join(" · ") : "";
               const receipt = receiptLabel(entry);
               // Agent entries arrive rendered from the server's restricted Markdown; user text is
@@ -342,6 +400,7 @@ list.addEventListener("click", (event) => {
   const board = boards.find((candidate) => candidate.key === button.dataset.key);
   if (!board || board.source) return;
   if (button.dataset.act === "close") closeBoard(board);
+  else if (button.dataset.act === "cancel") cancelBoard(board);
   else if (button.dataset.act === "reopen") reopenBoard(board);
   else if (button.dataset.act === "history") showHistory(board);
 });
@@ -349,8 +408,16 @@ tabOpen.addEventListener("click", () => {
   showing = "open";
   render();
 });
+tabNeedsInput?.addEventListener("click", () => {
+  showing = "needs-input";
+  render();
+});
 tabClosed.addEventListener("click", () => {
   showing = "closed";
+  render();
+});
+tabCancelled?.addEventListener("click", () => {
+  showing = "cancelled";
   render();
 });
 historyClose.addEventListener("click", () => {
@@ -361,6 +428,8 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") refresh();
 });
 if (location.hash === "#closed") showing = "closed";
+else if (location.hash === "#needs-input") showing = "needs-input";
+else if (location.hash === "#cancelled") showing = "cancelled";
 
 search.addEventListener("input", render);
 tagFilter.addEventListener("change", render);

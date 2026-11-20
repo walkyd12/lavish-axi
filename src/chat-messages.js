@@ -15,6 +15,7 @@ const SELECTOR_MAX = 512;
 const LABEL_MAX = 40;
 export const PROMPT_ID_MAX = 128;
 const PROMPT_ID_RE = /^[A-Za-z0-9_-]+$/;
+export const AUTHOR_MAX = 80;
 export const MAX_CHAT_STORED_BYTES = 5_242_880;
 
 // The chrome mints this at queue time and the server echoes it on the transcript entry. A value
@@ -25,6 +26,17 @@ export function normalizePromptId(value) {
   const id = value.trim();
   if (!id || id.length > PROMPT_ID_MAX || !PROMPT_ID_RE.test(id)) return "";
   return id;
+}
+
+export function normalizePromptAuthor(value) {
+  if (typeof value !== "string") return "";
+  const author = value
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!author) return "";
+  return author.slice(0, AUTHOR_MAX);
 }
 
 const LIST_ITEM = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
@@ -465,10 +477,12 @@ export function chatEntryForPrompt(prompt, at) {
           ? "layout-warnings"
           : "annotation";
   const promptId = normalizePromptId(prompt.prompt_id);
+  const author = normalizePromptAuthor(prompt.author);
   const anchor = promptAnchor(prompt, kind);
   if (!text && attachments.length === 0 && !promptId && !anchor) return null;
   const entry = { role: "user", kind, text, at: String(at || new Date().toISOString()) };
   if (promptId) entry.prompt_id = promptId;
+  if (author) entry.author = author;
   if (anchor) entry.anchor = anchor;
   if (attachments.length) entry.attachments = attachments;
   return entry;

@@ -27,7 +27,8 @@
 }
 .board-tags,
 .person-tags,
-.tag-form {
+.tag-form,
+.board-lifecycle-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -87,8 +88,13 @@ span.board-tag:not(:has(button)) {
   min-width: 0;
   flex: 1 1 100px;
 }
-.board-close {
+.board-lifecycle-actions {
   margin-top: 10px;
+}
+.board-workflow-action {
+  border-color: var(--metadata-accent);
+  color: var(--metadata-accent);
+  font-weight: 600;
 }
 .metadata-notice {
   margin: 8px 0 0;

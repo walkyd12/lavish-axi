@@ -1107,7 +1107,9 @@ function chatBubbleHtml(entry) {
     );
   }
   return (
-    "<small>You</small>" +
+    "<small>" +
+    escapeHtml(entry.author ? String(entry.author) : "You") +
+    "</small>" +
     anchorHtml(entry.anchor) +
     userBubbleTextHtml(entry, entry.text) +
     bubbleAttachmentsHtml(entry) +

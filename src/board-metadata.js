@@ -30,13 +30,27 @@ export function normalizeCreator(value) {
   return value.trim();
 }
 
+export function boardWorkflowState(session) {
+  const ended = session?.status === "ended" || session?.closed === true;
+  const cancelled = ended && (session?.ended_reason === "cancelled" || session?.cancelled === true);
+  if (cancelled) return { board_state: "cancelled", board_state_label: "Cancelled", cancelled: true };
+  if (ended) return { board_state: "done", board_state_label: "Done", cancelled: false };
+  const tags = Array.isArray(session?.tags) ? session.tags : [];
+  if (tags.some((tag) => String(tag).toLowerCase() === "needs-input")) {
+    return { board_state: "needs-input", board_state_label: "Needs input", cancelled: false };
+  }
+  return { board_state: "working", board_state_label: "Working", cancelled: false };
+}
+
 export function serializeBoardMetadata(session) {
+  const workflow = boardWorkflowState(session);
   return {
     tags: Array.isArray(session.tags) ? session.tags : [],
     creator: session.creator || "",
     created_version: session.created_version || "",
     served_version: session.served_version || "",
     closed: session.status === "ended",
+    ...workflow,
   };
 }
 
@@ -71,13 +85,28 @@ export function boardSearchText(html) {
   return parts.join(" ").replace(/\s+/g, " ").trim();
 }
 
-export function filterHubBoards(boards, { query = "", tag = "" } = {}) {
+export function filterHubBoards(boards, { query = "", tag = "", state = "" } = {}) {
   const words = String(query).toLowerCase().trim().split(/\s+/).filter(Boolean);
   const selected = String(tag).toLowerCase().trim();
+  const wantedState = String(state).toLowerCase().trim();
   return boards.filter((board) => {
     const tags = Array.isArray(board.tags) ? board.tags : [];
+    const closed = Boolean(board.closed || board.status === "ended" || board.state === "file-gone");
+    const cancelled = Boolean(board.cancelled);
+    const boardState = String(board.board_state || "").toLowerCase();
+    const stateMatches =
+      !wantedState ||
+      (wantedState === "open" && !closed) ||
+      (wantedState === "closed" && closed && !cancelled) ||
+      (wantedState === "done" && closed && !cancelled) ||
+      (wantedState === "cancelled" && cancelled) ||
+      (wantedState === "needs-input" &&
+        !closed &&
+        (boardState === "needs-input" || tags.some((v) => v.toLowerCase() === "needs-input"))) ||
+      (wantedState === "working" && !closed && boardState === "working");
     const haystack = [board.title, board.search_text, ...tags].join(" ").toLowerCase();
     return (
+      stateMatches &&
       (!selected || tags.some((value) => value.toLowerCase() === selected)) &&
       words.every((word) => haystack.includes(word))
     );

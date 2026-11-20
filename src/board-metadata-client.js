@@ -13,14 +13,21 @@
     root.dataset.metadata = JSON.stringify(metadata);
     const tags = metadata.tags || [];
     const readonly = root.dataset.readonly === "true";
+    const actionLabel = String(root.dataset.actionLabel || "").trim() || "Send";
+    const needsInput = tags.some((tag) => String(tag).toLowerCase() === "needs-input");
+    const stateLabel =
+      metadata.board_state_label ||
+      (metadata.cancelled ? "Cancelled" : metadata.closed ? "Done" : needsInput ? "Needs input" : "Working");
     root.innerHTML =
-      `<p class="board-provenance">Created by ${escape(metadata.creator || "Unknown")} · Created on ${escape(metadata.created_version || "unknown version")} · Last served on ${escape(metadata.served_version || "unknown version")}${metadata.version_behind ? " · <strong>Older Lavish version</strong>" : ""}</p>` +
+      `<p class="board-provenance"><strong>${escape(stateLabel)}</strong> · Created by ${escape(metadata.creator || "Unknown")} · Created on ${escape(metadata.created_version || "unknown version")} · Last served on ${escape(metadata.served_version || "unknown version")}${metadata.version_behind ? " · <strong>Older Lavish version</strong>" : ""}</p>` +
       `<div class="board-tags">${tags.map((tag) => (readonly ? `<span class="board-tag">${escape(tag)}</span>` : `<span class="board-tag"><button type="button" data-edit="${escape(tag)}" title="Change tag ${escape(tag)}">${escape(tag)}</button><button type="button" data-remove="${escape(tag)}" aria-label="Remove ${escape(tag)}">×</button></span>`)).join("")}</div>` +
       (readonly
         ? ""
-        : `<details class="tag-editor"><summary>Tags</summary><div class="person-tags">${people.map((name) => `<button type="button" data-person="${name}" aria-pressed="${tags.some((tag) => tag.toLowerCase() === name.toLowerCase())}">${name}</button>`).join("")}</div><form class="tag-form"><input name="tag" aria-label="Tag" placeholder="Add a tag" maxlength="64" required><button type="submit">Add tag</button><button type="button" data-cancel hidden>Cancel change</button></form></details>`) +
+        : `<details class="tag-editor"><summary>Tags</summary><div class="person-tags"><button type="button" data-needs-input aria-pressed="${needsInput}">Needs input</button>${people.map((name) => `<button type="button" data-person="${name}" aria-pressed="${tags.some((tag) => tag.toLowerCase() === name.toLowerCase())}">${name}</button>`).join("")}</div><form class="tag-form"><input name="tag" aria-label="Tag" placeholder="Add a tag" maxlength="64" required><button type="submit">Add tag</button><button type="button" data-cancel hidden>Cancel change</button></form></details>`) +
       (root.dataset.chrome === "true"
-        ? `<button type="button" class="board-close" data-close>${metadata.closed ? "Reactivate board" : "Close board"}</button>`
+        ? metadata.closed
+          ? `<div class="board-lifecycle-actions"><button type="button" class="board-close" data-close>Reactivate board</button></div>`
+          : `<div class="board-lifecycle-actions"><button type="button" class="board-workflow-action" data-workflow-action>${escape(actionLabel)}</button><button type="button" class="board-close" data-close>Close board</button><button type="button" class="board-cancel" data-cancel-board>Cancel board</button></div>`
         : "") +
       `<p class="metadata-notice" role="status" hidden></p>`;
   }
@@ -86,7 +93,10 @@
     const root = /** @type {HTMLElement} */ (button.closest("[data-board-metadata]"));
     const metadata = JSON.parse(root.dataset.metadata || "{}");
     if (button.dataset.remove) await save(root, { remove: [button.dataset.remove] });
-    else if (button.dataset.person) {
+    else if (button.hasAttribute("data-needs-input")) {
+      const active = (metadata.tags || []).some((tag) => String(tag).toLowerCase() === "needs-input");
+      await save(root, active ? { remove: ["needs-input"] } : { add: ["needs-input"] });
+    } else if (button.dataset.person) {
       const name = button.dataset.person;
       await save(
         root,
@@ -102,7 +112,54 @@
       /** @type {HTMLInputElement} */ (form.elements.namedItem("tag")).focus();
       /** @type {HTMLInputElement} */ (form.elements.namedItem("tag")).select();
     } else if (button.hasAttribute("data-cancel")) render(root, metadata);
-    else if (button.hasAttribute("data-close")) {
+    else if (button.hasAttribute("data-workflow-action")) {
+      const notice = /** @type {HTMLElement} */ (root.querySelector(".metadata-notice"));
+      const chatInput = /** @type {HTMLTextAreaElement | null} */ (document.getElementById("chatInput"));
+      const typed = chatInput ? chatInput.value.trim() : "";
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/${encodeURIComponent(root.dataset.boardMetadata)}/action`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(typed ? { prompt: typed } : {}),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || "Could not send action");
+        if (typed && chatInput) chatInput.value = "";
+        render(root, { ...metadata, ...result });
+        const freshNotice = /** @type {HTMLElement | null} */ (root.querySelector(".metadata-notice"));
+        if (freshNotice) {
+          freshNotice.textContent = `${result.action_label || root.dataset.actionLabel || "Send"} sent.`;
+          freshNotice.hidden = false;
+        }
+      } catch (error) {
+        notice.textContent = error.message;
+        notice.hidden = false;
+        button.disabled = false;
+      }
+    } else if (button.hasAttribute("data-cancel-board")) {
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/hub/${encodeURIComponent(root.dataset.boardMetadata)}/cancel`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        if (!response.ok) throw new Error("Could not cancel board");
+        render(root, {
+          ...metadata,
+          closed: true,
+          cancelled: true,
+          board_state: "cancelled",
+          board_state_label: "Cancelled",
+        });
+      } catch (error) {
+        const notice = /** @type {HTMLElement} */ (root.querySelector(".metadata-notice"));
+        notice.textContent = error.message;
+        notice.hidden = false;
+        button.disabled = false;
+      }
+    } else if (button.hasAttribute("data-close")) {
       if (metadata.closed) {
         await reactivate(button, root.dataset.boardMetadata, root.dataset.file);
         return;

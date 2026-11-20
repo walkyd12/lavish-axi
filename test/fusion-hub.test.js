@@ -152,3 +152,191 @@ test("CLI reads and changes tags in TOON, attributes the first creator and prese
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("LAVISH_AXI_ON_EVENT emits board lifecycle, message attribution, tag diffs and peer close/reopen without polling", async () => {
+  const { spawn } = await import("node:child_process");
+  const { chmod } = await import("node:fs/promises");
+  const dir = await mkdtemp(path.join(tmpdir(), "fusion-events-"));
+  const file = path.join(dir, "zach-board.html");
+  const peerFile = path.join(dir, "walker-board.html");
+  const hookLog = path.join(dir, "hook.jsonl");
+  const hookBin = path.join(dir, "on-event.mjs");
+  await writeFile(file, "<title>Zach board</title><p>Initial answer</p>");
+  await writeFile(peerFile, "<title>Walker board</title><p>Greenside Settings</p>");
+  await writeFile(
+    hookBin,
+    `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(hookLog)}, process.argv[2] + "\\n");\n`,
+  );
+  await chmod(hookBin, 0o755);
+
+  const events = [];
+  const peer = await serve({ port: 0, stateFile: path.join(dir, "peer.json"), version: "0.1.96" });
+  const peerBase = `http://127.0.0.1:${peer.port}`;
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "0.1.96",
+    hubPeers: `walker=${peerBase}`,
+    actionLabel: "Dispatch workflow",
+    env: { ...process.env, LAVISH_AXI_ON_EVENT: hookBin },
+    onEvent: (payload) => events.push(payload),
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const cliEnv = {
+    ...process.env,
+    LAVISH_AXI_STATE_DIR: dir,
+    LAVISH_AXI_PORT: String(server.port),
+    LAVISH_AXI_TELEMETRY: "0",
+    LAVISH_AXI_NO_OPEN: "1",
+  };
+  const cli = (...args) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["bin/lavish-axi.js", ...args], { env: cliEnv });
+      let output = "";
+      let errors = "";
+      child.stdout.on("data", (data) => (output += data));
+      child.stderr.on("data", (data) => (errors += data));
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code, output, errors }));
+    });
+  try {
+    const opened = await cli("open", "--creator", "Zach", file);
+    assert.equal(opened.code, 0, opened.errors);
+    const key = (await new SessionStore(path.join(dir, "state.json")).findByFile(file)).key;
+
+    // Mark board needs-input + person tag; verify Hub Needs input filter sees it, then answering clears needs-input automatically.
+    await cli("tag", file, "--needs-input", "--add", "Zach");
+    const needsInputHub = await fetch(`${base}/api/hub?state=needs-input`).then((r) => r.json());
+    assert.equal(needsInputHub.boards.length, 1);
+    assert.equal(needsInputHub.boards[0].board_state, "needs-input");
+    assert.equal(needsInputHub.action_label, "Dispatch workflow");
+
+    // Side bot posts normal free-chat message (no --send): clears needs-input, emits message (NOT board_action).
+    const msgRes = await cli(
+      "message",
+      file,
+      "--message",
+      "Check <b>TEST</b> customer code",
+      "--author",
+      "Zach via runner2",
+    );
+    assert.equal(msgRes.code, 0, msgRes.errors);
+    assert.match(msgRes.output, /Zach via runner2/);
+    assert.equal((await fetch(`${base}/api/hub?state=needs-input`).then((r) => r.json())).boards.length, 0);
+    assert.equal((await fetch(`${base}/api/hub?state=working`).then((r) => r.json())).boards[0].board_state, "working");
+
+    // Explicit workflow Send (--send) fires board_action with configurable action_label.
+    const sendRes = await cli(
+      "message",
+      file,
+      "--message",
+      "Run full verification",
+      "--author",
+      "Zach via runner2",
+      "--send",
+    );
+    assert.equal(sendRes.code, 0, sendRes.errors);
+    assert.match(sendRes.output, /Dispatch workflow/);
+
+    // Poll delivers the prompts with author intact, and conversation Markdown escapes/quotes user text.
+    const polled = await fetch(`${base}/api/poll?file=${encodeURIComponent(file)}&timeoutMs=500`).then((r) => r.json());
+    assert.equal(polled.status, "feedback");
+    assert.equal(polled.prompts[0].author, "Zach via runner2");
+    assert.equal(polled.prompts[0].prompt, "Check <b>TEST</b> customer code");
+
+    const convJson = await fetch(`${base}/api/${key}/conversation`).then((r) => r.json());
+    assert.equal(convJson.creator, "Zach");
+    assert.equal(convJson.chat[0].author, "Zach via runner2");
+    assert.equal(convJson.chat[0].html, undefined, "user messages never carry raw HTML");
+
+    const convMd = await fetch(`${base}/api/${key}/conversation?format=markdown`).then((r) => r.text());
+    assert.match(convMd, /- Creator: Zach/);
+    assert.match(convMd, /\*\*Zach via runner2\*\*/);
+    assert.match(convMd, /> Check <b>TEST<\/b> customer code/);
+
+    // Person tag addition emits tag_change with added/removed.
+    await cli("tag", file, "--add", "Walker", "--add", "Gibson");
+    await cli("tag", file, "--remove", "Gibson");
+
+    // Cancel board -> emits board_cancelled (NOT board_closed), appears under state=cancelled, then reopen + close -> emits board_closed.
+    assert.equal(
+      (await fetch(`${base}/api/hub/${key}/cancel`, { method: "POST", headers: { origin: "https://evil.example" } }))
+        .status,
+      403,
+    );
+    await fetch(`${base}/api/hub/${key}/cancel`, { method: "POST", headers: { origin: base } });
+    assert.equal((await fetch(`${base}/api/hub?state=cancelled`).then((r) => r.json())).boards.length, 1);
+    assert.equal((await fetch(`${base}/api/hub?state=closed`).then((r) => r.json())).boards.length, 0);
+    await cli("open", "--reopen", file);
+    await fetch(`${base}/api/hub/${key}/close`, { method: "POST", headers: { origin: base } });
+    assert.equal((await fetch(`${base}/api/hub?state=closed`).then((r) => r.json())).boards.length, 1);
+    await cli("open", "--reopen", file);
+
+    // Peer board lifecycle: open -> closed -> reopened -> closed again.
+    await fetch(`${peerBase}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: peerBase },
+      body: JSON.stringify({ file: peerFile, creator: "Walker" }),
+    });
+    const peerKey = (await fetch(`${peerBase}/api/hub?peers=0`).then((r) => r.json())).boards[0].key;
+    await fetch(`${base}/api/hub`);
+    await fetch(`${peerBase}/api/hub/${peerKey}/close`, { method: "POST", headers: { origin: peerBase } });
+    await fetch(`${base}/api/hub`);
+    await fetch(`${peerBase}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: peerBase },
+      body: JSON.stringify({ file: peerFile, reopen: true }),
+    });
+    await fetch(`${base}/api/hub`);
+    await fetch(`${peerBase}/api/hub/${peerKey}/close`, { method: "POST", headers: { origin: peerBase } });
+    await fetch(`${base}/api/hub`);
+
+    // Allow async onEvent / detached hook writes to flush.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const kinds = events.map((entry) => `${entry.source || "local"}:${entry.event}`);
+    assert.deepEqual(kinds, [
+      "local:board_created",
+      "local:tag_change",
+      "local:tag_change",
+      "local:message",
+      "local:message",
+      "local:board_action",
+      "local:tag_change",
+      "local:tag_change",
+      "local:board_cancelled",
+      "local:board_reopened",
+      "local:board_closed",
+      "local:board_reopened",
+      "walker:board_created",
+      "walker:board_closed",
+      "walker:board_reopened",
+      "walker:board_closed",
+    ]);
+    const msgEvent = events.find((entry) => entry.event === "message");
+    assert.equal(msgEvent.had_listener, false);
+    assert.equal(msgEvent.prompts[0].author, "Zach via runner2");
+    const actionEvent = events.find((entry) => entry.event === "board_action");
+    assert.equal(actionEvent.action, "send");
+    assert.equal(actionEvent.action_label, "Dispatch workflow");
+    assert.equal(actionEvent.author, "Zach via runner2");
+    const firstTagEvent = events.find((entry) => entry.event === "tag_change");
+    assert.deepEqual(firstTagEvent.added, ["Zach", "needs-input"]);
+    const autoClearTagEvent = events.filter((entry) => entry.event === "tag_change")[1];
+    assert.deepEqual(autoClearTagEvent.removed, ["needs-input"]);
+    const peerCloseEvents = events.filter((entry) => entry.source === "walker" && entry.event === "board_closed");
+    assert.equal(peerCloseEvents.length, 2, "reactivate + reclose emits a second board_closed for new brain revision");
+    assert.equal(peerCloseEvents[0].peer_origin, peerBase);
+    assert.equal(peerCloseEvents[0].peer_key, peerKey);
+
+    const diskLines = (await readFile(hookLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(diskLines.length, events.length);
+  } finally {
+    await server.close();
+    await peer.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

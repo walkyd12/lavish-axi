@@ -163,14 +163,18 @@ export function conversationMarkdown(session, { title = "" } = {}) {
   const lines = [`# ${boardTitle(session, title)}`, ""];
   lines.push(`- Board file: \`${session.file}\``);
   const status =
-    session.status === "ended" ? `ended by ${session.ended_by === "user" ? "the reviewer" : "an agent"}` : "open";
+    session.status === "ended"
+      ? `${session.ended_reason === "cancelled" ? "cancelled" : "ended"} by ${session.ended_by === "user" ? "the reviewer" : "an agent"}`
+      : "open";
   lines.push(`- Status: ${status}`);
+  if (session.creator) lines.push(`- Creator: ${session.creator}`);
+  if (Array.isArray(session.tags) && session.tags.length) lines.push(`- Tags: ${session.tags.join(", ")}`);
   if (session.updated_at) lines.push(`- Last update: ${session.updated_at}`);
   lines.push("", "## Conversation", "");
   const chat = Array.isArray(session.chat) ? session.chat : [];
   if (!chat.length) lines.push("_No messages._", "");
   for (const entry of chat) {
-    const who = entry?.role === "agent" ? "Agent" : "Reviewer";
+    const who = entry?.role === "agent" ? "Agent" : String(entry?.author || "").trim() || "Reviewer";
     const meta = [entry?.at, anchorText(entry) && `on ${anchorText(entry)}`, receiptText(entry)].filter(Boolean);
     lines.push(`**${who}**${meta.length ? ` · ${meta.join(" · ")}` : ""}`, "");
     const text = String(entry?.text || "").trim() || "_(no text)_";
@@ -229,7 +233,7 @@ ${themed.style}
 </head>
 <body>
 <header class="hero">${HUB_SCAPE}<div class="wrap inner"><div class="topline">${markHtml(mark)}<span class="pill" id="hubPill" role="status">Loading…</span></div><p class="kicker">Fusion Hub</p><h1>Your boards.</h1><p class="lede" id="hubLede">Every review this server knows, and who is there to read what you send.</p></div></header>
-<div class="ctaband"><div class="wrap"><nav class="tabs" aria-label="Boards"><button type="button" class="tab" id="tabOpen" aria-pressed="true">Open <span id="countOpen">0</span></button><button type="button" class="tab" id="tabClosed" aria-pressed="false">Closed <span id="countClosed">0</span></button></nav></div></div>
+<div class="ctaband"><div class="wrap"><nav class="tabs" aria-label="Boards"><button type="button" class="tab" id="tabOpen" aria-pressed="true">Open <span id="countOpen">0</span></button><button type="button" class="tab" id="tabNeedsInput" aria-pressed="false">Needs input <span id="countNeedsInput">0</span></button><button type="button" class="tab" id="tabClosed" aria-pressed="false">Closed <span id="countClosed">0</span></button><button type="button" class="tab" id="tabCancelled" aria-pressed="false">Cancelled <span id="countCancelled">0</span></button></nav></div></div>
 <main class="wrap">
 <div class="hub-search"><label>Search boards<input id="hubSearch" type="search" placeholder="Title, tag or board text" aria-describedby="searchHint"></label><label>Filter by tag<select id="hubTag"><option value="">All tags</option></select></label></div>
 <p class="meta" id="searchHint">Search and tag filters include open and closed boards from every relay.</p>

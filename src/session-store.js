@@ -21,6 +21,7 @@ import {
   chatEntryForPrompt,
   collectChatAckIds,
   markPreReceipt,
+  normalizePromptAuthor,
   normalizePromptId,
   stampDelivered,
   stampDone,
@@ -387,6 +388,14 @@ export class SessionStore {
     if (!restoring || (existingPrompts.length === 0 && !session.dom_snapshot)) {
       session.dom_snapshot = restoredSnapshot;
     }
+    let clearedTags = [];
+    if (!restoring && acceptedPrompts.length > 0 && Array.isArray(session.tags)) {
+      const removed = session.tags.filter((tag) => String(tag).toLowerCase() === "needs-input");
+      if (removed.length) {
+        session.tags = session.tags.filter((tag) => String(tag).toLowerCase() !== "needs-input");
+        clearedTags = removed;
+      }
+    }
     session.status =
       shouldEndSession || alreadyEnded
         ? "ended"
@@ -394,10 +403,18 @@ export class SessionStore {
             (restoring && Array.isArray(session.artifact_failures) && session.artifact_failures.length > 0)
           ? "feedback"
           : "open";
-    if (shouldEndSession) session.ended_by = "user";
+    if (shouldEndSession) {
+      session.ended_by = "user";
+      delete session.ended_reason;
+    }
     session.updated_at = new Date().toISOString();
     await this.writeState(state);
-    return { ...session, fresh_feedback: !restoring && acceptedPrompts.length > 0 };
+    return {
+      ...session,
+      fresh_feedback: !restoring && acceptedPrompts.length > 0,
+      accepted_prompts: !restoring ? storedPrompts : [],
+      cleared_tags: clearedTags,
+    };
   }
 
   // Record (or, for `{ clear: true }`, remove) the owner's statement about itself. Throws
@@ -779,7 +796,7 @@ export class SessionStore {
   // `endedBy` distinguishes a human ending review from the browser chrome ("user") from an
   // agent explicitly closing the loop via `lavish-axi end` ("agent"). Only a user-initiated end
   // blocks a plain reopen - see `SessionStore` callers in server.js.
-  async endSession(key, endedBy = "agent") {
+  async endSession(key, endedBy = "agent", { cancelled = false } = {}) {
     return this.runExclusive(async () => {
       const state = await this.readState();
       const session = state.sessions[key];
@@ -790,6 +807,8 @@ export class SessionStore {
       const nextEndedBy = endedBy === "user" || existingEndedBy === "user" ? "user" : "agent";
       session.status = "ended";
       session.ended_by = nextEndedBy;
+      if (cancelled) session.ended_reason = "cancelled";
+      else delete session.ended_reason;
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
       return session;
@@ -943,6 +962,8 @@ function normalizePrompt(prompt) {
   };
   const promptId = normalizePromptId(prompt.prompt_id);
   if (promptId) normalized.prompt_id = promptId;
+  const author = normalizePromptAuthor(prompt.author);
+  if (author) normalized.author = author;
   const target = normalizeTarget(prompt.target);
   if (target) normalized.target = target;
   const { refs, malformed } = normalizeAttachmentRefs(prompt.attachments);

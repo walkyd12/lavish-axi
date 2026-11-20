@@ -331,7 +331,13 @@ export async function serve({
   theme = resolveHostTheme(env),
   hubPeers = env[HUB_PEERS_ENV],
   hubPeerOptions = {},
+  actionLabel = env.LAVISH_AXI_ACTION_LABEL,
+  onEvent = null,
 } = {}) {
+  const resolvedActionLabel =
+    String(actionLabel || "Send")
+      .trim()
+      .slice(0, 64) || "Send";
   // Keep the transport dependency off fast metadata paths such as `--version`.
   const { WebSocket, WebSocketServer } = await import("ws");
   // LAVISH_AXI_PUBLIC_URL replaces the origin of every board link the server emits, and its
@@ -438,7 +444,107 @@ export async function serve({
   events.on("ended", (key, endedBy) => broadcastLiveEvent("ended", key, { ended_by: endedBy || null }));
   events.on("ended", (key, endedBy) => {
     runEndHook(key, endedBy).catch((error) => writeLog(`[lavish] end hook failed: ${error?.message || error}`));
+    emitLocalBoardEnded(key, endedBy).catch((error) =>
+      writeLog(`[lavish] board end event failed: ${error?.message || error}`),
+    );
   });
+
+  function tagDiff(before = [], after = []) {
+    const beforeLower = new Set((Array.isArray(before) ? before : []).map((tag) => String(tag).toLowerCase()));
+    const afterLower = new Set((Array.isArray(after) ? after : []).map((tag) => String(tag).toLowerCase()));
+    return {
+      added: (Array.isArray(after) ? after : []).filter((tag) => !beforeLower.has(String(tag).toLowerCase())),
+      removed: (Array.isArray(before) ? before : []).filter((tag) => !afterLower.has(String(tag).toLowerCase())),
+    };
+  }
+
+  function compactEventPayload(payload) {
+    const out = { ...payload };
+    if (typeof out.search_text === "string" && out.search_text.length > 16_384) {
+      out.search_text = out.search_text.slice(0, 16_384);
+    }
+    if (Array.isArray(out.prompts)) {
+      out.prompts = out.prompts.slice(0, 32).map((prompt) => ({
+        prompt: String(prompt?.prompt || "").slice(0, 4_096),
+        tag: String(prompt?.tag || "").slice(0, 64),
+        selector: String(prompt?.selector || "").slice(0, 512),
+        text: String(prompt?.text || "").slice(0, 256),
+        ...(prompt?.author ? { author: String(prompt.author).slice(0, 80) } : {}),
+        ...(prompt?.target ? { target: prompt.target } : {}),
+      }));
+    }
+    if (Array.isArray(out.chat)) {
+      out.chat = out.chat.slice(-40).map((entry) => ({
+        role: entry?.role === "agent" ? "agent" : "user",
+        text: String(entry?.text || "").slice(0, 4_096),
+        ...(entry?.author ? { author: String(entry.author).slice(0, 80) } : {}),
+        ...(entry?.at ? { at: String(entry.at).slice(0, 40) } : {}),
+      }));
+    }
+    return out;
+  }
+
+  function spawnHookExecutable(envVar, command, args, extraEnv = {}) {
+    if (!command) return;
+    if (!path.isAbsolute(command)) {
+      writeLog(`[lavish] ${envVar} must be an absolute path to an executable; skipped`);
+      return;
+    }
+    try {
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: "ignore",
+        env: { ...process.env, ...env, ...extraEnv },
+      });
+      child.on("error", (error) => writeLog(`[lavish] event hook ${command} failed to start: ${error.message}`));
+      child.unref();
+    } catch (error) {
+      writeLog(`[lavish] event hook ${command} failed: ${error?.message || error}`);
+    }
+  }
+
+  // LAVISH_AXI_ON_EVENT (and optional LAVISH_AXI_ON_ACTION for board_action) names an executable run
+  // (no shell, detached, fire-and-forget) whenever a hub/board event occurs (board_created,
+  // board_reopened, message, board_action, tag_change, board_closed, board_cancelled), receiving one
+  // compact JSON payload argument so external workflows stay event-driven without polling.
+  function emitHubEvent(payload) {
+    const base = `http://${hostForUrl(LOOPBACK_HOST)}:${publicPort}`;
+    const eventPayload = compactEventPayload({ ...payload, base, at: new Date().toISOString() });
+    if (typeof onEvent === "function") {
+      Promise.resolve()
+        .then(() => onEvent(eventPayload))
+        .catch((error) => writeLog(`[lavish] onEvent callback failed: ${error?.message || error}`));
+    }
+    const serialized = JSON.stringify(eventPayload);
+    const hookEnv = { LAVISH_AXI_EVENT: String(eventPayload.event || "") };
+    const eventCommand = String(env.LAVISH_AXI_ON_EVENT || process.env.LAVISH_AXI_ON_EVENT || "").trim();
+    spawnHookExecutable("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv);
+    if (eventPayload.event === "board_action") {
+      const actionCommand = String(env.LAVISH_AXI_ON_ACTION || process.env.LAVISH_AXI_ON_ACTION || "").trim();
+      if (actionCommand && actionCommand !== eventCommand) {
+        spawnHookExecutable("LAVISH_AXI_ON_ACTION", actionCommand, [serialized], hookEnv);
+      }
+    }
+  }
+
+  async function emitLocalBoardEnded(key, endedBy) {
+    const session = await store.findByKey(key);
+    if (!session) return;
+    const head = await readBoardHead(session.file);
+    const cancelled = session.ended_reason === "cancelled";
+    emitHubEvent({
+      event: cancelled ? "board_cancelled" : "board_closed",
+      key,
+      file: session.file,
+      url: session.url,
+      title: boardTitle(session, head.title),
+      creator: session.creator || "",
+      tags: session.tags || [],
+      cancelled,
+      ended_by: endedBy === "user" ? "user" : "agent",
+      search_text: head.searchText || "",
+    });
+  }
 
   // LAVISH_AXI_ON_END names an executable run (no shell) whenever a session ends - from the
   // browser, Send & End, the hub, or `lavish-axi end` - with the board file, session key, who
@@ -446,7 +552,7 @@ export async function serve({
   // board's copy (GET /api/:key/export) and conversation (GET /api/:key/conversation). Detached and
   // fire-and-forget: a slow or failing hook never delays or fails the end.
   async function runEndHook(key, endedBy) {
-    const command = String(process.env.LAVISH_AXI_ON_END || "").trim();
+    const command = String(env.LAVISH_AXI_ON_END || process.env.LAVISH_AXI_ON_END || "").trim();
     if (!command) return;
     if (!path.isAbsolute(command)) {
       writeLog("[lavish] LAVISH_AXI_ON_END must be an absolute path to an executable; skipped");
@@ -858,6 +964,60 @@ export async function serve({
   const parsedPeers = parseHubPeers(hubPeers);
   for (const error of parsedPeers.errors) writeLog(`[lavish] ${error}; skipped`);
   const collectPeerBoards = parsedPeers.peers.length ? createPeerBoardSource(parsedPeers.peers, hubPeerOptions) : null;
+  /** @type {Map<string, { closed: boolean, cancelled: boolean, tags: string[], notes: number, last_activity: string }>} */
+  const observedPeerBoards = new Map();
+
+  function observePeerBoards(remoteBoards) {
+    for (const board of Array.isArray(remoteBoards) ? remoteBoards : []) {
+      if (!board || typeof board.key !== "string") continue;
+      const prev = observedPeerBoards.get(board.key);
+      const currentTags = Array.isArray(board.tags) ? board.tags : [];
+      const currentClosed = Boolean(board.closed);
+      const currentCancelled = Boolean(board.cancelled);
+      const currentNotes = Number(board.notes) || 0;
+      observedPeerBoards.set(board.key, {
+        closed: currentClosed,
+        cancelled: currentCancelled,
+        tags: currentTags,
+        notes: currentNotes,
+        last_activity: String(board.last_activity || ""),
+      });
+      const peerCommon = {
+        key: board.key,
+        peer_key: board.peer_key || "",
+        peer_origin: board.peer_origin || "",
+        source: board.source || "",
+        url: board.url || "",
+        title: board.title || "",
+        creator: board.creator || "",
+        tags: currentTags,
+        cancelled: currentCancelled,
+        ended_by: board.ended_by || null,
+        last_activity: board.last_activity || "",
+        search_text: board.search_text || "",
+      };
+      if (!prev) {
+        emitHubEvent({
+          event: currentCancelled ? "board_cancelled" : currentClosed ? "board_closed" : "board_created",
+          ...peerCommon,
+        });
+        continue;
+      }
+      if (prev.closed && !currentClosed) {
+        emitHubEvent({ event: "board_reopened", ...peerCommon });
+      }
+      const { added, removed } = tagDiff(prev.tags, currentTags);
+      if (added.length || removed.length) {
+        emitHubEvent({ event: "tag_change", ...peerCommon, added, removed });
+      }
+      if (currentNotes > prev.notes) {
+        emitHubEvent({ event: "message", ...peerCommon, notes_delta: currentNotes - prev.notes });
+      }
+      if (!prev.closed && currentClosed) {
+        emitHubEvent({ event: currentCancelled ? "board_cancelled" : "board_closed", ...peerCommon });
+      }
+    }
+  }
 
   /** @param {{ includePeers?: boolean }} [options] */
   async function hubView({ includePeers = true } = {}) {
@@ -866,6 +1026,7 @@ export async function serve({
       includePeers && collectPeerBoards ? collectPeerBoards() : null,
     ]);
     if (!remote) return { boards: local, peers: [] };
+    observePeerBoards(remote.boards);
     return {
       boards: sortHubBoards([
         ...local,
@@ -914,7 +1075,12 @@ export async function serve({
       const view = await hubView({ includePeers: req.query.peers !== "0" });
       res.json({
         ...view,
-        boards: filterHubBoards(view.boards, { query: String(req.query.q || ""), tag: String(req.query.tag || "") }),
+        boards: filterHubBoards(view.boards, {
+          query: String(req.query.q || ""),
+          tag: String(req.query.tag || ""),
+          state: String(req.query.state || ""),
+        }),
+        action_label: resolvedActionLabel,
         version,
         generated_at: new Date().toISOString(),
       });
@@ -943,7 +1109,159 @@ export async function serve({
       }
       clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
       events.emit("ended", req.params.key, session.ended_by);
-      res.json({ status: "ended", ended_by: session.ended_by });
+      res.json({ status: "ended", ended_by: session.ended_by, ...serializeBoardMetadata(session) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Cancel from the hub or board chrome: ends the board without marking it Done, so external brain
+  // hooks skip cancelled boards while keeping them searchable and restorable from Cancelled.
+  app.post("/api/hub/:key/cancel", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin cancel rejected" });
+        return;
+      }
+      if (isPeerKey(req.params.key)) {
+        res.status(400).json({ error: "a peer's board is cancelled on its own server" });
+        return;
+      }
+      const session = await store.endSession(req.params.key, "user", { cancelled: true });
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+      events.emit("ended", req.params.key, session.ended_by);
+      res.json({ status: "ended", ended_by: session.ended_by, ...serializeBoardMetadata(session) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Generic configurable board workflow action (default label "Send", overridden via
+  // LAVISH_AXI_ACTION_LABEL). Normal board chat stays free conversation; clicking this control (or
+  // passing --send from the CLI) fires `board_action` so each person's external workflow can run.
+  app.post("/api/:key/action", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin action rejected" });
+        return;
+      }
+      if (isPeerKey(req.params.key)) {
+        res.status(400).json({ error: "run actions on a peer board from its own server" });
+        return;
+      }
+      let current = await store.findByKey(req.params.key);
+      if (!current) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (current.status === "ended") {
+        res.status(409).json({ status: "ended", error: "session already ended", ended_by: current.ended_by });
+        return;
+      }
+      const activeHolder = activePolls.get(req.params.key);
+      const inlinePrompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
+      const inlineAuthor = typeof req.body?.author === "string" ? req.body.author.trim() : "";
+      let acceptedPrompts = [];
+      let clearedTags = [];
+      if (inlinePrompt) {
+        const queued = await store.queuePrompts(
+          req.params.key,
+          {
+            prompts: [
+              {
+                uid: "",
+                prompt: inlinePrompt,
+                selector: "",
+                tag: "message",
+                text: "Board message",
+                prompt_id: `action-${crypto.randomUUID()}`,
+                ...(inlineAuthor ? { author: inlineAuthor } : {}),
+              },
+            ],
+          },
+          {
+            resolveAttachment: (sessionKeyValue, id) => resolveAttachment(attachmentStateRoot, sessionKeyValue, id),
+            maxPerPrompt: attachmentConfig.maxPerPrompt,
+            maxPromptBytes: attachmentConfig.maxPromptBytes,
+          },
+        );
+        if (queued && !queued.ended && !queued.rejected && !queued.conflict) {
+          current = queued;
+          acceptedPrompts = Array.isArray(queued.accepted_prompts) ? queued.accepted_prompts : [];
+          clearedTags = Array.isArray(queued.cleared_tags) ? queued.cleared_tags : [];
+          if (queued.fresh_feedback) {
+            emitHubEvent({
+              event: "message",
+              key: req.params.key,
+              file: current.file,
+              url: current.url,
+              creator: current.creator || "",
+              tags: current.tags || [],
+              had_listener: Boolean(activeHolder),
+              listener: activeHolder ? listenerLabel(activeHolder) : null,
+              prompts: acceptedPrompts,
+            });
+            events.emit("feedback", req.params.key, current.ended_by);
+            events.emit("chat-sync", req.params.key, current);
+          }
+        }
+      }
+      if (Array.isArray(current.tags) && current.tags.some((tag) => String(tag).toLowerCase() === "needs-input")) {
+        const priorTags = current.tags;
+        const updated = await store.updateBoardTags(req.params.key, { remove: ["needs-input"] });
+        if (updated) {
+          const diff = tagDiff(priorTags, updated.tags || []);
+          clearedTags = [...clearedTags, ...diff.removed];
+          current = updated;
+        }
+      }
+      const metadata = serializeBoardMetadata(current);
+      const head = await readBoardHead(current.file);
+      if (clearedTags.length) {
+        events.emit("board-metadata", req.params.key, metadata);
+        emitHubEvent({
+          event: "tag_change",
+          key: req.params.key,
+          file: current.file,
+          url: current.url,
+          title: boardTitle(current, head.title),
+          creator: current.creator || "",
+          tags: metadata.tags,
+          added: [],
+          removed: clearedTags,
+        });
+      }
+      const actionName =
+        String(req.body?.action || "send")
+          .trim()
+          .slice(0, 40) || "send";
+      emitHubEvent({
+        event: "board_action",
+        action: actionName,
+        action_label: resolvedActionLabel,
+        key: req.params.key,
+        file: current.file,
+        url: current.url,
+        title: boardTitle(current, head.title),
+        creator: current.creator || "",
+        tags: metadata.tags,
+        had_listener: Boolean(activeHolder),
+        listener: activeHolder ? listenerLabel(activeHolder) : null,
+        ...(inlineAuthor ? { author: inlineAuthor } : {}),
+        prompts: acceptedPrompts.length ? acceptedPrompts : current.prompts || [],
+        chat: current.chat || [],
+      });
+      res.json({
+        status: "sent",
+        action: actionName,
+        action_label: resolvedActionLabel,
+        ...metadata,
+        ...serializeChatSync(current),
+      });
     } catch (error) {
       next(error);
     }
@@ -959,10 +1277,26 @@ export async function serve({
       return;
     }
     try {
+      const prior = await store.findByKey(req.params.key);
       const session = await store.updateBoardTags(req.params.key, req.body);
       if (!session) return void res.status(404).json({ error: "session not found" });
       const metadata = serializeBoardMetadata(session);
       events.emit("board-metadata", req.params.key, metadata);
+      const { added, removed } = tagDiff(prior?.tags || [], metadata.tags);
+      if (added.length || removed.length) {
+        const { title } = await readBoardHead(session.file);
+        emitHubEvent({
+          event: "tag_change",
+          key: req.params.key,
+          file: session.file,
+          url: session.url,
+          title: boardTitle(session, title),
+          creator: session.creator || "",
+          tags: metadata.tags,
+          added,
+          removed,
+        });
+      }
       res.json(metadata);
     } catch (error) {
       if (error instanceof BoardMetadataError) {
@@ -1006,6 +1340,7 @@ export async function serve({
         return;
       }
       res.json({
+        ...serializeBoardMetadata(session),
         key: session.key,
         file: session.file,
         title: boardTitle(session, title),
@@ -1114,6 +1449,8 @@ export async function serve({
         return;
       }
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
+      const wasNew = !existing;
+      const wasReopened = Boolean(existing && existing.status === "ended");
       const session = await store.upsertSession(file, sessionUrl, { creator: creator || undefined, version });
       if (existing?.status === "ended") {
         clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
@@ -1121,6 +1458,20 @@ export async function serve({
       logEvent?.(`session opened key=${key} file=${file}`);
       await syncOutstandingRepairs(key);
       await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
+      if (wasNew || wasReopened) {
+        const { title } = await readBoardHead(session.file);
+        emitHubEvent({
+          event: wasNew ? "board_created" : "board_reopened",
+          key,
+          file: session.file,
+          url: session.url,
+          title: boardTitle(session, title),
+          creator: session.creator || "",
+          tags: session.tags || [],
+          created_version: session.created_version || "",
+          served_version: session.served_version || "",
+        });
+      }
       res.json({
         key,
         file,
@@ -1468,12 +1819,44 @@ export async function serve({
         return;
       }
       const freshFeedback = session.fresh_feedback === true;
+      const acceptedPrompts = Array.isArray(session.accepted_prompts) ? session.accepted_prompts : [];
+      const clearedTags = Array.isArray(session.cleared_tags) ? session.cleared_tags : [];
+      const activeHolder = activePolls.get(req.params.key);
       if (shouldEndSession) clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
       let publishedSession = session;
       if (hasLayoutWarningPrompt) {
         await syncOutstandingRepairs(req.params.key);
         publishedSession = (await store.findByKey(req.params.key)) || session;
         events.emit("layout-warnings", req.params.key, serializeLayoutWarnings(publishedSession.layout_warnings));
+      }
+      if (clearedTags.length) {
+        const metadata = serializeBoardMetadata(publishedSession);
+        const { title } = await readBoardHead(publishedSession.file);
+        events.emit("board-metadata", req.params.key, metadata);
+        emitHubEvent({
+          event: "tag_change",
+          key: req.params.key,
+          file: publishedSession.file,
+          url: publishedSession.url,
+          title: boardTitle(publishedSession, title),
+          creator: publishedSession.creator || "",
+          tags: metadata.tags,
+          added: [],
+          removed: clearedTags,
+        });
+      }
+      if (freshFeedback) {
+        emitHubEvent({
+          event: "message",
+          key: req.params.key,
+          file: publishedSession.file,
+          url: publishedSession.url,
+          creator: publishedSession.creator || "",
+          tags: publishedSession.tags || [],
+          had_listener: Boolean(activeHolder),
+          listener: activeHolder ? listenerLabel(activeHolder) : null,
+          prompts: acceptedPrompts,
+        });
       }
       if (shouldEndSession) events.emit("ended", req.params.key, publishedSession.ended_by);
       else if (freshFeedback) events.emit("feedback", req.params.key, publishedSession.ended_by);
@@ -1816,7 +2199,7 @@ export async function serve({
     try {
       const file = await canonicalFile(req.body.file);
       const key = sessionKey(file);
-      const session = await store.endSession(key, "agent");
+      const session = await store.endSession(key, "agent", { cancelled: req.body?.cancel === true });
       clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
       events.emit("ended", key, session?.ended_by);
       res.json({ status: "ended", ...(session ? serializeBoardMetadata(session) : { closed: true }) });
@@ -1861,6 +2244,7 @@ export async function serve({
           chromeLoadToken: chromeLoad.chrome_load_token,
           attachmentMaxBytes: attachmentConfig.maxBytes,
           attachmentMaxCount: attachmentConfig.maxPerPrompt,
+          actionLabel: resolvedActionLabel,
           theme,
         }),
       );
@@ -3428,6 +3812,7 @@ export function createChromeHtml(
     attachmentMaxBytes = 0,
     attachmentMaxCount = 0,
     attachmentAcceptedMime = ACCEPTED_IMAGE_MIME,
+    actionLabel = "Send",
     theme = "",
   } = {},
 ) {
@@ -3488,7 +3873,7 @@ ${themed.style}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><span class="presence-pill" id="presencePill" role="status" aria-live="polite" data-tone="off"><span class="presence-dot" aria-hidden="true"></span><span class="presence-text" id="presencePillText">Connecting…</span></span><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="panel" aria-expanded="true" aria-label="Hide conversation" title="Hide conversation">${chromeIcons.sidebar}<span class="sidebar-toggle-count" id="sidebarToggleCount" aria-hidden="true" hidden></span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="layoutToggle" type="button" title="Switch between the phone and desktop layouts. Remembered on this device.">${chromeIcons.phone}<span id="layoutToggleText">Layout: Auto</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p><button type="button" class="button ended-action" data-reactivate data-key="${session.key}" data-file="${escapeHtml(session.file)}">Reactivate board</button><p><a href="/">Fusion Hub</a></p></div></div>

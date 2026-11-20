@@ -7,6 +7,8 @@
 // (never taken from the peer), and a peer that is slow, down, or answers badly is skipped without
 // breaking or holding up the hub for more than the one short timeout.
 
+import { boardWorkflowState } from "./board-metadata.js";
+
 export const HUB_PEERS_ENV = "LAVISH_AXI_HUB_PEERS";
 export const PEER_KEY_PREFIX = "peer:";
 export const PEER_TIMEOUT_MS = 2000;
@@ -118,23 +120,31 @@ export function serializePeerBoard(peer, board) {
   if (!board || typeof board !== "object" || typeof board.key !== "string" || !BOARD_KEY.test(board.key)) return null;
   const status = board.status === "ended" ? "ended" : "open";
   const state = STATES.has(board.state) ? board.state : status === "ended" ? "closed-agent" : "nobody";
+  const tags = Array.isArray(board.tags)
+    ? [
+        ...new Set(
+          board.tags
+            .slice(0, 32)
+            .map((tag) => text(tag, 64))
+            .filter(Boolean),
+        ),
+      ]
+    : [];
+  const workflow = boardWorkflowState({
+    status,
+    tags,
+    cancelled: status === "ended" && board.cancelled === true,
+  });
   return {
     key: `${PEER_KEY_PREFIX}${peer.name}:${board.key}`,
     peer_key: board.key,
-    tags: Array.isArray(board.tags)
-      ? [
-          ...new Set(
-            board.tags
-              .slice(0, 32)
-              .map((tag) => text(tag, 64))
-              .filter(Boolean),
-          ),
-        ]
-      : [],
+    peer_origin: peer.origin,
+    tags,
     creator: text(board.creator, 120),
     created_version: text(board.created_version, 40),
     served_version: text(board.served_version, 40),
     closed: status === "ended",
+    ...workflow,
     search_text: text(board.search_text, 64 * 1024),
     source: peer.name,
     file: "",
