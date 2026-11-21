@@ -1120,3 +1120,6 @@ main.wrap {
   color: inherit;
   max-width: 14rem;
 }
+
+/* Poppins' narrow space plus negative tracking made words run together on phones ("Linkone"). */
+.board-title, h2 { letter-spacing: 0; word-spacing: 0.08em; }
