@@ -413,6 +413,18 @@ function applyViewData(data) {
   if (typeof data.needs_you_count === "number") needsYouCount = data.needs_you_count;
 }
 
+// The box shows a friendly name ("Zach's Cortana DM") for known destinations; the stored value
+// stays the route id. Typing a known name maps back to its id; anything else is taken as typed.
+function displaySendTo(value) {
+  const hit = notifyDestinations.find((item) => item.id === value);
+  return hit ? hit.label : String(value || "");
+}
+function storedSendTo(text) {
+  const clean = String(text || "").trim();
+  const hit = notifyDestinations.find((item) => item.label.toLowerCase() === clean.toLowerCase());
+  return hit ? hit.id : clean;
+}
+
 function destinationStatus(value) {
   const destination = notifyDestinations.find((item) => item.id === value);
   if (destination) return { label: destination.ready ? "Ready" : "Not connected", ready: destination.ready };
@@ -453,7 +465,7 @@ function notifyRowHtml(person, cfg) {
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="tagged"${cfg.tagged ? " checked" : ""}><span>When tagged</span></label>` +
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="done"${cfg.done ? " checked" : ""}><span>When board is done</span></label>` +
     `</div>` +
-    `<label class="notify-sendto"><span>Destination</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Paste a URL or pick below" maxlength="2048"></label>` +
+    `<label class="notify-sendto"><span>Destination</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(displaySendTo(cfg.send_to))}" placeholder="Pick below, or paste a webhook URL" maxlength="2048"></label>` +
     `<label class="notify-sendto"><span>Suggested destinations</span><select data-notify-pick="${safeName}" aria-describedby="destination-status-${index}">${destinationOptions(cfg.send_to)}</select></label>` +
     `<div class="destination-check"><span class="destination-status" id="destination-status-${index}" data-ready="${status.ready}">${escapeHtml(status.label)}</span><button type="button" class="act" data-notify-test="${safeName}" aria-label="Send test for ${safeName}">Send test</button></div>` +
     `</div>`
@@ -504,11 +516,11 @@ function renderNotificationsPanel() {
       if (field === "tagged") input.checked = Boolean(cfg.tagged);
       else if (field === "done") input.checked = Boolean(cfg.done);
       else if (field === "send_to" && input !== focusedSendTo && !sendToSaveTimers.has(person)) {
-        input.value = String(cfg.send_to || "");
+        input.value = displaySendTo(cfg.send_to);
       }
     }
     const field = /** @type {HTMLInputElement | null} */ (existing.querySelector('input[data-notify-field="send_to"]'));
-    syncDestinationRow(existing, field?.value.trim() || "");
+    syncDestinationRow(existing, storedSendTo(field?.value || ""));
   }
 }
 
@@ -1055,7 +1067,7 @@ notifyRows?.addEventListener("change", (event) => {
     const field = /** @type {HTMLInputElement | null} */ (
       select.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
     );
-    if (field) field.value = select.value;
+    if (field) field.value = displaySendTo(select.value);
     notifySettings[pickedPerson] = { ...notifySettings[pickedPerson], send_to: select.value };
     void queueNotifyMutation({ patch: { person: pickedPerson, send_to: select.value } }, { rerender: true });
     renderNotificationsPanel();
@@ -1075,7 +1087,7 @@ notifyRows?.addEventListener("change", (event) => {
       clearTimeout(existingTimer);
       sendToSaveTimers.delete(person);
     }
-    const cleaned = input.value.trim();
+    const cleaned = storedSendTo(input.value);
     notifySettings[person] = { ...notifySettings[person], send_to: cleaned };
     void queueNotifyMutation({ patch: { person, send_to: cleaned } }, { rerender: true });
   }
@@ -1085,7 +1097,7 @@ notifyRows?.addEventListener("input", (event) => {
   const person = input?.dataset?.notifyPerson;
   const field = input?.dataset?.notifyField;
   if (!input || !person || field !== "send_to" || !Object.hasOwn(notifySettings, person)) return;
-  const cleaned = input.value.trim();
+  const cleaned = storedSendTo(input.value);
   notifySettings[person] = { ...notifySettings[person], send_to: cleaned };
   const row = input.closest("[data-notify-row]");
   if (row) syncDestinationRow(row, cleaned);
@@ -1107,7 +1119,7 @@ notifyRows?.addEventListener("click", async (event) => {
     const field = /** @type {HTMLInputElement | null} */ (
       testButton.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
     );
-    const sendTo = field?.value.trim() ?? notifySettings[testPerson].send_to;
+    const sendTo = field ? storedSendTo(field.value) : notifySettings[testPerson].send_to;
     try {
       await notifySaveChain;
       const response = await fetch("/api/hub/notifications/test", {
@@ -1130,6 +1142,19 @@ notifyRows?.addEventListener("click", async (event) => {
   );
   const person = button?.dataset?.notifyRemove;
   if (!person || !Object.hasOwn(notifySettings, person)) return;
+  if (button.dataset.armed !== "1") {
+    // Two taps to remove someone, like Close/Cancel on boards: the first tap asks.
+    button.dataset.armed = "1";
+    button.classList.add("armed");
+    button.textContent = "Tap again to remove";
+    setTimeout(() => {
+      if (!button.isConnected) return;
+      button.dataset.armed = "";
+      button.classList.remove("armed");
+      button.textContent = "×";
+    }, 4000);
+    return;
+  }
   const pendingTimer = sendToSaveTimers.get(person);
   if (pendingTimer) {
     clearTimeout(pendingTimer);
