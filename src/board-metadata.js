@@ -59,6 +59,7 @@ export function serializeBoardMetadata(session) {
     client: session.client || "",
     created_version: session.created_version || "",
     served_version: session.served_version || "",
+    opened_at: session.opened_at || "",
     closed: session.status === "ended",
     ...workflow,
   };

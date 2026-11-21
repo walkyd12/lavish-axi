@@ -405,6 +405,7 @@ export function serializePeerBoard(peer, board) {
     client: text(board.client, 64),
     created_version: text(board.created_version, 40),
     served_version: text(board.served_version, 40),
+    opened_at: text(board.opened_at, 40),
     closed: status === "ended",
     ...workflow,
     search_text: text(board.search_text, 64 * 1024),
