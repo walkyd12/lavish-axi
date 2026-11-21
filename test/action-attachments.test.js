@@ -45,9 +45,15 @@ test("action attachments reach the detached event hook and poll through the chat
     }).then((r) => r.json());
     const attachment = { id: uploaded.attachment.id, name: "review.png", path: "/forged/path" };
     for (const prompt of ["Fix this row", ""]) {
+      // An earlier chat turn may still be pending when the reviewer presses the action.
+      const earlier = await post(`/api/${key}/prompts`, {
+        prompts: [{ prompt: "Earlier chat instruction", tag: "message", prompt_id: `earlier-${prompt}` }],
+      });
+      assert.equal(earlier.status, 200);
       const response = await post(`/api/${key}/action`, { prompt, attachments: [attachment] });
       assert.equal(response.status, 200);
       const action = events.filter((e) => e.event === "board_action").at(-1);
+      assert.equal(action.prompts.length, 1);
       assert.equal(action.prompts[0].prompt, prompt);
       const resolved = action.prompts[0].attachments?.[0];
       assert.equal(resolved?.id, attachment.id);
@@ -57,7 +63,9 @@ test("action attachments reach the detached event hook and poll through the chat
       const polled = await fetch(`${base}/api/poll?file=${encodeURIComponent(file)}&timeoutMs=100`).then((r) =>
         r.json(),
       );
-      assert.deepEqual(polled.prompts[0].attachments[0], { ...resolved, type: "image" });
+      assert.equal(polled.prompts.length, 2);
+      assert.equal(polled.prompts[0].prompt, "Earlier chat instruction");
+      assert.deepEqual(polled.prompts[1].attachments[0], { ...resolved, type: "image" });
     }
     const count = events.filter((e) => e.event === "board_action").length;
     const rejected = await post(`/api/${key}/action`, {
