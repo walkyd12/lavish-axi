@@ -1160,8 +1160,28 @@ function handleBoardClick(event) {
   if (!button || button.disabled) return;
   const board = renderedBoards.get(button.dataset.key);
   if (!board) return;
-  if (button.dataset.act === "close") return closeBoard(board);
-  else if (button.dataset.act === "cancel") return cancelBoard(board);
+  if (button.dataset.act === "close" || button.dataset.act === "cancel") {
+    // Two-tap confirm so nobody closes or cancels a board by accident: the first tap arms the
+    // button for a few seconds, the second tap does it.
+    if (button.dataset.armed !== "1") {
+      const original = button.textContent || "";
+      button.dataset.armed = "1";
+      button.dataset.originalLabel = original;
+      button.classList.add("armed");
+      button.textContent = button.dataset.act === "close" ? "Tap again to close" : "Tap again to cancel";
+      setTimeout(() => {
+        if (button.dataset.armed === "1") {
+          button.dataset.armed = "";
+          button.classList.remove("armed");
+          button.textContent = button.dataset.originalLabel || original;
+        }
+      }, 4000);
+      return;
+    }
+    button.dataset.armed = "";
+    button.classList.remove("armed");
+    return button.dataset.act === "close" ? closeBoard(board) : cancelBoard(board);
+  }
   else if (button.dataset.act === "reopen") return reopenBoard(board);
   else if (button.dataset.act === "history" && !board.source) showHistory(board);
 }
