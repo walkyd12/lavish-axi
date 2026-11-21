@@ -1,7 +1,18 @@
 /* global document, window, location */
 // Shared tag editor for local hub cards and the board chrome. Peer cards are read-only.
 (() => {
-  const people = ["Walker", "Broc", "Gibson", "Zach", "Roxanne"];
+  const configuredPeople = (root) => {
+    if (root?.dataset.people) {
+      try {
+        const parsed = JSON.parse(root.dataset.people);
+        if (Array.isArray(parsed)) return parsed.filter((name) => typeof name === "string" && name.trim());
+      } catch {
+        // ignore invalid attribute
+      }
+    }
+    const globalList = window["lavishNotifyPeople"];
+    return Array.isArray(globalList) ? globalList.filter((name) => typeof name === "string" && name.trim()) : [];
+  };
   const escape = (value) =>
     String(value).replace(
       /[&<>"']/g,
@@ -14,6 +25,7 @@
     const tags = metadata.tags || [];
     const readonly = root.dataset.readonly === "true";
     const actionLabel = String(root.dataset.actionLabel || "").trim() || "Send";
+    const people = configuredPeople(root);
     const needsInput = tags.some((tag) => String(tag).toLowerCase() === "needs-input");
     const stateLabel =
       metadata.board_state_label ||
@@ -23,7 +35,7 @@
       `<div class="board-tags">${tags.map((tag) => (readonly ? `<span class="board-tag">${escape(tag)}</span>` : `<span class="board-tag"><button type="button" data-edit="${escape(tag)}" title="Change tag ${escape(tag)}">${escape(tag)}</button><button type="button" data-remove="${escape(tag)}" aria-label="Remove ${escape(tag)}">×</button></span>`)).join("")}</div>` +
       (readonly
         ? ""
-        : `<details class="tag-editor"><summary>Tags</summary><div class="person-tags"><button type="button" data-needs-input aria-pressed="${needsInput}">Needs input</button>${people.map((name) => `<button type="button" data-person="${name}" aria-pressed="${tags.some((tag) => tag.toLowerCase() === name.toLowerCase())}">${name}</button>`).join("")}</div><form class="tag-form"><input name="tag" aria-label="Tag" placeholder="Add a tag" maxlength="64" required><button type="submit">Add tag</button><button type="button" data-cancel hidden>Cancel change</button></form></details>`) +
+        : `<details class="tag-editor"><summary>Tags</summary><div class="person-tags"><button type="button" data-needs-input aria-pressed="${needsInput}">Needs input</button>${people.map((name) => `<button type="button" data-person="${escape(name)}" aria-pressed="${tags.some((tag) => tag.toLowerCase() === name.toLowerCase())}">${escape(name)}</button>`).join("")}</div><form class="tag-form"><input name="tag" aria-label="Tag" placeholder="Add a tag" maxlength="64" required><button type="submit">Add tag</button><button type="button" data-cancel hidden>Cancel change</button></form></details>`) +
       (root.dataset.chrome === "true"
         ? metadata.closed
           ? `<div class="board-lifecycle-actions"><button type="button" class="board-close" data-close>Reactivate board</button></div>`
@@ -38,6 +50,13 @@
         root.dataset.mounted = "true";
         render(root, JSON.parse(root.dataset.metadata || "{}"));
       }
+    }
+  }
+
+  function rerenderAll() {
+    for (const root of /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll("[data-board-metadata]"))) {
+      if (root.contains(document.activeElement)) continue;
+      render(root, JSON.parse(root.dataset.metadata || "{}"));
     }
   }
 
@@ -191,6 +210,7 @@
     });
   });
   window.addEventListener("lavish:render-metadata", mount);
+  window.addEventListener("lavish:notify-people", rerenderAll);
   window["lavishBoardMetadata"] = {
     update(metadata) {
       for (const root of /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll("[data-board-metadata]"))) {

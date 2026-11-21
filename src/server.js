@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { open as openFile, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { open as openFile, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
 import { homedir, hostname as osHostname, networkInterfaces } from "node:os";
@@ -66,7 +66,15 @@ import {
 import { hostRejectedShareWrite, publishedDespiteError, publishToHtmlApp } from "./html-app.js";
 import { normalizePromptAuthor, serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
 import { OwnerStatusError, serializeOwnerStatus } from "./owner-status.js";
-import { boardTitle, conversationMarkdown, createHubHtml, serializeHubBoard, sortHubBoards } from "./hub.js";
+import {
+  boardTitle,
+  conversationMarkdown,
+  createHubHtml,
+  serializeHubBoard,
+  sortHubBoards,
+  summarizeHubBoards,
+} from "./hub.js";
+import { createNotifySettingsStore, NOTIFY_PEOPLE_ENV, NotifySettingsError } from "./notify-settings.js";
 import {
   createPeerBoardSource,
   HUB_PEERS_ENV,
@@ -489,6 +497,9 @@ export async function serve({
   let bindRecoveryTimer = null;
   const app = express();
   const store = new SessionStore(stateFile);
+  const notifySettingsStore = createNotifySettingsStore(path.dirname(stateFile), {
+    seedPeople: String(env[NOTIFY_PEOPLE_ENV] ?? process.env[NOTIFY_PEOPLE_ENV] ?? ""),
+  });
   const events = new EventEmitter();
   const watchers = new Map();
   const activePolls = new Map();
@@ -738,17 +749,21 @@ export async function serve({
     } else {
       notifyHubViewers();
     }
+    const hookPayload = { ...eventPayload, notify_settings: notifySettingsStore.getSync() };
     if (typeof onEvent === "function") {
       Promise.resolve()
-        .then(() => onEvent(eventPayload))
+        .then(() => onEvent(hookPayload))
         .catch((error) => writeLog(`[lavish] onEvent callback failed: ${error?.message || error}`));
     }
-    let serialized = JSON.stringify(eventPayload);
+    let serialized = JSON.stringify(hookPayload);
     if (Buffer.byteLength(serialized, "utf8") > MAX_HOOK_ARG_BYTES) {
-      const slimmer = compactEventPayload(
-        { ...eventPayload, search_text: String(eventPayload.search_text || "").slice(0, 4_096) },
-        { promptMax: 1_024, chatMax: 512 },
-      );
+      const slimmer = {
+        ...compactEventPayload(
+          { ...eventPayload, search_text: String(eventPayload.search_text || "").slice(0, 4_096) },
+          { promptMax: 1_024, chatMax: 512 },
+        ),
+        notify_settings: hookPayload.notify_settings,
+      };
       serialized = JSON.stringify(slimmer);
     }
     const hookEnv = { LAVISH_AXI_EVENT: String(eventPayload.event || "") };
@@ -765,7 +780,7 @@ export async function serve({
   async function emitLocalBoardEnded(key, endedBy) {
     const session = await store.findByKey(key);
     if (!session) return;
-    const head = await readBoardHead(session.file);
+    const head = await readBoardHead(session.file, { includeSearchText: true });
     const cancelled = session.ended_reason === "cancelled";
     emitHubEvent({
       event: cancelled ? "board_cancelled" : "board_closed",
@@ -1171,20 +1186,88 @@ export async function serve({
 
   // ---- The hub (src/hub.js) ----
   // The front page lists every board with a state computed from what this server already knows.
-  async function readBoardHead(file) {
+  const DEFAULT_HUB_LIMIT = 50;
+  const MAX_HUB_LIMIT = 200;
+  const BOARD_IO_CONCURRENCY = 32;
+  const MAX_BOARD_HEAD_CACHE = 2048;
+  /** @type {Map<string, { stamp: string, title: string, searchText: string | null }>} */
+  const boardHeadCache = new Map();
+
+  /**
+   * @template T, R
+   * @param {T[]} items
+   * @param {number} concurrency
+   * @param {(item: T, index: number) => Promise<R>} worker
+   * @returns {Promise<R[]>}
+   */
+  async function mapLimit(items, concurrency, worker) {
+    if (items.length === 0) return [];
+    const results = new Array(items.length);
+    let cursor = 0;
+    const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      for (;;) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= items.length) return;
+        results[index] = await worker(items[index], index);
+      }
+    });
+    await Promise.all(runners);
+    return results;
+  }
+
+  async function checkBoardFileExists(file) {
+    try {
+      const st = await stat(file);
+      return st.isFile();
+    } catch (error) {
+      return error?.code !== "ENOENT" && error?.code !== "ENOTDIR";
+    }
+  }
+
+  async function readBoardHead(file, { includeSearchText = false } = {}) {
+    let st;
+    try {
+      st = await stat(file, { bigint: true });
+    } catch (error) {
+      boardHeadCache.delete(file);
+      return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "", searchText: "" };
+    }
+    if (!st.isFile()) {
+      boardHeadCache.delete(file);
+      return { exists: false, title: "", searchText: "" };
+    }
+    const stamp = `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+    const cached = boardHeadCache.get(file);
+    if (cached && cached.stamp === stamp && (!includeSearchText || cached.searchText !== null)) {
+      return { exists: true, title: cached.title, searchText: cached.searchText || "" };
+    }
+    const maxBytes = includeSearchText ? 1024 * 1024 : 64 * 1024;
+    const toRead = Math.min(Number(st.size), maxBytes);
+    if (toRead === 0) {
+      boardHeadCache.set(file, { stamp, title: "", searchText: "" });
+      return { exists: true, title: "", searchText: "" };
+    }
     let handle;
     try {
       handle = await openFile(file, "r");
-      const buffer = Buffer.alloc(1024 * 1024);
+      const buffer = Buffer.allocUnsafe(toRead);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
       const html = buffer.subarray(0, bytesRead).toString("utf8");
-      return {
-        exists: true,
-        title: extractArtifactHead(html.slice(0, 64 * 1024)).title,
-        searchText: boardSearchText(html).slice(0, 64 * 1024),
-      };
+      const title = extractArtifactHead(html.slice(0, 64 * 1024)).title;
+      const searchText = includeSearchText
+        ? boardSearchText(html).slice(0, 64 * 1024)
+        : cached && cached.stamp === stamp
+          ? cached.searchText
+          : null;
+      if (!boardHeadCache.has(file) && boardHeadCache.size >= MAX_BOARD_HEAD_CACHE) {
+        const oldestKey = boardHeadCache.keys().next().value;
+        if (oldestKey !== undefined) boardHeadCache.delete(oldestKey);
+      }
+      boardHeadCache.set(file, { stamp, title, searchText });
+      return { exists: true, title, searchText: searchText || "" };
     } catch (error) {
-      return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "" };
+      return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "", searchText: "" };
     } finally {
       await handle?.close().catch(() => {});
     }
@@ -1377,84 +1460,254 @@ export async function serve({
     for (const sub of peerEventSubscriptions.splice(0)) sub.close();
   }
 
-  /** @param {{ includePeers?: boolean }} [options] */
-  async function hubView({ includePeers = true } = {}) {
-    const [local, remote] = await Promise.all([
-      hubBoards(),
-      includePeers && collectPeerBoards ? collectPeerBoards() : null,
-    ]);
-    if (!remote) return { boards: local, peers: [] };
-    return {
-      boards: sortHubBoards([
-        ...local,
-        ...remote.boards.map((board) => ({ ...board, version_behind: boardVersionBehind(board, version) })),
-      ]),
-      peers: remote.peers,
-    };
-  }
-
-  async function hubBoards() {
-    const sessions = await store.listSessions();
-    const now = Date.now();
-    const boards = await Promise.all(
-      sessions.map(async (session) => {
-        const head = await readBoardHead(session.file);
-        const holder = activePolls.get(session.key);
-        return serializeHubBoard(session, {
-          listener: holder ? listenerLabel(holder) : null,
-          tabs: liveClientCount(session.key),
-          fileExists: head.exists,
-          title: head.title,
-          searchText: head.searchText || "",
-          version,
-          now,
-        });
-      }),
-    );
-    return sortHubBoards(boards);
-  }
-
-  app.get("/", async (_req, res, next) => {
-    try {
-      res.setHeader("x-frame-options", "DENY");
-      res.setHeader("content-security-policy", "frame-ancestors 'none'");
-      const view = await hubView();
-      res.type("html").send(createHubHtml({ ...view, hostname: osHostname(), theme }));
-    } catch (error) {
-      next(error);
-    }
-  });
-
   const PEER_TOTAL_SEARCH_TEXT_BUDGET = 16 * 1024 * 1024;
 
-  app.get("/api/hub", async (req, res, next) => {
-    try {
-      // `?peers=0` is what a peer hub asks for: this server's own boards only, so hubs that list
-      // each other never loop, and bounded to PEER_MAX_BOARDS so a large peer never overflows PEER_MAX_BYTES.
-      const peersOnly = req.query.peers === "0";
-      const view = await hubView({ includePeers: !peersOnly });
-      let filtered = filterHubBoards(view.boards, {
-        query: String(req.query.q || ""),
-        tag: String(req.query.tag || ""),
-        state: String(req.query.state || ""),
+  function stripBoardSearchText(board) {
+    if (!board || typeof board !== "object" || !Object.hasOwn(board, "search_text")) return board;
+    const copy = { ...board };
+    delete copy.search_text;
+    return copy;
+  }
+
+  function parseHubLimit(rawLimit) {
+    if (rawLimit === undefined || rawLimit === "") return DEFAULT_HUB_LIMIT;
+    const parsed = Number(rawLimit);
+    if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_HUB_LIMIT;
+    return Math.min(Math.floor(parsed), MAX_HUB_LIMIT);
+  }
+
+  function parseHubOffset(rawOffset) {
+    if (rawOffset === undefined || rawOffset === "") return 0;
+    const parsed = Number(rawOffset);
+    if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+    return Math.min(Math.floor(parsed), 1_000_000);
+  }
+
+  /**
+   * @param {{
+   *   includePeers?: boolean,
+   *   peersOnly?: boolean,
+   *   query?: string,
+   *   tag?: string,
+   *   state?: string,
+   *   limit?: number,
+   *   offset?: number,
+   * }} [options]
+   */
+  async function queryHub({
+    includePeers = true,
+    peersOnly = false,
+    query = "",
+    tag = "",
+    state = "",
+    limit = DEFAULT_HUB_LIMIT,
+    offset = 0,
+  } = {}) {
+    const [sessions, remote] = await Promise.all([
+      store.listSessions(),
+      includePeers && collectPeerBoards ? collectPeerBoards() : null,
+    ]);
+    const now = Date.now();
+    /** @type {Map<string, any>} */
+    const sessionByKey = new Map();
+    const openSessions = [];
+    for (const session of sessions) {
+      sessionByKey.set(String(session.key), session);
+      if (session.status !== "ended") openSessions.push(session);
+    }
+    const openExists = await mapLimit(openSessions, BOARD_IO_CONCURRENCY, (session) =>
+      checkBoardFileExists(session.file),
+    );
+    /** @type {Map<string, boolean>} */
+    const existsByKey = new Map();
+    for (let i = 0; i < openSessions.length; i += 1) {
+      existsByKey.set(String(openSessions[i].key), openExists[i]);
+    }
+
+    const buildLocalBoard = (session, facts = {}) => {
+      const holder = activePolls.get(session.key);
+      const cachedHead = boardHeadCache.get(session.file);
+      return serializeHubBoard(session, {
+        listener: holder ? listenerLabel(holder) : null,
+        tabs: liveClientCount(session.key),
+        fileExists: facts.fileExists !== undefined ? facts.fileExists : (existsByKey.get(String(session.key)) ?? true),
+        title: facts.title !== undefined ? facts.title : cachedHead?.title || "",
+        ...(facts.includeSearchText ? { searchText: facts.searchText || "", includeSearchText: true } : {}),
+        version,
+        now,
       });
-      if (peersOnly && filtered.length > 0) {
-        filtered = filtered.slice(0, PEER_MAX_BOARDS);
+    };
+
+    const localSkeletons = sessions.map((session) => buildLocalBoard(session));
+    const remoteBoards = remote
+      ? remote.boards.map((board) => ({ ...board, version_behind: boardVersionBehind(board, version) }))
+      : [];
+    const sortedAll = sortHubBoards([...localSkeletons, ...remoteBoards]);
+    const summary = summarizeHubBoards(sortedAll);
+
+    const cleanQuery = String(query || "").trim();
+    const cleanTag = String(tag || "").trim();
+    const cleanState = String(state || "").trim();
+
+    let candidates = filterHubBoards(sortedAll, { query: "", tag: cleanTag, state: cleanState });
+    let filtered;
+    if (cleanQuery) {
+      const hydrated = await mapLimit(candidates, BOARD_IO_CONCURRENCY, async (board) => {
+        if (board.source) return board;
+        const session = sessionByKey.get(board.key);
+        if (!session) return board;
+        const head = await readBoardHead(session.file, { includeSearchText: true });
+        return buildLocalBoard(session, {
+          fileExists: head.exists,
+          title: head.title,
+          searchText: head.searchText,
+          includeSearchText: true,
+        });
+      });
+      filtered = sortHubBoards(filterHubBoards(hydrated, { query: cleanQuery, tag: cleanTag, state: cleanState }));
+    } else {
+      filtered = candidates;
+    }
+
+    if (peersOnly) {
+      let peerSlice = filtered.slice(0, PEER_MAX_BOARDS);
+      if (!cleanQuery && peerSlice.length > 0) {
+        peerSlice = await mapLimit(peerSlice, BOARD_IO_CONCURRENCY, async (board) => {
+          if (board.source) return board;
+          const session = sessionByKey.get(board.key);
+          if (!session) return board;
+          const head = await readBoardHead(session.file, { includeSearchText: true });
+          return buildLocalBoard(session, {
+            fileExists: head.exists,
+            title: head.title,
+            searchText: head.searchText,
+            includeSearchText: true,
+          });
+        });
+      }
+      if (peerSlice.length > 0) {
         const perBoardMax = Math.min(
           64 * 1024,
-          Math.max(4 * 1024, Math.floor(PEER_TOTAL_SEARCH_TEXT_BUDGET / filtered.length)),
+          Math.max(4 * 1024, Math.floor(PEER_TOTAL_SEARCH_TEXT_BUDGET / peerSlice.length)),
         );
         if (perBoardMax < 64 * 1024) {
-          filtered = filtered.map((board) =>
+          peerSlice = peerSlice.map((board) =>
             typeof board.search_text === "string" && board.search_text.length > perBoardMax
               ? { ...board, search_text: board.search_text.slice(0, perBoardMax) }
               : board,
           );
         }
       }
+      return {
+        boards: peerSlice,
+        peers: [],
+        ...summary,
+        total: filtered.length,
+        limit: PEER_MAX_BOARDS,
+        offset: 0,
+        has_more: filtered.length > peerSlice.length,
+      };
+    }
+
+    const total = filtered.length;
+    let pageSlice = filtered.slice(offset, offset + limit);
+    if (!cleanQuery && pageSlice.length > 0) {
+      pageSlice = await mapLimit(pageSlice, BOARD_IO_CONCURRENCY, async (board) => {
+        if (board.source) return board;
+        const session = sessionByKey.get(board.key);
+        if (!session) return board;
+        const head = await readBoardHead(session.file, { includeSearchText: false });
+        return buildLocalBoard(session, { fileExists: head.exists, title: head.title });
+      });
+    }
+    const publicBoards = pageSlice.map(stripBoardSearchText);
+    return {
+      boards: publicBoards,
+      peers: remote ? remote.peers : [],
+      ...summary,
+      total,
+      limit,
+      offset,
+      has_more: offset + publicBoards.length < total,
+      notify_settings: notifySettingsStore.getSync(),
+    };
+  }
+
+  app.get("/", async (_req, res, next) => {
+    try {
+      res.setHeader("x-frame-options", "DENY");
+      res.setHeader("content-security-policy", "frame-ancestors 'none'");
+      const view = await queryHub({ includePeers: true, state: "open", limit: DEFAULT_HUB_LIMIT, offset: 0 });
+      res.type("html").send(
+        createHubHtml({
+          boards: view.boards,
+          peers: view.peers,
+          counts: view.counts,
+          openSummary: view.open_summary,
+          tags: view.tags,
+          total: view.total,
+          limit: view.limit,
+          offset: view.offset,
+          hasMore: view.has_more,
+          notifySettings: notifySettingsStore.getSync(),
+          hostname: osHostname(),
+          theme,
+        }),
+      );
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/hub/notifications", async (_req, res, next) => {
+    try {
+      res.json({ notify_settings: await notifySettingsStore.get() });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/hub/notifications", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin notification settings write rejected" });
+        return;
+      }
+      const rawSettings =
+        req.body &&
+        typeof req.body === "object" &&
+        !Array.isArray(req.body) &&
+        Object.hasOwn(req.body, "notify_settings")
+          ? req.body.notify_settings
+          : req.body;
+      const saved = await notifySettingsStore.save(rawSettings);
+      notifyHubViewers();
+      res.json({ notify_settings: saved });
+    } catch (error) {
+      if (error instanceof NotifySettingsError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      next(error);
+    }
+  });
+
+  app.get("/api/hub", async (req, res, next) => {
+    try {
+      // `?peers=0` is what a peer hub asks for: this server's own boards only, so hubs that list
+      // each other never loop, and bounded to PEER_MAX_BOARDS so a large peer never overflows PEER_MAX_BYTES.
+      const peersOnly = req.query.peers === "0";
+      const view = await queryHub({
+        includePeers: !peersOnly,
+        peersOnly,
+        query: String(req.query.q || ""),
+        tag: String(req.query.tag || ""),
+        state: String(req.query.state || ""),
+        limit: parseHubLimit(req.query.limit),
+        offset: parseHubOffset(req.query.offset),
+      });
       res.json({
         ...view,
-        boards: filtered,
         action_label: resolvedActionLabel,
         version,
         generated_at: new Date().toISOString(),
@@ -2911,6 +3164,7 @@ export async function serve({
           attachmentMaxBytes: attachmentConfig.maxBytes,
           attachmentMaxCount: attachmentConfig.maxPerPrompt,
           actionLabel: resolvedActionLabel,
+          notifyPeople: Object.keys(notifySettingsStore.getSync()),
           initialViewerName: viewerName,
           requiresApprovalToken: resolvedApprovalTokens.length > 0,
           theme,
@@ -3738,6 +3992,7 @@ export async function serve({
     writeLog(`[lavish] WARNING: ${describeBindFailure(listenHost, error)}`);
   }
   serverReady = true;
+  await notifySettingsStore.init();
   if (parsedPeers.peers.length > 0) await loadPeerCursors();
   startPeerEventSubscribers();
   scheduleBindRecovery();
@@ -4581,6 +4836,7 @@ export function createChromeHtml(
     attachmentMaxCount = 0,
     attachmentAcceptedMime = ACCEPTED_IMAGE_MIME,
     actionLabel = "Send",
+    notifyPeople = [],
     initialViewerName = "",
     requiresApprovalToken = false,
     theme = "",
@@ -4645,7 +4901,7 @@ ${themed.style}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><span class="presence-pill" id="presencePill" role="status" aria-live="polite" data-tone="off"><span class="presence-dot" aria-hidden="true"></span><span class="presence-text" id="presencePillText">Connecting…</span></span><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="panel" aria-expanded="true" aria-label="Hide conversation" title="Hide conversation">${chromeIcons.sidebar}<span class="sidebar-toggle-count" id="sidebarToggleCount" aria-hidden="true" hidden></span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="layoutToggle" type="button" title="Switch between the phone and desktop layouts. Remembered on this device.">${chromeIcons.phone}<span id="layoutToggleText">Layout: Auto</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><label class="approval-author-wrap" id="approvalTokenWrap" for="approvalTokenInput" hidden><span>Token</span><input id="approvalTokenInput" type="password" maxlength="200" placeholder="Approval token"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}"${Array.isArray(notifyPeople) && notifyPeople.length ? ` data-people="${escapeHtml(JSON.stringify(notifyPeople))}"` : ""} data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><label class="approval-author-wrap" id="approvalTokenWrap" for="approvalTokenInput" hidden><span>Token</span><input id="approvalTokenInput" type="password" maxlength="200" placeholder="Approval token"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p><button type="button" class="button ended-action" data-reactivate data-key="${session.key}" data-file="${escapeHtml(session.file)}">Reactivate board</button><p><a href="/">Fusion Hub</a></p></div></div>

@@ -70,11 +70,14 @@ export function boardVersionBehind(board, currentVersion) {
   return false;
 }
 
+const LARGE_BASE64_DATA_URI = /data:[A-Za-z0-9.+/-]+;base64,[A-Za-z0-9+/=\s]{256,}/g;
+
 // Search only text, excluding executable/style/template content. Reads are bounded by the caller.
 export function boardSearchText(html) {
   const parts = [];
+  const compactHtml = String(html || "").replace(LARGE_BASE64_DATA_URI, "data:omitted");
   /** @type {import("parse5").DefaultTreeAdapterMap["node"][]} */
-  const pending = [parse(html)];
+  const pending = [parse(compactHtml)];
   while (pending.length) {
     const node = pending.pop();
     if ("tagName" in node && ["script", "style", "template", "noscript"].includes(node.tagName)) continue;
