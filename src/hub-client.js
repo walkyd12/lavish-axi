@@ -711,7 +711,11 @@ async function closeBoard(board) {
   busy.add(board.key);
   render();
   try {
-    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/close", { method: "POST" });
+    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/close", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ peer_origin: board.peer_origin }),
+    });
     if (!response.ok) throw new Error(String(response.status));
     showNote(`Closed "${board.title}".`, "done");
   } catch {
@@ -726,7 +730,11 @@ async function cancelBoard(board) {
   busy.add(board.key);
   render();
   try {
-    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/cancel", { method: "POST" });
+    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ peer_origin: board.peer_origin }),
+    });
     if (!response.ok) throw new Error(String(response.status));
     showNote(`Cancelled "${board.title}".`, "done");
   } catch {
@@ -744,7 +752,7 @@ async function reopenBoard(board) {
     const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/reopen", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: "{}",
+      body: JSON.stringify({ peer_origin: board.peer_origin }),
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || result.status !== "opened") throw new Error(result.error || String(response.status));

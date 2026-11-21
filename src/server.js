@@ -1922,6 +1922,10 @@ export async function serve({
           res.status(404).json({ error: "peer board not found" });
           return;
         }
+        if (req.body?.peer_origin !== target.peer.origin) {
+          res.status(409).json({ error: "peer hub changed; refresh before trying again" });
+          return;
+        }
         const relayed = await relayPeerHubAction(target.peer, target.peerKey, "close", hubPeerOptions);
         if (relayed.ok) collectPeerBoards?.invalidate(target.peer.name);
         res.status(relayed.status).json(relayed.payload);
@@ -1956,6 +1960,10 @@ export async function serve({
           res.status(404).json({ error: "peer board not found" });
           return;
         }
+        if (req.body?.peer_origin !== target.peer.origin) {
+          res.status(409).json({ error: "peer hub changed; refresh before trying again" });
+          return;
+        }
         const relayed = await relayPeerHubAction(target.peer, target.peerKey, "cancel", hubPeerOptions);
         if (relayed.ok) collectPeerBoards?.invalidate(target.peer.name);
         res.status(relayed.status).json(relayed.payload);
@@ -1987,6 +1995,10 @@ export async function serve({
         const target = resolvePeerBoardTarget(req.params.key, configuredPeers);
         if (!target) {
           res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        if (req.body?.peer_origin !== target.peer.origin) {
+          res.status(409).json({ error: "peer hub changed; refresh before trying again" });
           return;
         }
         const relayed = await relayPeerHubAction(target.peer, target.peerKey, "reopen", hubPeerOptions);

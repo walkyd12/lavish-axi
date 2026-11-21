@@ -302,14 +302,16 @@ test("LAVISH_AXI_ON_EVENT emits board lifecycle, message attribution, tag diffs 
     );
     const reopenedPeerRes = await fetch(`${base}/api/hub/${encodeURIComponent(namespacedPeerKey)}/reopen`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBase }),
     });
     assert.equal(reopenedPeerRes.status, 200);
     assert.equal((await reopenedPeerRes.json()).closed, false);
 
     const cancelledPeerRes = await fetch(`${base}/api/hub/${encodeURIComponent(namespacedPeerKey)}/cancel`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBase }),
     });
     assert.equal(cancelledPeerRes.status, 200);
     assert.equal((await cancelledPeerRes.json()).cancelled, true);
@@ -471,7 +473,8 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
       `${base}/api/hub/${encodeURIComponent(`peer:walker:${peerKeys[0]}`)}/close`,
       {
         method: "POST",
-        headers: { origin: base },
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({ peer_origin: peerBase }),
       },
     );
     assert.equal(relayCloseAfterRestart.status, 200);
@@ -493,11 +496,13 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
     // and replays ZERO already-processed peer close events, while delivering a fresh post-restart close!
     await fetch(`${base}/api/hub/${encodeURIComponent(`peer:walker:${peerKeys[0]}`)}/reopen`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBase }),
     });
     await fetch(`${base}/api/hub/${encodeURIComponent(`peer:walker:${peerKeys[0]}`)}/close`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBase }),
     });
     const secondCloseDeadline = Date.now() + 4_000;
     while (

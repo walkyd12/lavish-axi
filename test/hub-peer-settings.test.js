@@ -89,7 +89,8 @@ test("connected hubs seed once, validate same-origin writes, apply live and pers
         (
           await fetch(`${base}/api/hub/${encodeURIComponent(`peer:remote:${reg.key}`)}/${action}`, {
             method: "POST",
-            headers: { origin: base },
+            headers: { "content-type": "application/json", origin: base },
+            body: JSON.stringify({ peer_origin: peerBase }),
           })
         ).status,
         200,
@@ -143,6 +144,69 @@ test("changing peers aborts removed scrapes and never adopts their late results"
   assert.equal(aborted, true);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(await source(), { peers: [], boards: [] });
+});
+
+test("peer lifecycle actions reject a stale origin after a peer name is reused", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "hub-peer-action-origin-"));
+  process.env.LAVISH_AXI_STATE_DIR = dir;
+  const servers = [];
+  const request = (base, route, body) =>
+    fetch(base + route, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify(body),
+    });
+  try {
+    for (const name of ["hub", "original", "replacement"]) {
+      servers.push(
+        await serve({ port: 0, hosts: ["127.0.0.1"], stateFile: path.join(dir, name, "state.json"), hubPeers: "" }),
+      );
+    }
+    const [base, original, replacement] = servers.map((server) => `http://127.0.0.1:${server.port}`);
+    const file = path.join(dir, "shared.html");
+    await writeFile(file, "<title>Same canonical artifact on two hubs</title>");
+    const oldBoard = await request(original, "/api/sessions", { file }).then((r) => r.json());
+    const newBoard = await request(replacement, "/api/sessions", { file }).then((r) => r.json());
+    assert.equal(oldBoard.key, newBoard.key, "the two hubs serve the same canonical path");
+    const route = `/api/hub/${encodeURIComponent(`peer:remote:${oldBoard.key}`)}`;
+    const localRoute = `/api/hub/${oldBoard.key}`;
+    for (const action of ["close", "cancel", "reopen"]) {
+      if (action === "reopen") {
+        assert.equal((await request(original, `${localRoute}/close`, {})).status, 200);
+        assert.equal((await request(replacement, `${localRoute}/close`, {})).status, 200);
+      }
+      assert.equal((await post(base, { add: { name: "remote", origin: original } })).status, 200);
+      /** @type {{ peer_origin: string } | undefined} */
+      let displayed;
+      await until(async () => {
+        displayed = (await fetch(`${base}/api/hub`).then((r) => r.json())).boards.find((b) => b.source === "remote");
+        return displayed?.peer_origin === original;
+      });
+      assert.ok(displayed);
+      assert.equal((await post(base, { remove: "remote" })).status, 200);
+      assert.equal((await post(base, { add: { name: "remote", origin: replacement } })).status, 200);
+      const before = await readFile(path.join(dir, "replacement", "state.json"), "utf8");
+      const originalBefore = await readFile(path.join(dir, "original", "state.json"), "utf8");
+      for (const body of [{ peer_origin: displayed.peer_origin }, {}, { peer_origin: null }, { peer_origin: {} }]) {
+        assert.equal(
+          (await request(base, `${route}/${action}`, body)).status,
+          409,
+          `${action} must reject ${JSON.stringify(body)}`,
+        );
+      }
+      assert.equal(await readFile(path.join(dir, "replacement", "state.json"), "utf8"), before);
+      assert.equal(await readFile(path.join(dir, "original", "state.json"), "utf8"), originalBefore);
+      assert.equal((await request(base, `${route}/${action}`, { peer_origin: replacement })).status, 200);
+      const fresh = (await fetch(`${replacement}/api/hub?peers=0`).then((r) => r.json())).boards[0];
+      assert.equal(fresh.closed, action !== "reopen");
+      assert.equal(fresh.cancelled, action === "cancel");
+      assert.equal((await post(base, { remove: "remote" })).status, 200);
+      assert.equal((await request(replacement, `${localRoute}/reopen`, {})).status, 200);
+    }
+  } finally {
+    for (const server of servers.reverse()) await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("hub peers seed env only when their file is absent", async () => {
