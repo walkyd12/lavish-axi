@@ -175,6 +175,7 @@ const outdatedReloadButton = /** @type {HTMLButtonElement} */ (document.getEleme
 const outdatedDismissButton = /** @type {HTMLButtonElement} */ (document.getElementById("outdatedDismiss"));
 const approvalBanner = /** @type {HTMLDivElement | null} */ (document.getElementById("approvalBanner"));
 const approvalBannerText = /** @type {HTMLSpanElement | null} */ (document.getElementById("approvalBannerText"));
+const approvalPreview = /** @type {HTMLPreElement | null} */ (document.getElementById("approvalPreview"));
 const approvalAuthorInput = /** @type {HTMLInputElement | null} */ (document.getElementById("approvalAuthorInput"));
 const approvalTokenWrap = /** @type {HTMLLabelElement | null} */ (document.getElementById("approvalTokenWrap"));
 const approvalTokenInput = /** @type {HTMLInputElement | null} */ (document.getElementById("approvalTokenInput"));
@@ -5207,7 +5208,7 @@ endButton.onclick = () => {
   closeMenus();
   endSession();
 };
-/** @type {{ prompt: string, label: string, selector: string, text: string, initialAuthor: string } | null} */
+/** @type {{ prompt: string, label: string, selector: string, text: string, initialAuthor: string, previewReady: boolean } | null} */
 let pendingChromeApproval = null;
 let approvalConfirmInFlight = false;
 
@@ -5226,6 +5227,7 @@ function openApprovalConfirmation(msg) {
     selector: String(msg?.selector || "").slice(0, 512),
     text: String(msg?.text || label).slice(0, 240),
     initialAuthor: author,
+    previewReady: false,
   };
   let savedAuthor = "";
   let savedToken = "";
@@ -5243,8 +5245,31 @@ function openApprovalConfirmation(msg) {
   }
   syncApprovalConfirmationText();
   approvalBanner.hidden = false;
+  void loadApprovalPreview(pendingChromeApproval);
   if (isMobileSheet() && !sheetOpen) setSheetOpen(true);
   else pulseSheetDock();
+}
+
+async function loadApprovalPreview(pending) {
+  if (approvalPreview) approvalPreview.textContent = "Loading preview…";
+  if (approvalConfirmButton) approvalConfirmButton.disabled = true;
+  let preview = "Preview unavailable";
+  try {
+    const response = await fetch("/api/" + encodeURIComponent(key) + "/approval-preview", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chrome_load_token: chromeLoadToken }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const data = await response.json();
+    if (response.ok && typeof data.preview === "string" && data.preview.trim()) preview = data.preview;
+  } catch {
+    // A failed/unconfigured preview never supplies artifact text as a fallback.
+  }
+  if (pendingChromeApproval !== pending) return;
+  if (approvalPreview) approvalPreview.textContent = preview;
+  pending.previewReady = true;
+  if (approvalConfirmButton) approvalConfirmButton.disabled = approvalConfirmInFlight;
 }
 
 function syncApprovalConfirmationText() {
@@ -5268,7 +5293,15 @@ function closeApprovalConfirmation() {
 
 async function submitApprovalConfirmation(event) {
   // Only a real user-agent gesture in the top-level chrome may submit `/api/:key/approval`.
-  if (!event || event.isTrusted !== true || approvalConfirmInFlight || !pendingChromeApproval || ended) return;
+  if (
+    !event ||
+    event.isTrusted !== true ||
+    approvalConfirmInFlight ||
+    !pendingChromeApproval ||
+    !pendingChromeApproval.previewReady ||
+    ended
+  )
+    return;
   const author = String(approvalAuthorInput?.value || "").trim();
   if (!author) {
     if (approvalBannerText && pendingChromeApproval) {
