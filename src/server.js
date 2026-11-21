@@ -1735,7 +1735,15 @@ export async function serve({
     const sortedAll = sortHubBoards([...localSkeletons, ...remoteBoards]);
     const summary = {
       ...summarizeHubBoards(sortedAll),
-      people: [...new Set([...Object.keys(notifySettingsStore.getSync()), ...resolvedApprovalUsers.keys()])],
+      // One chip per person regardless of case ("Zach" from notifications wins over "zach" from approvals).
+      people: (() => {
+        const seen = new Map();
+        for (const name of [...Object.keys(notifySettingsStore.getSync()), ...resolvedApprovalUsers.keys()]) {
+          const k = String(name).toLowerCase();
+          if (!seen.has(k)) seen.set(k, name);
+        }
+        return [...seen.values()];
+      })(),
     };
     const needsYou = sortedAll.filter((board) => boardNeedsYou(board, viewer));
     const extraFilters = { client, person, needsInput, recent, now };

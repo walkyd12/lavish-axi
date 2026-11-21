@@ -377,11 +377,18 @@ function renderFilters() {
   const chip = (label, kind, value, active) =>
     `<button type="button" class="filter-chip" data-filter="${kind}" data-value="${escapeHtml(value)}" aria-pressed="${active}">${escapeHtml(label)}</button>`;
   const clients = [...new Set([...serverClients, ...(selectedClient ? [selectedClient] : [])])];
-  const people = [
-    ...new Set([...serverPeople, ...Object.keys(notifySettings), ...(selectedPerson ? [selectedPerson] : [])]),
-  ];
+  const peopleSeen = new Map();
+  for (const name of [...serverPeople, ...Object.keys(notifySettings), ...(selectedPerson ? [selectedPerson] : [])]) {
+    const k = String(name).toLowerCase();
+    if (!peopleSeen.has(k)) peopleSeen.set(k, name);
+  }
+  const people = [...peopleSeen.values()];
   filters.innerHTML =
-    `<div class="filter-group" role="group" aria-label="Status">${chip("Needs input", "needs", "", needsInputOnly)}</div>` +
+    `<div class="filter-group" role="group" aria-label="Status">${chip("Needs input", "needs", "", needsInputOnly)}` +
+    (selectedClient || selectedPerson || needsInputOnly
+      ? `<button type="button" class="filter-chip filter-clear" data-filter="clear" data-value="">✕ Clear filters</button>`
+      : "") +
+    `</div>` +
     (clients.length
       ? `<div class="filter-group" role="group" aria-label="Clients"><span class="filter-label">Client</span>` +
         `<select class="filter-select" data-filter-select="client" aria-label="Filter by client"><option value="">All clients</option>${clients
@@ -1267,7 +1274,11 @@ filters?.addEventListener("click", (event) => {
   );
   if (!button) return;
   const value = button.dataset.value || "";
-  if (button.dataset.filter === "client") selectedClient = selectedClient === value ? "" : value;
+  if (button.dataset.filter === "clear") {
+    selectedClient = "";
+    selectedPerson = "";
+    needsInputOnly = false;
+  } else if (button.dataset.filter === "client") selectedClient = selectedClient === value ? "" : value;
   else if (button.dataset.filter === "person") selectedPerson = selectedPerson === value ? "" : value;
   else needsInputOnly = !needsInputOnly;
   beginFilterTransition();
