@@ -409,7 +409,8 @@ test("scoped notification patches preserve concurrent opt-outs, survive 'notify_
       headers: { "content-type": "application/json", origin: base },
       body: JSON.stringify({ action: "send" }),
     });
-    assert.equal(brokenAction.status, 502);
+    // Send is fire-and-forget: a hook that fails to launch is logged, never blocks or errors the action.
+    assert.equal(brokenAction.status, 200);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });

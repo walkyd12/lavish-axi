@@ -2113,16 +2113,9 @@ export async function serve({
         prompts: acceptedPrompts.length ? acceptedPrompts : current.prompts || [],
         chat: current.chat || [],
       });
-      if (actionHook.configured) {
-        const launchOutcome = await actionHook.launched;
-        if (!launchOutcome.ok) {
-          res.status(502).json({
-            status: "error",
-            error: `Workflow hook failed to launch: ${launchOutcome.error || "spawn failed"}`,
-          });
-          return;
-        }
-      }
+      // Send stays fire-and-forget (as before 11/21): waiting on the ordered hook queue could outlast a
+      // caller's timeout and invite a retry that dispatches the same work twice. Launch failures are logged.
+      void actionHook;
       res.json({
         status: "sent",
         action: actionName,
