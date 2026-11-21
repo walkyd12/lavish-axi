@@ -21,6 +21,15 @@ export function normalizeTags(value) {
   return tags;
 }
 
+export function normalizeClient(value) {
+  // An empty value clears the client without affecting tags or attribution.
+  // eslint-disable-next-line no-control-regex
+  if (typeof value !== "string" || value.length > 64 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new BoardMetadataError("Client needs at most 64 printable characters");
+  }
+  return value.trim();
+}
+
 export function normalizeCreator(value) {
   if (value === undefined) return "";
   // eslint-disable-next-line no-control-regex
@@ -47,6 +56,7 @@ export function serializeBoardMetadata(session) {
   return {
     tags: Array.isArray(session.tags) ? session.tags : [],
     creator: session.creator || "",
+    client: session.client || "",
     created_version: session.created_version || "",
     served_version: session.served_version || "",
     closed: session.status === "ended",
@@ -88,7 +98,19 @@ export function boardSearchText(html) {
   return parts.join(" ").replace(/\s+/g, " ").trim();
 }
 
-export function filterHubBoards(boards, { query = "", tag = "", state = "" } = {}) {
+export function filterHubBoards(
+  boards,
+  {
+    query = "",
+    tag = "",
+    state = "",
+    client = "",
+    person = "",
+    needsInput = false,
+    recent = false,
+    now = Date.now(),
+  } = {},
+) {
   const words = String(query).toLowerCase().trim().split(/\s+/).filter(Boolean);
   const selected = String(tag).toLowerCase().trim();
   const wantedState = String(state).toLowerCase().trim();
@@ -107,9 +129,13 @@ export function filterHubBoards(boards, { query = "", tag = "", state = "" } = {
         !closed &&
         (boardState === "needs-input" || tags.some((v) => v.toLowerCase() === "needs-input"))) ||
       (wantedState === "working" && !closed && boardState === "working");
-    const haystack = [board.title, board.search_text, ...tags].join(" ").toLowerCase();
+    const haystack = [board.title, board.client, board.search_text, ...tags].join(" ").toLowerCase();
     return (
       stateMatches &&
+      (!client || String(board.client || "").toLowerCase() === client.toLowerCase()) &&
+      (!person || tags.some((value) => value.toLowerCase() === person.toLowerCase())) &&
+      (!needsInput || (!closed && tags.some((value) => value.toLowerCase() === "needs-input"))) &&
+      (!recent || Date.parse(board.last_activity || "") >= now - 14 * 86400000) &&
       (!selected || tags.some((value) => value.toLowerCase() === selected)) &&
       words.every((word) => haystack.includes(word))
     );

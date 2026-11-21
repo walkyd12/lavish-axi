@@ -9,6 +9,7 @@ import { homedir, hostname as osHostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { hubArtifactSummary } from "./hub-summary.js";
 import { runApprovalPreview } from "./approval-preview.js";
 
 import chokidar from "chokidar";
@@ -20,6 +21,7 @@ import {
   boardVersionBehind,
   filterHubBoards,
   normalizeCreator,
+  normalizeClient,
   serializeBoardMetadata,
 } from "./board-metadata.js";
 import {
@@ -70,19 +72,29 @@ import { normalizePromptAuthor, serializeChat, serializeChatAckIds, serializeCha
 import { OwnerStatusError, serializeOwnerStatus } from "./owner-status.js";
 import {
   boardTitle,
+  boardNeedsYou,
+  hubViewerNames,
   conversationMarkdown,
   createHubHtml,
   serializeHubBoard,
   sortHubBoards,
   summarizeHubBoards,
 } from "./hub.js";
-import { createNotifySettingsStore, NOTIFY_PEOPLE_ENV, NotifySettingsError } from "./notify-settings.js";
+import {
+  createNotifySettingsStore,
+  NOTIFY_PEOPLE_ENV,
+  NotifySettingsError,
+  normalizeNotifyPersonName,
+  normalizeNotifySendTo,
+} from "./notify-settings.js";
+import { createNotifyDestinations } from "./notify-destinations.js";
 import {
   createPeerBoardSource,
   HUB_PEERS_ENV,
   isPeerKey,
   PEER_MAX_BOARDS,
   relayPeerHubAction,
+  relayPeerBoardClient,
   resolvePeerBoardTarget,
   sanitizePeerHubEvent,
 } from "./hub-peers.js";
@@ -847,10 +859,10 @@ export async function serve({
   // (no shell, detached, fire-and-forget) whenever a hub/board event occurs (board_created,
   // board_reopened, message, board_action, tag_change, board_closed, board_cancelled), receiving one
   // compact JSON payload argument so external workflows stay event-driven without polling.
-  function emitHubEvent(payload) {
+  function emitHubEvent(payload, { broadcast = true, notifySnapshot = notifySettingsStore.getSync() } = {}) {
     const base = `http://${hostForUrl(LOOPBACK_HOST)}:${publicPort}`;
     const isLocal = !payload.source;
-    const seq = isLocal ? (hubEventSeq += 1) : undefined;
+    const seq = isLocal && broadcast ? (hubEventSeq += 1) : undefined;
     const eventPayload = compactEventPayload({
       ...payload,
       ...(isLocal ? { instance_id: hubInstanceId } : {}),
@@ -866,10 +878,9 @@ export async function serve({
       const wire = JSON.stringify({ type: "hub-event", instance_id: hubInstanceId, seq, event: eventPayload });
       sendToSocketSet(hubPeerStreamClients, wire);
       sendToSocketSet(hubViewStreamClients, wire);
-    } else {
+    } else if (broadcast) {
       notifyHubViewers();
     }
-    const notifySnapshot = notifySettingsStore.getSync();
     const hookPayload = { ...eventPayload, notify_settings: notifySnapshot };
     if (typeof onEvent === "function") {
       Promise.resolve()
@@ -1312,7 +1323,7 @@ export async function serve({
   const MAX_HUB_LIMIT = 200;
   const BOARD_IO_CONCURRENCY = 32;
   const MAX_BOARD_HEAD_CACHE = 2048;
-  /** @type {Map<string, { stamp: string, title: string, searchText: string | null }>} */
+  /** @type {Map<string, { stamp: string, title: string, nextStep?: string, searchText: string | null }>} */
   const boardHeadCache = new Map();
 
   /**
@@ -1376,7 +1387,7 @@ export async function serve({
       const buffer = Buffer.allocUnsafe(toRead);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
       const html = buffer.subarray(0, bytesRead).toString("utf8");
-      const title = extractArtifactHead(html.slice(0, 64 * 1024)).title;
+      const { title, nextStep } = hubArtifactSummary(html);
       const searchText = includeSearchText
         ? boardSearchText(html).slice(0, 64 * 1024)
         : cached && cached.stamp === stamp
@@ -1386,7 +1397,7 @@ export async function serve({
         const oldestKey = boardHeadCache.keys().next().value;
         if (oldestKey !== undefined) boardHeadCache.delete(oldestKey);
       }
-      boardHeadCache.set(file, { stamp, title, searchText });
+      boardHeadCache.set(file, { stamp, title, nextStep, searchText });
       return { exists: true, title, searchText: searchText || "" };
     } catch (error) {
       return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "", searchText: "" };
@@ -1626,6 +1637,28 @@ export async function serve({
   }
 
   const HUB_INITIAL_PEER_WAIT_MS = 80;
+  // Whois runs after first paint. Never let a slow identity probe hold GET /.
+  const hubViewers = new Map();
+  function cachedHubViewer(req) {
+    return hubViewers.get(normalizeRemoteIp(req.socket?.remoteAddress)) || [];
+  }
+  app.get("/api/hub/viewer", async (req, res) => {
+    const ip = normalizeRemoteIp(req.socket?.remoteAddress);
+    let viewer = [];
+    if (ip && !isOwnServerIp(ip) && typeof whoisPeer === "function") {
+      try {
+        const identity = await whoisPeer(ip, req.socket?.remotePort);
+        viewer = hubViewerNames(identity, resolvedApprovalUsers);
+      } catch {
+        /* Unknown identity uses the needs-input fallback. */
+      }
+    }
+    // Bound the cache; identity remains a display preference, never authorization.
+    if (hubViewers.size >= 256) hubViewers.clear();
+    hubViewers.set(ip, viewer);
+    res.setHeader("cache-control", "no-store");
+    res.json({ viewer });
+  });
 
   /**
    * @param {{
@@ -1635,6 +1668,11 @@ export async function serve({
    *   query?: string,
    *   tag?: string,
    *   state?: string,
+   *   client?: string,
+   *   person?: string,
+   *   needsInput?: boolean,
+   *   recent?: boolean,
+   *   viewer?: string[],
    *   limit?: number,
    *   offset?: number,
    * }} [options]
@@ -1646,6 +1684,11 @@ export async function serve({
     query = "",
     tag = "",
     state = "",
+    client = "",
+    person = "",
+    needsInput = false,
+    recent = false,
+    viewer = [],
     limit = DEFAULT_HUB_LIMIT,
     offset = 0,
   } = {}) {
@@ -1678,6 +1721,7 @@ export async function serve({
         tabs: liveClientCount(session.key),
         fileExists: facts.fileExists !== undefined ? facts.fileExists : (existsByKey.get(String(session.key)) ?? true),
         title: facts.title !== undefined ? facts.title : cachedHead?.title || "",
+        nextStep: cachedHead?.nextStep || "",
         ...(facts.includeSearchText ? { searchText: facts.searchText || "", includeSearchText: true } : {}),
         version,
         now,
@@ -1689,13 +1733,19 @@ export async function serve({
       ? remote.boards.map((board) => ({ ...board, version_behind: boardVersionBehind(board, version) }))
       : [];
     const sortedAll = sortHubBoards([...localSkeletons, ...remoteBoards]);
-    const summary = summarizeHubBoards(sortedAll);
+    const summary = {
+      ...summarizeHubBoards(sortedAll),
+      people: [...new Set([...Object.keys(notifySettingsStore.getSync()), ...resolvedApprovalUsers.keys()])],
+    };
+    const needsYou = sortedAll.filter((board) => boardNeedsYou(board, viewer));
+    const extraFilters = { client, person, needsInput, recent, now };
+    const sourceBoards = state === "needs-you" ? needsYou : sortedAll;
 
     const cleanQuery = String(query || "").trim();
     const cleanTag = String(tag || "").trim();
-    const cleanState = String(state || "").trim();
+    const cleanState = state === "needs-you" ? "open" : String(state || "").trim();
 
-    let candidates = filterHubBoards(sortedAll, { query: "", tag: cleanTag, state: cleanState });
+    let candidates = filterHubBoards(sourceBoards, { query: "", tag: cleanTag, state: cleanState, ...extraFilters });
     let filtered;
     if (cleanQuery) {
       const hydrated = await mapLimit(candidates, BOARD_IO_CONCURRENCY, async (board) => {
@@ -1710,7 +1760,9 @@ export async function serve({
           includeSearchText: true,
         });
       });
-      filtered = sortHubBoards(filterHubBoards(hydrated, { query: cleanQuery, tag: cleanTag, state: cleanState }));
+      filtered = sortHubBoards(
+        filterHubBoards(hydrated, { query: cleanQuery, tag: cleanTag, state: cleanState, ...extraFilters }),
+      );
     } else {
       filtered = candidates;
     }
@@ -1746,6 +1798,10 @@ export async function serve({
       }
       return {
         boards: peerSlice,
+        needs_you: [],
+        needs_you_total: 0,
+        needs_you_count: 0,
+        viewer: [],
         peers: [],
         ...summary,
         total: filtered.length,
@@ -1767,8 +1823,21 @@ export async function serve({
       });
     }
     const publicBoards = pageSlice.map(stripBoardSearchText);
+    const attention = filtered.filter((board) => boardNeedsYou(board, viewer));
+    const pageByKey = new Map(publicBoards.map((board) => [board.key, board]));
+    const pinned = await mapLimit(attention.slice(0, DEFAULT_HUB_LIMIT), BOARD_IO_CONCURRENCY, async (board) => {
+      if (pageByKey.has(board.key)) return pageByKey.get(board.key);
+      if (board.source || cleanQuery) return stripBoardSearchText(board);
+      const session = sessionByKey.get(board.key);
+      const head = await readBoardHead(session.file);
+      return buildLocalBoard(session, { fileExists: head.exists, title: head.title });
+    });
     return {
       boards: publicBoards,
+      needs_you: pinned,
+      needs_you_total: attention.length,
+      needs_you_count: needsYou.length,
+      viewer,
       peers: remote ? remote.peers : [],
       ...summary,
       total,
@@ -1779,7 +1848,7 @@ export async function serve({
     };
   }
 
-  app.get("/", async (_req, res, next) => {
+  app.get("/", async (req, res, next) => {
     try {
       res.setHeader("x-frame-options", "DENY");
       res.setHeader("content-security-policy", "frame-ancestors 'none'");
@@ -1787,6 +1856,7 @@ export async function serve({
         includePeers: true,
         maxPeerWaitMs: HUB_INITIAL_PEER_WAIT_MS,
         state: "open",
+        viewer: cachedHubViewer(req),
         limit: DEFAULT_HUB_LIMIT,
         offset: 0,
       });
@@ -1803,6 +1873,19 @@ export async function serve({
           hasMore: view.has_more,
           notifySettings: notifySettingsStore.getSync(),
           hostname: osHostname(),
+          title: String(env.LAVISH_AXI_HUB_TITLE || "")
+            .trim()
+            .slice(0, 120),
+          needsYou: view.needs_you,
+          needsYouTotal: view.needs_you_total,
+          needsYouCount: view.needs_you_count,
+          clients: view.clients,
+          people: view.people,
+          viewer: view.viewer,
+          identifyViewer: Boolean(
+            normalizeRemoteIp(req.socket?.remoteAddress) &&
+            !isOwnServerIp(normalizeRemoteIp(req.socket?.remoteAddress)),
+          ),
           theme,
         }),
       );
@@ -1835,6 +1918,49 @@ export async function serve({
         return;
       }
       next(error);
+    }
+  });
+
+  const getNotifyDestinations = createNotifyDestinations(String(env.LAVISH_AXI_NOTIFY_DESTINATIONS || "").trim(), env);
+  app.get("/api/hub/notification-destinations", async (_req, res) => {
+    res.set("Cache-Control", "no-store").json(await getNotifyDestinations());
+  });
+  app.post("/api/hub/notifications/test", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin notification test rejected" });
+        return;
+      }
+      const person = normalizeNotifyPersonName(req.body?.person);
+      const sendTo = normalizeNotifySendTo(req.body?.send_to);
+      const settings = notifySettingsStore.getSync();
+      if (!Object.hasOwn(settings, person) || !sendTo) {
+        throw new NotifySettingsError("Choose a person and a destination first");
+      }
+      if (!onEvent && !String(env.LAVISH_AXI_ON_EVENT || process.env.LAVISH_AXI_ON_EVENT || "").trim()) {
+        res.status(503).json({ error: "Notifications are not connected on this hub yet." });
+        return;
+      }
+      const delivery = emitHubEvent(
+        {
+          event: "notify_test",
+          person,
+          send_to: sendTo,
+          reason: "test",
+          title: "Test notification",
+          url: `http://${hostForUrl(LOOPBACK_HOST)}:${publicPort}/`,
+        },
+        { broadcast: false, notifySnapshot: { ...settings, [person]: { ...settings[person], send_to: sendTo } } },
+      );
+      const launched = await delivery.launched;
+      if (!launched.ok) {
+        res.status(503).json({ error: "Could not start the notification hook. Check the server log." });
+        return;
+      }
+      res.status(202).json({ message: "Test queued. Check your destination." });
+    } catch (error) {
+      if (error instanceof NotifySettingsError) res.status(error.statusCode).json({ error: error.message });
+      else next(error);
     }
   });
 
@@ -1895,6 +2021,11 @@ export async function serve({
         query: String(req.query.q || ""),
         tag: String(req.query.tag || ""),
         state: String(req.query.state || ""),
+        client: String(req.query.client || ""),
+        person: String(req.query.person || ""),
+        needsInput: req.query.needs_input === "1",
+        recent: req.query.recent === "1",
+        viewer: cachedHubViewer(req),
         limit: parseHubLimit(req.query.limit),
         offset: parseHubOffset(req.query.offset),
       });
@@ -2217,11 +2348,47 @@ export async function serve({
       res.status(403).json({ error: "cross-origin metadata write rejected" });
       return;
     }
-    if (isPeerKey(req.params.key)) {
-      res.status(400).json({ error: "edit a peer board on its own server" });
-      return;
-    }
     try {
+      if (Object.hasOwn(req.body || {}, "client")) {
+        const isPeer = isPeerKey(req.params.key);
+        if (Object.keys(req.body).some((field) => !["client", ...(isPeer ? ["peer_origin"] : [])].includes(field))) {
+          throw new BoardMetadataError("Use an exclusive client patch");
+        }
+        const client = normalizeClient(req.body.client);
+        if (isPeer) {
+          const target = resolvePeerBoardTarget(req.params.key, configuredPeers);
+          if (!target) return void res.status(404).json({ error: "peer board not found" });
+          if (req.body.peer_origin !== target.peer.origin)
+            return void res.status(409).json({ error: "peer hub changed; refresh before trying again" });
+          const relayed = await relayPeerBoardClient(target.peer, target.peerKey, client, hubPeerOptions);
+          if (relayed.ok) collectPeerBoards.invalidate(target.peer.name);
+          res.status(relayed.status).json(relayed.payload);
+          return;
+        }
+        const session = await store.updateBoardClient(req.params.key, client);
+        if (!session) return void res.status(404).json({ error: "session not found" });
+        const metadata = serializeBoardMetadata(session);
+        events.emit("board-metadata", req.params.key, metadata);
+        if (session.client_changed) {
+          const { title } = await readBoardHead(session.file);
+          emitHubEvent({
+            event: "tag_change",
+            key: req.params.key,
+            file: session.file,
+            url: session.url,
+            title: boardTitle(session, title),
+            creator: session.creator || "",
+            tags: metadata.tags,
+            client: metadata.client,
+            previous_client: session.previous_client,
+            added: [],
+            removed: [],
+          });
+        }
+        res.json(metadata);
+        return;
+      }
+      if (isPeerKey(req.params.key)) return void res.status(400).json({ error: "edit a peer board on its own server" });
       if (Object.hasOwn(req.body || {}, "creator") || Object.hasOwn(req.body || {}, "expected_file")) {
         const session = await store.fillEmptyCreator(req.params.key, req.body);
         if (!session) return void res.status(404).json({ error: "session not found" });

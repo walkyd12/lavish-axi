@@ -34,7 +34,7 @@
       metadata.board_state_label ||
       (metadata.cancelled ? "Cancelled" : metadata.closed ? "Done" : needsInput ? "Needs input" : "Working");
     root.innerHTML =
-      `<p class="board-provenance"><strong>${escape(stateLabel)}</strong> · Created by ${escape(metadata.creator || "Unknown")} · Created on ${escape(metadata.created_version || "unknown version")} · Last served on ${escape(metadata.served_version || "unknown version")}${metadata.version_behind ? " · <strong>Older Lavish version</strong>" : ""}</p>` +
+      `<p class="board-provenance"><strong>${escape(stateLabel)}</strong> · Created by ${escape(metadata.creator || "Unknown")} · ${metadata.created_version ? `Created on ${escape(metadata.created_version)}` : "Created before version tracking"} · ${metadata.served_version ? `Last served on ${escape(metadata.served_version)}` : "Last served before version tracking"}${metadata.version_behind ? " · <strong>Older Lavish version</strong>" : ""}</p>` +
       `<div class="board-tags">${tags.map((tag) => (readonly ? `<span class="board-tag">${escape(tag)}</span>` : `<span class="board-tag"><button type="button" data-edit="${escape(tag)}" title="Change tag ${escape(tag)}">${escape(tag)}</button><button type="button" data-remove="${escape(tag)}" aria-label="Remove ${escape(tag)}">×</button></span>`)).join("")}</div>` +
       (readonly
         ? ""

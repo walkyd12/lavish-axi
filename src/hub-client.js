@@ -21,6 +21,9 @@ let hasMore = Boolean(initial.has_more);
 let loadingMore = false;
 let filterEpoch = 0;
 let filterPending = false;
+let filterFailed = false;
+// Actions must use the board actually shown, even if an editor delays a live repaint.
+const renderedBoards = new Map();
 let pendingWsRefreshAfterLoadMore = false;
 /** @type {Record<string, { tagged: boolean, done: boolean, send_to: string }>} */
 let notifySettings =
@@ -29,6 +32,22 @@ let notifySettings =
     : {};
 let generatedAt = String(initial.generated_at || "");
 let showing = "open";
+let serverClients = Array.isArray(initial.clients) ? initial.clients : [];
+let serverPeople = Array.isArray(initial.people) ? initial.people : [];
+let viewer = Array.isArray(initial.viewer) ? initial.viewer : [];
+let needsYouBoards = Array.isArray(initial.needs_you) ? initial.needs_you : [];
+let needsYouTotal = Number(initial.needs_you_total) || 0;
+let needsYouCount = Number(initial.needs_you_count) || 0;
+let selectedClient = "";
+let selectedPerson = "";
+let needsInputOnly = false;
+let showOlderBoards = false;
+let editingClient = "";
+let clientDraft = "";
+let clientEditOrigin = "";
+let clientEditIsPeer = false;
+let savingClient = false;
+let pendingClientFocus = "";
 /** @type {Set<string>} */
 const busy = new Set();
 /** @type {ReturnType<typeof setTimeout> | undefined} */
@@ -46,11 +65,14 @@ let wsReconnectTimer;
 let wsReconnectAttempt = 0;
 let sawWsDisconnect = false;
 let notifySaveChain = Promise.resolve();
+let notifyDestinations = [];
 
 const list = /** @type {HTMLOListElement} */ (document.getElementById("boards"));
 const moreWrap = /** @type {HTMLDivElement | null} */ (document.getElementById("hubMoreWrap"));
 const moreBtn = /** @type {HTMLButtonElement | null} */ (document.getElementById("hubMore"));
 const empty = /** @type {HTMLParagraphElement} */ (document.getElementById("hubEmpty"));
+const loadError = document.getElementById("hubLoadError");
+const retry = document.getElementById("hubRetry");
 const note = /** @type {HTMLParagraphElement} */ (document.getElementById("hubNote"));
 const peerNote = /** @type {HTMLParagraphElement} */ (document.getElementById("peerNote"));
 const pill = /** @type {HTMLSpanElement} */ (document.getElementById("hubPill"));
@@ -64,24 +86,32 @@ const search = /** @type {HTMLInputElement} */ (document.getElementById("hubSear
 const tagFilter = /** @type {HTMLSelectElement} */ (document.getElementById("hubTag"));
 const countOpen = /** @type {HTMLSpanElement} */ (document.getElementById("countOpen"));
 const countNeedsInput = /** @type {HTMLSpanElement | null} */ (document.getElementById("countNeedsInput"));
-const countClosed = /** @type {HTMLSpanElement} */ (document.getElementById("countClosed"));
+const countClosed = /** @type {HTMLSpanElement | null} */ (document.getElementById("countClosed"));
 const countCancelled = /** @type {HTMLSpanElement | null} */ (document.getElementById("countCancelled"));
+const pinnedList = document.getElementById("needsYouBoards");
+const pinnedSection = document.getElementById("needsYouSection");
+const pinnedHint = document.getElementById("needsYouHint");
+const pinnedMore = document.getElementById("needsYouMore");
+const filters = document.getElementById("hubFilters");
+const suggestions = document.getElementById("clientSuggestions");
+const resultCount = document.getElementById("searchHint");
+const listHeading = document.getElementById("boardListHeading");
+const includeClosed = /** @type {HTMLInputElement | null} */ (document.getElementById("includeClosed"));
+const showOlder = document.getElementById("showOlder");
+const settings = /** @type {HTMLDialogElement | null} */ (document.getElementById("hubSettings"));
+const settingsToggle = document.getElementById("settingsToggle");
+const settingsClose = document.getElementById("settingsClose");
 const history = /** @type {HTMLDialogElement} */ (document.getElementById("history"));
 const historyTitle = /** @type {HTMLHeadingElement} */ (document.getElementById("historyTitle"));
 const historyBody = /** @type {HTMLDivElement} */ (document.getElementById("historyBody"));
 const historyClose = /** @type {HTMLButtonElement} */ (document.getElementById("historyClose"));
 
-const notifyToggle = /** @type {HTMLButtonElement | null} */ (document.getElementById("notifyToggle"));
-const notifyPanel = /** @type {HTMLElement | null} */ (document.getElementById("notifyPanel"));
-const notifyClose = /** @type {HTMLButtonElement | null} */ (document.getElementById("notifyClose"));
 const notifyRows = /** @type {HTMLDivElement | null} */ (document.getElementById("notifyRows"));
 const notifyEmpty = /** @type {HTMLParagraphElement | null} */ (document.getElementById("notifyEmpty"));
 const notifyAddForm = /** @type {HTMLFormElement | null} */ (document.getElementById("notifyAddForm"));
 const notifyAddInput = /** @type {HTMLInputElement | null} */ (document.getElementById("notifyAddInput"));
 const notifyStatus = /** @type {HTMLParagraphElement | null} */ (document.getElementById("notifyStatus"));
 
-const peerToggle = /** @type {HTMLButtonElement | null} */ (document.getElementById("peerToggle"));
-const peerPanel = /** @type {HTMLElement | null} */ (document.getElementById("peerPanel"));
 const peerRows = /** @type {HTMLDivElement | null} */ (document.getElementById("peerRows"));
 const peerAddForm = /** @type {HTMLFormElement | null} */ (document.getElementById("peerAddForm"));
 const peerName = /** @type {HTMLInputElement | null} */ (document.getElementById("peerName"));
@@ -141,11 +171,6 @@ async function savePeerMutation(body) {
   }
 }
 
-peerToggle?.addEventListener("click", () => {
-  if (!peerPanel) return;
-  peerPanel.hidden = !peerPanel.hidden;
-  peerToggle.setAttribute("aria-expanded", String(!peerPanel.hidden));
-});
 peerAddForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!peerName || !peerOrigin) return;
@@ -162,7 +187,7 @@ peerRows?.addEventListener("click", (event) => {
 });
 
 function syncGlobalNotifyPeople() {
-  window["lavishNotifyPeople"] = Object.keys(notifySettings);
+  window["lavishNotifyPeople"] = [...new Set([...Object.keys(notifySettings), ...serverPeople])];
   window.dispatchEvent(new CustomEvent("lavish:notify-people"));
 }
 
@@ -188,11 +213,14 @@ function isNeedsInput(board) {
 }
 
 function displayBadge(board) {
-  if (board.state === "file-gone") return { label: board.state_label || "File gone", tone: "bad" };
+  if (board.state === "file-gone") return { label: "File unavailable", tone: "bad" };
   if (isCancelled(board)) return { label: "Cancelled", tone: "muted" };
   if (board.status === "ended") return { label: "Done", tone: "muted" };
-  if (isNeedsInput(board)) return { label: "Needs input", tone: "warn" };
-  return { label: "Working", tone: board.tone === "warn" ? "warn" : "good" };
+  if (isNeedsInput(board)) return { label: "Needs you", tone: "warn" };
+  const waiting = waitingOn(board);
+  if (waiting) return { label: "Waiting on " + waiting, tone: "warn" };
+  if (board.state === "handed-off") return { label: "Ready for review", tone: "muted" };
+  return { label: "In progress", tone: "muted" };
 }
 
 function relativeTime(iso) {
@@ -242,13 +270,6 @@ function metaLine(board) {
   return parts.join(" · ");
 }
 
-function shortPath(file) {
-  const parts = String(file || "")
-    .split("/")
-    .filter(Boolean);
-  return parts.length > 3 ? "…/" + parts.slice(-3).join("/") : String(file || "");
-}
-
 function safeHref(url) {
   try {
     const parsed = new URL(String(url || ""), location.href);
@@ -291,7 +312,6 @@ function actionsHtml(board) {
   const disabled = busy.has(board.key) ? " disabled" : "";
   const actions = [];
   if (board.state === "file-gone") {
-    actions.push(`<button type="button" class="act" data-act="history" data-key="${key}">History</button>`);
     if (board.status !== "ended") {
       actions.push(`<button type="button" class="act" data-act="close" data-key="${key}"${disabled}>Close</button>`);
       actions.push(`<button type="button" class="act" data-act="cancel" data-key="${key}"${disabled}>Cancel</button>`);
@@ -300,33 +320,124 @@ function actionsHtml(board) {
   }
   if (board.status === "ended") {
     actions.push(`<button type="button" class="act" data-act="reopen" data-key="${key}"${disabled}>Reopen</button>`);
-    actions.push(`<button type="button" class="act" data-act="history" data-key="${key}">History</button>`);
     return actions.join("");
   }
   actions.push(`<a class="act primary" href="${escapeHtml(board.url)}">Open →</a>`);
-  actions.push(`<button type="button" class="act" data-act="history" data-key="${key}">History</button>`);
   actions.push(`<button type="button" class="act" data-act="close" data-key="${key}"${disabled}>Close</button>`);
   actions.push(`<button type="button" class="act" data-act="cancel" data-key="${key}"${disabled}>Cancel</button>`);
   return actions.join("");
 }
 
+function clientHtml(board) {
+  const key = escapeHtml(board.key);
+  if (editingClient === board.key) {
+    return `<form class="client-edit" data-client-key="${key}"><label>Client<input name="client" aria-label="Client for ${escapeHtml(board.title)}" value="${escapeHtml(clientDraft)}" maxlength="64" list="clientSuggestions" autocomplete="off"${savingClient ? " disabled" : ""}></label><button type="submit"${savingClient ? " disabled" : ""}>${savingClient ? "Saving…" : "Save"}</button><button type="button" data-client-cancel${savingClient ? " disabled" : ""}>Cancel</button></form>`;
+  }
+  return `<button type="button" class="client-chip" data-client-edit="${key}" aria-label="Edit client for ${escapeHtml(board.title)}">${escapeHtml(board.client || "+ Client")}</button>`;
+}
+
+function waitingOn(board) {
+  const people = new Set(
+    [...serverPeople, ...Object.keys(notifySettings), ...viewer].map((name) => name.toLowerCase()),
+  );
+  return (board.tags || []).filter((tag) => people.has(tag.toLowerCase())).join(", ");
+}
+
 function boardHtml(board) {
   const badge = displayBadge(board);
+  const href = safeHref(board.url);
+  const waiting = isNeedsInput(board) ? waitingOn(board) : "";
   return (
     `<li class="board" data-key="${escapeHtml(board.key)}">` +
-    `<div class="board-head"><h2 class="board-title">${escapeHtml(board.title)}</h2>` +
-    `<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span></div>` +
-    (board.source ? `<p class="peer-badge">On ${escapeHtml(board.source)}</p>` : "") +
-    `<p class="meta">${escapeHtml(metaLine(board))}</p>` +
-    (board.source ? "" : `<p class="path" title="${escapeHtml(board.file)}">${escapeHtml(shortPath(board.file))}</p>`) +
-    `<div data-board-metadata="${escapeHtml(board.key)}" data-readonly="${Boolean(board.source)}" data-metadata="${escapeHtml(JSON.stringify(board))}"></div>` +
+    `<div class="board-head"><h3 class="board-title" title="${escapeHtml(board.title)}">${escapeHtml(board.title)}</h3></div>` +
+    `<div class="board-summary">${clientHtml(board)}<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span><span class="activity">${escapeHtml(relativeTime(board.last_activity))}</span></div>` +
+    (waiting ? `<p class="next-step">Waiting on ${escapeHtml(waiting)}</p>` : "") +
+    (board.next_step
+      ? `<p class="next-step" title="${escapeHtml(board.next_step)}">Next: ${escapeHtml(board.next_step)}</p>`
+      : "") +
     `<div class="acts">${actionsHtml(board)}</div>` +
+    `<details class="board-details"><summary>More info</summary>` +
+    (board.source
+      ? `<p class="meta">Hub: ${escapeHtml(board.source)}</p>`
+      : `<p class="path">${escapeHtml(board.file)}</p>`) +
+    (href
+      ? `<div class="board-link"><a href="${escapeHtml(href)}">${escapeHtml(href)}</a><button type="button" class="act" data-copy-link="${escapeHtml(href)}">Copy link</button></div>`
+      : "") +
+    (!board.source
+      ? `<button type="button" class="act" data-act="history" data-key="${escapeHtml(board.key)}">History</button>`
+      : "") +
+    `<p class="meta">${escapeHtml(metaLine(board))}</p>` +
+    `<div data-board-metadata="${escapeHtml(board.key)}" data-readonly="${Boolean(board.source)}" data-metadata="${escapeHtml(JSON.stringify(board))}"></div></details>` +
     `</li>`
   );
 }
 
+function renderFilters() {
+  if (!filters) return;
+  const chip = (label, kind, value, active) =>
+    `<button type="button" class="filter-chip" data-filter="${kind}" data-value="${escapeHtml(value)}" aria-pressed="${active}">${escapeHtml(label)}</button>`;
+  const clients = [...new Set([...serverClients, ...(selectedClient ? [selectedClient] : [])])];
+  const people = [
+    ...new Set([...serverPeople, ...Object.keys(notifySettings), ...(selectedPerson ? [selectedPerson] : [])]),
+  ];
+  filters.innerHTML =
+    `<div class="filter-group" role="group" aria-label="Status">${chip("Needs input", "needs", "", needsInputOnly)}</div>` +
+    (clients.length
+      ? `<div class="filter-group" role="group" aria-label="Clients"><span class="filter-label">Client</span>` +
+        `<select class="filter-select" data-filter-select="client" aria-label="Filter by client"><option value="">All clients</option>${clients
+          .map((name) => `<option value="${escapeHtml(name)}"${name === selectedClient ? " selected" : ""}>${escapeHtml(name)}</option>`)
+          .join("")}</select>` +
+        // Quick chips: the first three clients the server lists (busiest first when it orders them).
+        `${clients.slice(0, 3).map((name) => chip(name, "client", name, name === selectedClient)).join("")}</div>`
+      : "") +
+    (people.length
+      ? `<div class="filter-group" role="group" aria-label="People"><span class="filter-label">People</span>${people.map((name) => chip(name, "person", name, name === selectedPerson)).join("")}</div>`
+      : "");
+  if (suggestions)
+    suggestions.innerHTML = serverClients.map((name) => `<option value="${escapeHtml(name)}"></option>`).join("");
+}
+
+function applyViewData(data) {
+  if (Array.isArray(data.clients)) serverClients = data.clients;
+  if (Array.isArray(data.people)) serverPeople = data.people;
+  if (Array.isArray(data.viewer)) viewer = data.viewer;
+  if (Array.isArray(data.needs_you)) needsYouBoards = data.needs_you;
+  if (typeof data.needs_you_total === "number") needsYouTotal = data.needs_you_total;
+  if (typeof data.needs_you_count === "number") needsYouCount = data.needs_you_count;
+}
+
+function destinationStatus(value) {
+  const destination = notifyDestinations.find((item) => item.id === value);
+  if (destination) return { label: destination.ready ? "Ready" : "Not connected", ready: destination.ready };
+  return {
+    label: value
+      ? /^https?:\/\//i.test(value)
+        ? "URL · use Send test to check"
+        : "Custom · use Send test to check"
+      : "Choose a destination",
+    ready: false,
+  };
+}
+
+function destinationOptions(value) {
+  return `<option value="">Choose a destination…</option>${notifyDestinations.map((item) => `<option value="${escapeHtml(item.id)}"${value === item.id ? " selected" : ""}>${escapeHtml(item.label)} · ${item.ready ? "Ready" : "Not connected"}</option>`).join("")}`;
+}
+
+function syncDestinationRow(row, value) {
+  const statusElement = row.querySelector(".destination-status");
+  const status = destinationStatus(value);
+  if (statusElement) {
+    statusElement.textContent = status.label;
+    statusElement.setAttribute("data-ready", String(status.ready));
+  }
+  const picker = row.querySelector("select[data-notify-pick]");
+  if (picker) picker.innerHTML = destinationOptions(value);
+}
+
 function notifyRowHtml(person, cfg) {
   const safeName = escapeHtml(person);
+  const index = Object.keys(notifySettings).indexOf(person);
+  const status = destinationStatus(cfg.send_to);
   return (
     `<div class="notify-row" data-notify-row="${safeName}">` +
     `<div class="notify-person-head"><strong class="notify-person-name">${safeName}</strong>` +
@@ -335,7 +446,9 @@ function notifyRowHtml(person, cfg) {
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="tagged"${cfg.tagged ? " checked" : ""}><span>When tagged</span></label>` +
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="done"${cfg.done ? " checked" : ""}><span>When board is done</span></label>` +
     `</div>` +
-    `<label class="notify-sendto"><span>Send to</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Optional destination" maxlength="256"></label>` +
+    `<label class="notify-sendto"><span>Destination</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Paste a URL or pick below" maxlength="2048"></label>` +
+    `<label class="notify-sendto"><span>Suggested destinations</span><select data-notify-pick="${safeName}" aria-describedby="destination-status-${index}">${destinationOptions(cfg.send_to)}</select></label>` +
+    `<div class="destination-check"><span class="destination-status" id="destination-status-${index}" data-ready="${status.ready}">${escapeHtml(status.label)}</span><button type="button" class="act" data-notify-test="${safeName}" aria-label="Send test for ${safeName}">Send test</button></div>` +
     `</div>`
   );
 }
@@ -387,6 +500,8 @@ function renderNotificationsPanel() {
         input.value = String(cfg.send_to || "");
       }
     }
+    const field = /** @type {HTMLInputElement | null} */ (existing.querySelector('input[data-notify-field="send_to"]'));
+    syncDestinationRow(existing, field?.value.trim() || "");
   }
 }
 
@@ -432,8 +547,11 @@ function cancelLoadMore() {
 }
 
 function beginFilterTransition() {
+  editingClient = "";
+  clientDraft = "";
   filterEpoch += 1;
   filterPending = true;
+  filterFailed = false;
   hasMore = false;
   cancelLoadMore();
   activeFetchController?.abort();
@@ -442,6 +560,14 @@ function beginFilterTransition() {
 }
 
 function render() {
+  const expandedBoards = new Set(
+    Array.from(document.querySelectorAll?.(".board-details[open]") || []).map(
+      (element) => /** @type {HTMLElement} */ (element.closest(".board"))?.dataset.key,
+    ),
+  );
+  const focusedClientKey =
+    pendingClientFocus || /** @type {HTMLElement | null} */ (document.activeElement)?.dataset?.clientEdit;
+  pendingClientFocus = "";
   const fallbackOpen = boards.filter((board) => !isClosed(board));
   const counts = serverCounts || {
     open: fallbackOpen.length,
@@ -456,12 +582,12 @@ function render() {
   };
 
   countOpen.textContent = String(counts.open);
-  if (countNeedsInput) countNeedsInput.textContent = String(counts.needs_input);
-  countClosed.textContent = String(counts.closed);
+  if (countNeedsInput) countNeedsInput.textContent = String(needsYouCount || counts.needs_input);
+  if (countClosed) countClosed.textContent = String(counts.closed);
   if (countCancelled) countCancelled.textContent = String(counts.cancelled);
 
   tabOpen.setAttribute("aria-pressed", showing === "open" ? "true" : "false");
-  if (tabNeedsInput) tabNeedsInput.setAttribute("aria-pressed", showing === "needs-input" ? "true" : "false");
+  if (tabNeedsInput) tabNeedsInput.setAttribute("aria-pressed", showing === "needs-you" ? "true" : "false");
   tabClosed.setAttribute("aria-pressed", showing === "closed" ? "true" : "false");
   if (tabCancelled) tabCancelled.setAttribute("aria-pressed", showing === "cancelled" ? "true" : "false");
 
@@ -481,24 +607,71 @@ function render() {
 
   const query = search.value.trim();
   const searching = Boolean(query || tagFilter.value);
-  list.innerHTML = boards.map(boardHtml).join("");
+  const hideBoards = filterPending || filterFailed;
+  const pinned = hideBoards ? [] : needsYouBoards;
+  const pinnedKeys = new Set(pinned.map((board) => board.key));
+  const remaining = (hideBoards ? [] : boards).filter((board) => !pinnedKeys.has(board.key));
+  renderedBoards.clear();
+  for (const board of [...pinned, ...remaining]) renderedBoards.set(board.key, { ...board });
+  if (pinnedList) pinnedList.innerHTML = pinned.map(boardHtml).join("");
+  if (pinnedSection) pinnedSection.hidden = pinned.length === 0;
+  if (pinnedHint) pinnedHint.textContent = `${needsYouTotal} ${needsYouTotal === 1 ? "board" : "boards"}`;
+  if (pinnedMore) pinnedMore.hidden = pinned.length >= needsYouTotal || showing === "needs-you";
+  list.innerHTML = remaining.map(boardHtml).join("");
+  if (listHeading) {
+    listHeading.hidden = remaining.length === 0;
+    listHeading.textContent =
+      query && includeClosed?.checked
+        ? "Search results"
+        : showing === "closed"
+          ? "Closed boards"
+          : showing === "cancelled"
+            ? "Cancelled boards"
+            : showing === "needs-you"
+              ? "Needs you"
+              : pinned.length
+                ? "Other open boards"
+                : "Open boards";
+  }
+  if (resultCount)
+    resultCount.textContent = filterPending
+      ? "Searching…"
+      : filterFailed
+        ? "Could not load boards."
+        : `${totalMatching} ${totalMatching === 1 ? "board" : "boards"} · ${query && includeClosed?.checked ? "Including closed and cancelled" : showing === "open" ? "Open" : showing === "needs-you" ? "Needs you" : showing === "closed" ? "Closed" : "Cancelled"}${(showing === "closed" || showing === "cancelled") && !showOlderBoards && !query ? " · Last 14 days" : ""}`;
+  if (showOlder)
+    showOlder.hidden =
+      hideBoards || !(showing === "closed" || showing === "cancelled") || showOlderBoards || Boolean(query);
+  if (loadError) loadError.hidden = !filterFailed;
+  renderFilters();
   window.dispatchEvent(new CustomEvent("lavish:render-metadata"));
+  for (const details of document.querySelectorAll?.(".board-details") || []) {
+    if (expandedBoards.has(/** @type {HTMLElement} */ (details.closest(".board"))?.dataset.key))
+      /** @type {HTMLDetailsElement} */ (details).open = true;
+  }
+  if (focusedClientKey) {
+    const chip = Array.from(document.querySelectorAll?.("[data-client-edit]") || []).find(
+      (element) => /** @type {HTMLElement} */ (element).dataset.clientEdit === focusedClientKey,
+    );
+    /** @type {HTMLElement | undefined} */ (chip)?.focus();
+  }
 
   if (moreWrap && moreBtn) {
-    const showMore = hasMore && !filterPending;
+    const showMore = hasMore && !hideBoards;
     moreWrap.hidden = !showMore;
     moreBtn.disabled = loadingMore;
+    const visibleCount = new Set([...boards, ...pinned].map((board) => board.key)).size;
     moreBtn.textContent = loadingMore
       ? "Loading…"
       : totalMatching > boards.length
-        ? `Load more (${boards.length} of ${totalMatching})`
+        ? `Load more (${visibleCount} of ${totalMatching})`
         : "Load more";
   }
 
-  empty.hidden = boards.length > 0 || filterPending;
+  empty.hidden = boards.length > 0 || pinned.length > 0 || hideBoards;
   empty.textContent = searching
     ? "No matching boards."
-    : showing === "needs-input"
+    : showing === "needs-you"
       ? "No boards waiting on input."
       : showing === "cancelled"
         ? "No cancelled boards."
@@ -508,25 +681,13 @@ function render() {
 
   const listening = openSummary.listening || 0;
   const unread = openSummary.unread || 0;
-  const nobody = openSummary.nobody || 0;
   pill.textContent = unread
     ? plural(unread, "board has unread notes", "boards have unread notes")
     : plural(listening, "board live", "boards live");
   pill.dataset.tone = unread ? "warn" : listening ? "good" : "muted";
-  lede.textContent =
-    plural(counts.open, "open board", "open boards") +
-    (counts.open
-      ? ": " +
-        [
-          listening && listening + " taking input",
-          unread && unread + " with unread notes",
-          nobody && nobody + " with nobody listening",
-        ]
-          .filter(Boolean)
-          .join(", ") +
-        "."
-      : "");
-  if (!counts.open) lede.textContent = "No open boards. Closed ones can be reopened below.";
+  lede.textContent = needsYouCount
+    ? `${needsYouCount} ${needsYouCount === 1 ? "board needs" : "boards need"} your attention.`
+    : "Open a board to review it or send a message.";
   updated.textContent = generatedAt ? new Date(generatedAt).toLocaleTimeString() : "";
   const down = peers.filter((peer) => peer && peer.ok === false && !peer.pending).map((peer) => String(peer.name));
   peerNote.textContent = down.length
@@ -551,7 +712,11 @@ function buildHubQuery({ offset = 0, limit = DEFAULT_PAGE_LIMIT } = {}) {
   const tag = tagFilter.value.trim();
   if (q) params.set("q", q);
   if (tag) params.set("tag", tag);
-  if (!q && !tag) params.set("state", showing);
+  if (!(q && includeClosed?.checked)) params.set("state", showing);
+  if (selectedClient) params.set("client", selectedClient);
+  if (selectedPerson) params.set("person", selectedPerson);
+  if (needsInputOnly) params.set("needs_input", "1");
+  if ((showing === "closed" || showing === "cancelled") && !showOlderBoards && !q) params.set("recent", "1");
   params.set("limit", String(limit));
   if (offset > 0) params.set("offset", String(offset));
   return "/api/hub?" + params.toString();
@@ -585,6 +750,8 @@ async function refresh({ resetLimit = false } = {}) {
     const data = await response.json();
     if (activeFetchController !== controller || reqEpoch !== filterEpoch) return;
     filterPending = false;
+    filterFailed = false;
+    applyViewData(data);
     boards = Array.isArray(data.boards) ? data.boards : [];
     peers = Array.isArray(data.peers) ? data.peers : [];
     if (data.counts && typeof data.counts === "object") serverCounts = data.counts;
@@ -599,12 +766,23 @@ async function refresh({ resetLimit = false } = {}) {
     }
     generatedAt = String(data.generated_at || "");
     if (note.dataset.tone === "offline") showNote("");
-    if (!list.contains(document.activeElement) || !document.activeElement?.matches("input")) render();
+    if (
+      !editingClient &&
+      (!(list.contains(document.activeElement) || pinnedList?.contains(document.activeElement)) ||
+        !document.activeElement?.matches("input"))
+    )
+      render();
   } catch (error) {
-    if (/** @type {any} */ (error)?.name === "AbortError" || reqEpoch !== filterEpoch) return;
+    if (
+      /** @type {any} */ (error)?.name === "AbortError" ||
+      activeFetchController !== controller ||
+      reqEpoch !== filterEpoch
+    )
+      return;
+    filterFailed = filterPending || filterFailed;
     filterPending = false;
     render();
-    showNote("Lavish is not answering. The list below may be out of date.", "offline");
+    showNote(filterFailed ? "" : "Lavish is not answering. The list below may be out of date.", "offline");
   }
 }
 
@@ -624,6 +802,7 @@ async function loadMore() {
     if (!response.ok) throw new Error("hub request failed: " + response.status);
     const data = await response.json();
     if (loadMoreController !== controller || reqEpoch !== filterEpoch) return;
+    applyViewData(data);
     const seen = new Set(boards.map((board) => board.key));
     for (const board of Array.isArray(data.boards) ? data.boards : []) {
       if (board && !seen.has(board.key)) {
@@ -820,20 +999,61 @@ async function showHistory(board) {
 }
 
 function setNotifyPanelOpen(open) {
-  if (!notifyPanel || !notifyToggle) return;
-  notifyPanel.hidden = !open;
-  notifyToggle.setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) renderNotificationsPanel();
+  if (!settings) return;
+  if (open) {
+    settings.showModal();
+    renderNotificationsPanel();
+    renderPeersPanel();
+    void fetch("/api/hub/notification-destinations", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error();
+        return response.json();
+      })
+      .then((data) => {
+        notifyDestinations = Array.isArray(data.destinations) ? data.destinations : [];
+        renderNotificationsPanel();
+        if (data.error) setNotifyStatus(data.error, true);
+      })
+      .catch(() => setNotifyStatus("Suggested destinations are unavailable. You can still paste a URL.", true));
+  } else settings.close();
+  settingsToggle?.setAttribute("aria-expanded", String(open));
 }
+settingsToggle?.addEventListener("click", () => setNotifyPanelOpen(true));
+settingsClose?.addEventListener("click", () => setNotifyPanelOpen(false));
+function switchSettingsPanel(peersOpen) {
+  const notifications = document.getElementById("notifyPanel");
+  const connections = document.getElementById("peerPanel");
+  if (notifications) notifications.hidden = peersOpen;
+  if (connections) connections.hidden = !peersOpen;
+  document.getElementById("settingsNotifications")?.setAttribute("aria-pressed", String(!peersOpen));
+  document.getElementById("settingsPeers")?.setAttribute("aria-pressed", String(peersOpen));
+}
+document.getElementById("settingsNotifications")?.addEventListener("click", () => switchSettingsPanel(false));
+document.getElementById("settingsPeers")?.addEventListener("click", () => switchSettingsPanel(true));
+settings?.addEventListener("close", () => {
+  settingsToggle?.setAttribute("aria-expanded", "false");
+  settingsToggle?.focus();
+});
+settings?.addEventListener("click", (event) => {
+  if (event.target === settings) setNotifyPanelOpen(false);
+});
 
-notifyToggle?.addEventListener("click", () => {
-  const nextOpen = Boolean(notifyPanel?.hidden);
-  setNotifyPanelOpen(nextOpen);
-});
-notifyClose?.addEventListener("click", () => {
-  setNotifyPanelOpen(false);
-});
 notifyRows?.addEventListener("change", (event) => {
+  const select = /** @type {HTMLSelectElement} */ (event.target);
+  const pickedPerson = select.dataset?.notifyPick;
+  if (pickedPerson && select.value && Object.hasOwn(notifySettings, pickedPerson)) {
+    const timer = sendToSaveTimers.get(pickedPerson);
+    if (timer) clearTimeout(timer);
+    sendToSaveTimers.delete(pickedPerson);
+    const field = /** @type {HTMLInputElement | null} */ (
+      select.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
+    );
+    if (field) field.value = select.value;
+    notifySettings[pickedPerson] = { ...notifySettings[pickedPerson], send_to: select.value };
+    void queueNotifyMutation({ patch: { person: pickedPerson, send_to: select.value } }, { rerender: true });
+    renderNotificationsPanel();
+    return;
+  }
   const input = /** @type {HTMLInputElement | null} */ (event.target);
   const person = input?.dataset?.notifyPerson;
   const field = input?.dataset?.notifyField;
@@ -850,7 +1070,7 @@ notifyRows?.addEventListener("change", (event) => {
     }
     const cleaned = input.value.trim();
     notifySettings[person] = { ...notifySettings[person], send_to: cleaned };
-    void queueNotifyMutation({ patch: { person, send_to: cleaned } });
+    void queueNotifyMutation({ patch: { person, send_to: cleaned } }, { rerender: true });
   }
 });
 notifyRows?.addEventListener("input", (event) => {
@@ -860,15 +1080,44 @@ notifyRows?.addEventListener("input", (event) => {
   if (!input || !person || field !== "send_to" || !Object.hasOwn(notifySettings, person)) return;
   const cleaned = input.value.trim();
   notifySettings[person] = { ...notifySettings[person], send_to: cleaned };
+  const row = input.closest("[data-notify-row]");
+  if (row) syncDestinationRow(row, cleaned);
   const existingTimer = sendToSaveTimers.get(person);
   if (existingTimer) clearTimeout(existingTimer);
   const timer = setTimeout(() => {
     sendToSaveTimers.delete(person);
-    void queueNotifyMutation({ patch: { person, send_to: cleaned } });
+    void queueNotifyMutation({ patch: { person, send_to: cleaned } }, { rerender: true });
   }, SEND_TO_DEBOUNCE_MS);
   sendToSaveTimers.set(person, timer);
 });
-notifyRows?.addEventListener("click", (event) => {
+notifyRows?.addEventListener("click", async (event) => {
+  const testButton = /** @type {HTMLButtonElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("button[data-notify-test]")
+  );
+  const testPerson = testButton?.dataset.notifyTest;
+  if (testButton && testPerson && !testButton.disabled && Object.hasOwn(notifySettings, testPerson)) {
+    testButton.disabled = true;
+    const field = /** @type {HTMLInputElement | null} */ (
+      testButton.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
+    );
+    const sendTo = field?.value.trim() ?? notifySettings[testPerson].send_to;
+    try {
+      await notifySaveChain;
+      const response = await fetch("/api/hub/notifications/test", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ person: testPerson, send_to: sendTo }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not send test");
+      setNotifyStatus(data.message);
+    } catch (error) {
+      setNotifyStatus(error.message || "Could not send test", true);
+    } finally {
+      testButton.disabled = false;
+    }
+    return;
+  }
   const button = /** @type {HTMLButtonElement | null} */ (
     /** @type {HTMLElement} */ (event.target).closest?.("button[data-notify-remove]") || null
   );
@@ -905,19 +1154,25 @@ notifyAddForm?.addEventListener("submit", (event) => {
   void queueNotifyMutation({ add: rawName }, { rerender: true });
 });
 
-list.addEventListener("click", (event) => {
+function handleBoardClick(event) {
   const target = /** @type {HTMLElement} */ (event.target);
   const button = /** @type {HTMLButtonElement | null} */ (target.closest?.("button[data-act]") || null);
   if (!button || button.disabled) return;
-  const board = boards.find((candidate) => candidate.key === button.dataset.key);
+  const board = renderedBoards.get(button.dataset.key);
   if (!board) return;
-  if (button.dataset.act === "close") closeBoard(board);
-  else if (button.dataset.act === "cancel") cancelBoard(board);
-  else if (button.dataset.act === "reopen") reopenBoard(board);
+  if (button.dataset.act === "close") return closeBoard(board);
+  else if (button.dataset.act === "cancel") return cancelBoard(board);
+  else if (button.dataset.act === "reopen") return reopenBoard(board);
   else if (button.dataset.act === "history" && !board.source) showHistory(board);
-});
+}
+list.addEventListener("click", handleBoardClick);
+pinnedList?.addEventListener("click", handleBoardClick);
 moreBtn?.addEventListener("click", () => {
   void loadMore();
+});
+retry?.addEventListener("click", () => {
+  beginFilterTransition();
+  return refresh({ resetLimit: true });
 });
 
 function switchTab(nextTab) {
@@ -925,12 +1180,14 @@ function switchTab(nextTab) {
   clearTimeout(searchDebounceTimer);
   searchDebounceTimer = undefined;
   showing = nextTab;
+  if (includeClosed) includeClosed.checked = false;
+  showOlderBoards = false;
   beginFilterTransition();
   void refresh({ resetLimit: true });
 }
 
 tabOpen.addEventListener("click", () => switchTab("open"));
-tabNeedsInput?.addEventListener("click", () => switchTab("needs-input"));
+tabNeedsInput?.addEventListener("click", () => switchTab("needs-you"));
 tabClosed.addEventListener("click", () => switchTab("closed"));
 tabCancelled?.addEventListener("click", () => switchTab("cancelled"));
 historyClose.addEventListener("click", () => {
@@ -941,7 +1198,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") void refresh();
 });
 if (location.hash === "#closed") showing = "closed";
-else if (location.hash === "#needs-input") showing = "needs-input";
+else if (location.hash === "#needs-input") showing = "needs-you";
 else if (location.hash === "#cancelled") showing = "cancelled";
 else if (location.hash === "#notifications") setNotifyPanelOpen(true);
 
@@ -973,3 +1230,155 @@ if (showing !== "open") {
   void refresh();
 }
 connectHubEvents();
+
+filters?.addEventListener("change", (event) => {
+  const select = /** @type {HTMLSelectElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("select[data-filter-select]")
+  );
+  if (!select || select.dataset.filterSelect !== "client") return;
+  selectedClient = select.value || "";
+  beginFilterTransition();
+  void refresh({ resetLimit: true });
+});
+
+filters?.addEventListener("click", (event) => {
+  const button = /** @type {HTMLElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("button[data-filter]")
+  );
+  if (!button) return;
+  const value = button.dataset.value || "";
+  if (button.dataset.filter === "client") selectedClient = selectedClient === value ? "" : value;
+  else if (button.dataset.filter === "person") selectedPerson = selectedPerson === value ? "" : value;
+  else needsInputOnly = !needsInputOnly;
+  beginFilterTransition();
+  void refresh({ resetLimit: true });
+});
+includeClosed?.addEventListener("change", () => {
+  beginFilterTransition();
+  void refresh({ resetLimit: true });
+});
+showOlder?.addEventListener("click", () => {
+  showOlderBoards = true;
+  beginFilterTransition();
+  void refresh({ resetLimit: true });
+});
+pinnedMore?.addEventListener("click", () => switchTab("needs-you"));
+
+document.addEventListener("click", async (event) => {
+  const copy = /** @type {HTMLButtonElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("[data-copy-link]")
+  );
+  if (copy) {
+    try {
+      const value = copy.dataset.copyLink || "";
+      let copied = false;
+      if (window.navigator.clipboard?.writeText) {
+        try {
+          await window.navigator.clipboard.writeText(value);
+          copied = true;
+        } catch {
+          /* Fall back for plain-http origins and denied clipboard permissions. */
+        }
+      }
+      if (!copied) {
+        const textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.setAttribute("aria-label", "Board link");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        try {
+          textarea.select();
+          if (!document.execCommand("copy")) throw new Error("Copy unavailable");
+        } finally {
+          textarea.remove();
+          copy.focus();
+        }
+      }
+      copy.textContent = "Copied";
+    } catch {
+      showNote("Copy is unavailable here. Select the link in More info to copy it.", "error");
+    }
+    return;
+  }
+  const button = /** @type {HTMLElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("[data-client-edit], [data-client-cancel]")
+  );
+  if (!button || savingClient) return;
+  if (button.hasAttribute("data-client-cancel")) {
+    pendingClientFocus = editingClient;
+    editingClient = "";
+    render();
+    return;
+  }
+  const board = [...boards, ...needsYouBoards].find((item) => item.key === button.dataset.clientEdit);
+  if (!board) return;
+  editingClient = board.key;
+  clientEditOrigin = board.peer_origin || "";
+  clientEditIsPeer = Boolean(board.source);
+  clientDraft = board.client || "";
+  render();
+  const input = /** @type {HTMLInputElement | null} */ (document.querySelector(".client-edit input"));
+  input?.focus();
+  input?.select();
+});
+document.addEventListener("input", (event) => {
+  const input = /** @type {HTMLInputElement} */ (event.target);
+  if (input.matches?.(".client-edit input")) clientDraft = input.value;
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && editingClient && !savingClient) {
+    event.preventDefault();
+    pendingClientFocus = editingClient;
+    editingClient = "";
+    render();
+  }
+});
+document.addEventListener("submit", async (event) => {
+  const form = /** @type {HTMLFormElement} */ (event.target);
+  if (!form.matches?.(".client-edit")) return;
+  event.preventDefault();
+  if (savingClient) return;
+  const board = [...boards, ...needsYouBoards].find((item) => item.key === form.dataset.clientKey);
+  if (!board) {
+    editingClient = "";
+    render();
+    showNote("This board is no longer in this view. Refresh to edit it.", "error");
+    return;
+  }
+  savingClient = true;
+  render();
+  try {
+    const response = await fetch(`/api/${encodeURIComponent(board.key)}/metadata`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client: clientDraft.trim(),
+        ...(clientEditIsPeer ? { peer_origin: clientEditOrigin } : {}),
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not save client");
+    board.client = result.client;
+    pendingClientFocus = editingClient;
+    editingClient = "";
+    window.dispatchEvent(new CustomEvent("lavish:metadata-saved", { detail: { key: board.key, ...result } }));
+    showNote("Client saved.", "done");
+  } catch (error) {
+    showNote(error.message || "Could not save client", "error");
+  } finally {
+    savingClient = false;
+    render();
+  }
+});
+if (initial.identify_viewer) {
+  void fetch("/api/hub/viewer", { cache: "no-store" })
+    .then((response) => response.json())
+    .then((data) => {
+      if (Array.isArray(data.viewer) && data.viewer.length) {
+        viewer = data.viewer;
+        void refresh();
+      }
+    })
+    .catch(() => {});
+}
