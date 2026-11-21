@@ -32,7 +32,8 @@ function freshnessBadge(board) {
   const opened = Date.parse(board.opened_at || "") || 0;
   if (!opened) return `<span class="fresh fresh-new">New</span>`;
   const activity = Date.parse(board.last_activity || "") || 0;
-  return activity > opened + 5000 ? `<span class="fresh fresh-updated">Updated</span>` : "";
+  // Anything new on the board since it was last opened (e.g. a new email's revision) makes it New again.
+  return activity > opened + 5000 ? `<span class="fresh fresh-new">New</span>` : "";
 }
 let pendingWsRefreshAfterLoadMore = false;
 /** @type {Record<string, { tagged: boolean, done: boolean, send_to: string }>} */
