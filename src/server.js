@@ -3659,6 +3659,7 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      await store.markBoardOpened(req.params.key).catch(() => null);
       res.json({
         chrome_load_token: handoff.chrome_load_token,
         artifact_revision: handoff.artifact_revision,

@@ -231,6 +231,18 @@ export class SessionStore {
     });
   }
 
+  /** Someone opened this board on this hub: clears its New/Updated badge for everyone here. */
+  async markBoardOpened(key) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      session.opened_at = new Date().toISOString();
+      await this.writeState(state);
+      return session;
+    });
+  }
+
   async updateBoardClient(key, value) {
     const client = normalizeClient(value);
     return this.runExclusive(async () => {
