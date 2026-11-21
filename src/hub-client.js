@@ -355,7 +355,7 @@ function boardHtml(board) {
     (board.next_step
       ? `<p class="next-step" title="${escapeHtml(board.next_step)}">Next: ${escapeHtml(board.next_step)}</p>`
       : "") +
-    `<div class="acts">${actionsHtml(board)}</div>` +
+    `<div class="acts">${actionsHtml(board)}<button type="button" class="act more-toggle" data-act="more" data-key="${escapeHtml(board.key)}" aria-expanded="false">▸ More info</button></div>` +
     `<details class="board-details"><summary>More info</summary>` +
     (board.source
       ? `<p class="meta">Hub: ${escapeHtml(board.source)}</p>`
@@ -1165,6 +1165,15 @@ function handleBoardClick(event) {
   const target = /** @type {HTMLElement} */ (event.target);
   const button = /** @type {HTMLButtonElement | null} */ (target.closest?.("button[data-act]") || null);
   if (!button || button.disabled) return;
+  if (button.dataset.act === "more") {
+    // The toggle lives in the action row, so it stays on the right when the details open below.
+    const details = button.closest("li.board")?.querySelector(".board-details");
+    if (!details) return;
+    details.open = !details.open;
+    button.textContent = details.open ? "▾ More info" : "▸ More info";
+    button.setAttribute("aria-expanded", String(details.open));
+    return;
+  }
   const board = renderedBoards.get(button.dataset.key);
   if (!board) return;
   if (button.dataset.act === "close" || button.dataset.act === "cancel") {

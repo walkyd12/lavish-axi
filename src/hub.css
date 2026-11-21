@@ -1125,3 +1125,15 @@ main.wrap {
 .board-title, h2 { letter-spacing: 0; word-spacing: 0.08em; }
 
 button.armed { color: var(--bad); font-weight: 700; }
+
+/* More info toggle sits at the right end of the action row; the native summary is hidden. */
+.acts .more-toggle {
+  margin-left: auto;
+  font-weight: 400;
+  color: var(--muted, inherit);
+  border-bottom-color: transparent;
+}
+.board-details > summary,
+.board-details[open] > summary {
+  display: none;
+}
