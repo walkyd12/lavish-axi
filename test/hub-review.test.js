@@ -137,9 +137,15 @@ for (const action of ["close", "cancel", "reopen"]) {
     h.run(
       "globalThis.actionBodies = []; const previousFetch = fetch; fetch = async (url, init) => { if (init?.method) actionBodies.push(JSON.parse(init.body)); return previousFetch(url, init); }",
     );
-    await h.emit("boards", "click", {
-      closest: () => ({ disabled: false, dataset: { act: action, key: "peer:team:abc" } }),
-    });
+    // Close and Cancel need two taps (the first only arms the button); Reopen acts on one.
+    const button = {
+      disabled: false,
+      dataset: { act: action, key: "peer:team:abc" },
+      textContent: action,
+      classList: { add() {}, remove() {} },
+    };
+    const taps = action === "reopen" ? 1 : 2;
+    for (let i = 0; i < taps; i += 1) await h.emit("boards", "click", { closest: () => button });
     assert.equal(h.run("actionBodies[0].peer_origin"), "https://original.example");
   });
 }
