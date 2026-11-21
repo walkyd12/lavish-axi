@@ -816,15 +816,15 @@ export class SessionStore {
       if (!session) {
         return null;
       }
-      const existingEndedBy = session.status === "ended" ? session.ended_by : undefined;
-      const nextEndedBy = endedBy === "user" || existingEndedBy === "user" ? "user" : "agent";
+      if (session.status === "ended") return { ...session, end_changed: false };
+      const nextEndedBy = endedBy === "user" ? "user" : "agent";
       session.status = "ended";
       session.ended_by = nextEndedBy;
       if (cancelled) session.ended_reason = "cancelled";
       else delete session.ended_reason;
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
-      return session;
+      return { ...session, end_changed: true };
     });
   }
 

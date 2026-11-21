@@ -5204,7 +5204,7 @@ endButton.onclick = () => {
   closeMenus();
   endSession();
 };
-/** @type {{ prompt: string, label: string, summary: string, selector: string, text: string, initialAuthor: string } | null} */
+/** @type {{ prompt: string, label: string, selector: string, text: string, initialAuthor: string } | null} */
 let pendingChromeApproval = null;
 let approvalConfirmInFlight = false;
 
@@ -5212,19 +5212,14 @@ function openApprovalConfirmation(msg) {
   if (ended || !approvalBanner || !approvalBannerText) return;
   const prompt = String(msg?.prompt || "").trim();
   if (!prompt) return;
-  const label = String(msg?.label || "Confirm action")
-    .trim()
-    .slice(0, 120);
-  const summary = String(msg?.summary || "")
-    .trim()
-    .slice(0, 400);
+  // The trusted bar displays the exact action it submits, never an independent artifact label.
+  const label = "Confirm action";
   const author = String(msg?.author || "")
     .trim()
     .slice(0, 80);
   pendingChromeApproval = {
     prompt,
     label,
-    summary,
     selector: String(msg?.selector || "").slice(0, 512),
     text: String(msg?.text || label).slice(0, 240),
     initialAuthor: author,
@@ -5243,11 +5238,25 @@ function openApprovalConfirmation(msg) {
   if (approvalTokenInput && requiresApprovalToken && !approvalTokenInput.value && savedToken) {
     approvalTokenInput.value = savedToken;
   }
-  approvalBannerText.textContent = summary ? label + ": " + summary : label;
+  syncApprovalConfirmationText();
   approvalBanner.hidden = false;
   if (isMobileSheet() && !sheetOpen) setSheetOpen(true);
   else pulseSheetDock();
 }
+
+function syncApprovalConfirmationText() {
+  if (!pendingChromeApproval || !approvalBannerText) return;
+  const author = String(approvalAuthorInput?.value || "").trim();
+  if (pendingChromeApproval.initialAuthor && author) {
+    pendingChromeApproval.prompt = pendingChromeApproval.prompt.replace(
+      " from " + pendingChromeApproval.initialAuthor + " [",
+      " from " + author + " [",
+    );
+    pendingChromeApproval.initialAuthor = author;
+  }
+  approvalBannerText.textContent = pendingChromeApproval.prompt;
+}
+if (approvalAuthorInput) approvalAuthorInput.addEventListener("input", syncApprovalConfirmationText);
 
 function closeApprovalConfirmation() {
   pendingChromeApproval = null;
@@ -5260,7 +5269,7 @@ async function submitApprovalConfirmation(event) {
   const author = String(approvalAuthorInput?.value || "").trim();
   if (!author) {
     if (approvalBannerText && pendingChromeApproval) {
-      approvalBannerText.textContent = pendingChromeApproval.label + ": enter your reviewer name before confirming.";
+      approvalBannerText.textContent = pendingChromeApproval.prompt + ": enter your reviewer name before confirming.";
     }
     approvalAuthorInput?.focus?.();
     return;
@@ -5268,15 +5277,13 @@ async function submitApprovalConfirmation(event) {
   const approvalToken = String(approvalTokenInput?.value || "").trim();
   if (requiresApprovalToken && !approvalToken) {
     if (approvalBannerText && pendingChromeApproval) {
-      approvalBannerText.textContent = pendingChromeApproval.label + ": enter your approval token before confirming.";
+      approvalBannerText.textContent = pendingChromeApproval.prompt + ": enter your approval token before confirming.";
     }
     approvalTokenInput?.focus?.();
     return;
   }
-  let promptText = pendingChromeApproval.prompt;
-  if (pendingChromeApproval.initialAuthor && pendingChromeApproval.initialAuthor !== author) {
-    promptText = promptText.replace(" from " + pendingChromeApproval.initialAuthor + " [", " from " + author + " [");
-  }
+  syncApprovalConfirmationText();
+  const promptText = pendingChromeApproval.prompt;
   approvalConfirmInFlight = true;
   if (approvalConfirmButton) approvalConfirmButton.disabled = true;
   try {
@@ -5306,7 +5313,7 @@ async function submitApprovalConfirmation(event) {
   } catch (error) {
     if (approvalBannerText && pendingChromeApproval) {
       approvalBannerText.textContent =
-        pendingChromeApproval.label + ": " + (error instanceof Error ? error.message : String(error));
+        pendingChromeApproval.prompt + ": " + (error instanceof Error ? error.message : String(error));
     }
   } finally {
     approvalConfirmInFlight = false;

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { serve } from "../src/server.js";
+import { doesAuthorMatchTailscaleWhois, parseApprovalUsers, serve } from "../src/server.js";
 import { SessionStore } from "../src/session-store.js";
 
 process.env.LAVISH_AXI_HOST = "127.0.0.1";
@@ -727,6 +727,67 @@ test("hub viewer WebSockets and peer subscriptions prevent premature idle shutdo
   } finally {
     if (hub) await hub.close();
     if (peer) await peer.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Tailscale approvals require an exact provisioned login or alias", () => {
+  const aliases = parseApprovalUsers("Zach=zachhite22@gmail.com|zachhite22,Walker=walkyd12");
+  const matches = (loginName, displayName = "Zach Hite") =>
+    doesAuthorMatchTailscaleWhois("Zach", { loginName, displayName }, aliases);
+  assert.equal(matches("zach-attacker@example.com"), false);
+  assert.equal(matches("other@example.com", "Zach"), false);
+  assert.equal(matches("zachhite22@evil.example"), false);
+  assert.equal(matches(" ZACHHITE22@GMAIL.COM "), true);
+  assert.equal(matches("zachhite22"), true);
+  assert.equal(doesAuthorMatchTailscaleWhois("Walker", { loginName: "walkyd12" }, aliases), true);
+  assert.equal(doesAuthorMatchTailscaleWhois("Zach", { loginName: "zach@example.com" }, new Map()), false);
+});
+
+test("repeated End preserves cancellation and emits no second terminal event", async () => {
+  const { WebSocket } = await import("ws");
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-end-once-"));
+  const file = path.join(dir, "board.html");
+  await writeFile(file, "<title>End once</title>");
+  const stateFile = path.join(dir, "state.json");
+  const events = [];
+  const server = await serve({ port: 0, stateFile, onEvent: (event) => events.push(event) });
+  const base = `http://127.0.0.1:${server.port}`;
+  const ws = new WebSocket(`ws://127.0.0.1:${server.port}/events/hub`);
+  await new Promise((resolve, reject) => {
+    ws.once("open", resolve);
+    ws.once("error", reject);
+  });
+  const post = (route, body = {}) =>
+    fetch(base + route, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify(body),
+    }).then((r) => r.json());
+  try {
+    const { key } = await post("/api/sessions", { file });
+    const store = new SessionStore(stateFile);
+    for (const cancelled of [true, false]) {
+      if (!cancelled) await post(`/api/hub/${key}/reopen`);
+      await post(`/api/hub/${key}/${cancelled ? "cancel" : "close"}`);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const before = await store.findByKey(key);
+      const count = events.filter((e) => ["board_closed", "board_cancelled"].includes(e.event)).length;
+      assert.equal(count, cancelled ? 1 : 2);
+      const result = await post("/api/end", { file });
+      assert.equal(result.cancelled, cancelled);
+      await Promise.all([
+        post("/api/end", { file, cancel: true }),
+        post(`/api/${key}/end`),
+        post(`/api/hub/${key}/close`),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.deepEqual(await store.findByKey(key), before);
+      assert.equal(events.filter((e) => ["board_closed", "board_cancelled"].includes(e.event)).length, count);
+    }
+  } finally {
+    ws.close();
+    await server.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

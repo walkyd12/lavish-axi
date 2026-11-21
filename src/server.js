@@ -398,28 +398,14 @@ function reviewerMatchesName(suppliedAuthor, expectedReviewer) {
   return Boolean(supFirst && supFirst === expFirst && (sup === supFirst || exp === expFirst));
 }
 
-function doesAuthorMatchTailscaleWhois(suppliedAuthor, whois, aliasMap) {
+export function doesAuthorMatchTailscaleWhois(suppliedAuthor, whois, aliasMap) {
   const sup = normalizePromptAuthor(suppliedAuthor).toLowerCase();
   if (!sup || !whois) return false;
-  const display = String(whois.displayName || "")
-    .trim()
-    .toLowerCase();
   const login = String(whois.loginName || "")
     .trim()
     .toLowerCase();
-  const loginLocal = login.split("@")[0] || "";
   const aliases = aliasMap?.get(sup) || aliasMap?.get(sup.split(/\s+/)[0]);
-  if (aliases) {
-    if ((login && aliases.has(login)) || (loginLocal && aliases.has(loginLocal)) || (display && aliases.has(display))) {
-      return true;
-    }
-  }
-  if (display && (sup === display || display.split(/[^a-z0-9]+/).includes(sup))) return true;
-  const supFirst = sup.split(/\s+/)[0];
-  if (display && supFirst.length >= 2 && display.split(/[^a-z0-9]+/)[0] === supFirst) return true;
-  if (loginLocal && (sup === loginLocal || loginLocal.split(/[^a-z0-9]+/).includes(supFirst))) return true;
-  if (supFirst.length >= 3 && loginLocal.startsWith(supFirst)) return true;
-  return false;
+  return Boolean(login && aliases?.has(login));
 }
 
 /**
@@ -1503,8 +1489,10 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key, session.ended_by);
+      if (session.end_changed) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+        events.emit("ended", req.params.key, session.ended_by);
+      }
       res.json({ status: "ended", ended_by: session.ended_by, ...serializeBoardMetadata(session) });
     } catch (error) {
       next(error);
@@ -1535,8 +1523,10 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key, session.ended_by);
+      if (session.end_changed) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+        events.emit("ended", req.params.key, session.ended_by);
+      }
       res.json({ status: "ended", ended_by: session.ended_by, ...serializeBoardMetadata(session) });
     } catch (error) {
       next(error);
@@ -2672,10 +2662,12 @@ export async function serve({
   app.post("/api/:key/end", async (req, res, next) => {
     try {
       const session = await store.endSession(req.params.key, "user");
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key, session?.ended_by);
+      if (session?.end_changed) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+        events.emit("ended", req.params.key, session.ended_by);
+      }
       res.json({ status: "ended", ...(session ? serializeBoardMetadata(session) : { closed: true }) });
-      await shutdownIfNoLiveSessions();
+      if (session?.end_changed) await shutdownIfNoLiveSessions();
     } catch (error) {
       next(error);
     }
@@ -2871,10 +2863,12 @@ export async function serve({
       const file = await canonicalFile(req.body.file);
       const key = sessionKey(file);
       const session = await store.endSession(key, "agent", { cancelled: req.body?.cancel === true });
-      clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
-      events.emit("ended", key, session?.ended_by);
+      if (session?.end_changed) {
+        clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+        events.emit("ended", key, session.ended_by);
+      }
       res.json({ status: "ended", ...(session ? serializeBoardMetadata(session) : { closed: true }) });
-      await shutdownIfNoLiveSessions();
+      if (session?.end_changed) await shutdownIfNoLiveSessions();
     } catch (error) {
       next(error);
     }

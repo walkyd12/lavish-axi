@@ -10027,3 +10027,30 @@ test("lavish:requestApproval never auto-submits and requires a trusted human cli
   assert.match(approvalCalls[0].prompt, /^Send approved draft from Walker \[/);
   assert.equal(chrome.element("approvalBanner").hidden, true);
 });
+
+test("confirmation displays the exact submitted action instead of an artifact label", async () => {
+  const calls = [];
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialViewerName: "Walker" },
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/approval")) calls.push(JSON.parse(String(init?.body || "{}")));
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  const prompt =
+    "Send approved draft from Walker [ref rabc1234 sha256 " + "c".repeat(64) + " recipients alex@example.com]: ok";
+  chrome.sendFrameMessage({
+    type: "lavish:requestApproval",
+    artifact_load_token: chrome.artifactLoadToken(),
+    prompt,
+    label: "Approve board",
+    summary: "Save these notes",
+    author: "Walker",
+    selector: "#send-approved-email",
+  });
+  assert.equal(chrome.element("approvalBannerText").textContent, prompt);
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].prompt, prompt);
+});

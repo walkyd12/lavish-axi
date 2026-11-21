@@ -275,7 +275,7 @@ pnpm link
 
 ## Fusion Hub
 
-Open the server root (`/`) for every board on this relay and the peers configured by `LAVISH_AXI_HUB_PEERS`. Access is open to anyone who can reach the server; there are no logins or approval gates. Boards keep their own HTML and layout.
+Open the server root (`/`) for every board on this relay and the peers configured by `LAVISH_AXI_HUB_PEERS`. Access is open to anyone who can reach the server; there are no logins or approval gates. Boards keep their own HTML and layout. Trusted action confirmations display the submitted action text. Configure `LAVISH_AXI_APPROVAL_USERS="Reviewer=reviewer@example.com"` with exact Tailscale logins (or use `LAVISH_AXI_APPROVAL_TOKENS`); display names and login prefixes cannot authorize confirmations.
 
 The default list shows open boards. Search matches title, tags, and board text; a search or tag filter includes closed boards too. Text search reads the first 1 MiB of each local artifact, retains up to 64 KiB of text, and excludes scripts, styles, templates, and noscript content. It searches saved HTML text, not content generated later by JavaScript. Peers contribute their own bounded search text when supported; older peers still contribute titles and available metadata.
 
