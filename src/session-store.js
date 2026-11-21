@@ -15,6 +15,7 @@ import {
   queueLayoutWarnings as queueWarningRecords,
   serializeLayoutWarnings,
 } from "./layout-warnings.js";
+import { resolveAllowedArtifactFile } from "./artifact-path.js";
 import { AsyncMutex } from "./async-mutex.js";
 import {
   boundStoredChat,
@@ -183,6 +184,44 @@ export class SessionStore {
     state.sessions[key] = session;
     await this.writeState(state);
     return session;
+  }
+
+  // Metadata-only attribution repair: never creates or revives a session.
+  async fillEmptyCreator(key, patch) {
+    if (
+      !patch ||
+      typeof patch !== "object" ||
+      Array.isArray(patch) ||
+      Object.keys(patch).some((name) => !["creator", "expected_file"].includes(name)) ||
+      typeof patch.expected_file !== "string" ||
+      !path.isAbsolute(patch.expected_file)
+    )
+      throw new BoardMetadataError("Use creator and an absolute expected_file");
+    const creator = normalizeCreator(patch.creator);
+    if (!creator) throw new BoardMetadataError("Creator is required");
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      if (
+        session.status === "ended" ||
+        session.creator ||
+        session.file !== patch.expected_file ||
+        sessionKey(patch.expected_file) !== key
+      )
+        return { conflict: true };
+      // Check the stored path under the same lock as status/creator. A replaced symlink
+      // cannot redirect this write: it always addresses the original session key.
+      try {
+        if ((await resolveAllowedArtifactFile(patch.expected_file)) !== session.file) return { conflict: true };
+      } catch {
+        return { conflict: true };
+      }
+      session.creator = creator;
+      session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return session;
+    });
   }
 
   async updateBoardTags(key, patch) {

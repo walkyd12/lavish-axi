@@ -2158,6 +2158,15 @@ export async function serve({
       return;
     }
     try {
+      if (Object.hasOwn(req.body || {}, "creator") || Object.hasOwn(req.body || {}, "expected_file")) {
+        const session = await store.fillEmptyCreator(req.params.key, req.body);
+        if (!session) return void res.status(404).json({ error: "session not found" });
+        if (session.conflict) return void res.status(409).json({ error: "creator update preconditions changed" });
+        const metadata = serializeBoardMetadata(session);
+        events.emit("board-metadata", req.params.key, metadata);
+        res.json(metadata);
+        return;
+      }
       const prior = await store.findByKey(req.params.key);
       const session = await store.updateBoardTags(req.params.key, req.body);
       if (!session) return void res.status(404).json({ error: "session not found" });
