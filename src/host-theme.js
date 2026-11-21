@@ -220,6 +220,29 @@ const DAY_HUB = {
 };
 
 const PRESETS = Object.freeze({
+  minimal: Object.freeze({
+    board: Object.freeze({ ...DAY_BOARD }),
+    hub: Object.freeze({
+      ...DAY_HUB,
+      paper: "#ffffff",
+      card: "#ffffff",
+      ink: "#17191c",
+      body: "#62676d",
+      line: "#e5e7eb",
+      "line-strong": "#cbd0d6",
+      mark: "#167267",
+      "mark-text": "#12655b",
+      link: "#12655b",
+      "link-mark": "#167267",
+      well: "#f5f6f7",
+      "hero-bg": "#17191c",
+      band: "#17191c",
+      "tab-ink": "#d3d6da",
+      "tab-active": "#ffffff",
+      sans: '"Poppins", system-ui, sans-serif',
+      serif: '"Poppins", system-ui, sans-serif',
+    }),
+  }),
   night: Object.freeze({ board: Object.freeze(NIGHT_BOARD), hub: Object.freeze(NIGHT_HUB) }),
   day: Object.freeze({ board: Object.freeze(DAY_BOARD), hub: Object.freeze(DAY_HUB) }),
 });
@@ -229,13 +252,13 @@ export const HOST_THEMES = Object.freeze(Object.keys(PRESETS));
 /**
  * The preset LAVISH_AXI_THEME names, or "" for the stock look.
  * @param {NodeJS.ProcessEnv} [env]
- * @returns {"" | "night" | "day"}
+ * @returns {"" | "night" | "day" | "minimal"}
  */
 export function resolveHostTheme(env = process.env) {
   const raw = String(env[HOST_THEME_ENV] ?? "")
     .trim()
     .toLowerCase();
-  return Object.hasOwn(PRESETS, raw) ? /** @type {"night" | "day"} */ (raw) : "";
+  return Object.hasOwn(PRESETS, raw) ? /** @type {"night" | "day" | "minimal"} */ (raw) : "";
 }
 
 /**
@@ -246,7 +269,7 @@ export function resolveHostTheme(env = process.env) {
  */
 export function hostThemeTokens(theme, surface) {
   if (!Object.hasOwn(PRESETS, theme)) return null;
-  return PRESETS[/** @type {"night" | "day"} */ (theme)][surface] || null;
+  return PRESETS[/** @type {"night" | "day" | "minimal"} */ (theme)][surface] || null;
 }
 
 /**

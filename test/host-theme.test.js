@@ -89,7 +89,7 @@ function colorsIn(value) {
 }
 
 test("LAVISH_AXI_THEME selects a preset and anything else keeps the stock look", () => {
-  assert.deepEqual([...HOST_THEMES], ["night", "day"]);
+  assert.deepEqual([...HOST_THEMES], ["minimal", "night", "day"]);
   assert.equal(resolveHostTheme({}), "");
   assert.equal(resolveHostTheme({ LAVISH_AXI_THEME: "" }), "");
   assert.equal(resolveHostTheme({ LAVISH_AXI_THEME: "default" }), "");
@@ -177,13 +177,10 @@ test("hub.css keeps every colour in its :root tokens", () => {
   }
 });
 
-test("the hub header landscape draws from tokens", async () => {
+test("the hub header is solid and contains no decorative landscape", () => {
   const hub = createHubHtml({ boards: [], hostname: "schlab" });
-  const svg = hub.match(/<svg class="scape"[\s\S]*?<\/svg>/)[0];
-  const outsideMask = svg.replace(/<mask[\s\S]*?<\/mask>/, "");
-  assert.doesNotMatch(outsideMask, /(?:fill|stroke|stop-color)="#/);
-  const stock = declaredTokens(rootBlock(hubCss));
-  for (const name of usedTokens(svg)) assert.ok(stock.has(name), `hub.css declares --${name}`);
+  assert.doesNotMatch(hub, /class="scape"|linearGradient/);
+  assert.match(hub, /<header class="hero"><div class="wrap inner">/);
 });
 
 test("every colour token the chrome and SDK use follows each preset", () => {

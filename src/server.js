@@ -9,6 +9,7 @@ import { homedir, hostname as osHostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { hubArtifactSummary } from "./hub-summary.js";
 import { runApprovalPreview } from "./approval-preview.js";
 
 import chokidar from "chokidar";
@@ -79,7 +80,14 @@ import {
   sortHubBoards,
   summarizeHubBoards,
 } from "./hub.js";
-import { createNotifySettingsStore, NOTIFY_PEOPLE_ENV, NotifySettingsError } from "./notify-settings.js";
+import {
+  createNotifySettingsStore,
+  NOTIFY_PEOPLE_ENV,
+  NotifySettingsError,
+  normalizeNotifyPersonName,
+  normalizeNotifySendTo,
+} from "./notify-settings.js";
+import { createNotifyDestinations } from "./notify-destinations.js";
 import {
   createPeerBoardSource,
   HUB_PEERS_ENV,
@@ -851,10 +859,10 @@ export async function serve({
   // (no shell, detached, fire-and-forget) whenever a hub/board event occurs (board_created,
   // board_reopened, message, board_action, tag_change, board_closed, board_cancelled), receiving one
   // compact JSON payload argument so external workflows stay event-driven without polling.
-  function emitHubEvent(payload) {
+  function emitHubEvent(payload, { broadcast = true, notifySnapshot = notifySettingsStore.getSync() } = {}) {
     const base = `http://${hostForUrl(LOOPBACK_HOST)}:${publicPort}`;
     const isLocal = !payload.source;
-    const seq = isLocal ? (hubEventSeq += 1) : undefined;
+    const seq = isLocal && broadcast ? (hubEventSeq += 1) : undefined;
     const eventPayload = compactEventPayload({
       ...payload,
       ...(isLocal ? { instance_id: hubInstanceId } : {}),
@@ -870,10 +878,9 @@ export async function serve({
       const wire = JSON.stringify({ type: "hub-event", instance_id: hubInstanceId, seq, event: eventPayload });
       sendToSocketSet(hubPeerStreamClients, wire);
       sendToSocketSet(hubViewStreamClients, wire);
-    } else {
+    } else if (broadcast) {
       notifyHubViewers();
     }
-    const notifySnapshot = notifySettingsStore.getSync();
     const hookPayload = { ...eventPayload, notify_settings: notifySnapshot };
     if (typeof onEvent === "function") {
       Promise.resolve()
@@ -1316,7 +1323,7 @@ export async function serve({
   const MAX_HUB_LIMIT = 200;
   const BOARD_IO_CONCURRENCY = 32;
   const MAX_BOARD_HEAD_CACHE = 2048;
-  /** @type {Map<string, { stamp: string, title: string, searchText: string | null }>} */
+  /** @type {Map<string, { stamp: string, title: string, nextStep?: string, searchText: string | null }>} */
   const boardHeadCache = new Map();
 
   /**
@@ -1380,7 +1387,7 @@ export async function serve({
       const buffer = Buffer.allocUnsafe(toRead);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
       const html = buffer.subarray(0, bytesRead).toString("utf8");
-      const title = extractArtifactHead(html.slice(0, 64 * 1024)).title;
+      const { title, nextStep } = hubArtifactSummary(html);
       const searchText = includeSearchText
         ? boardSearchText(html).slice(0, 64 * 1024)
         : cached && cached.stamp === stamp
@@ -1390,7 +1397,7 @@ export async function serve({
         const oldestKey = boardHeadCache.keys().next().value;
         if (oldestKey !== undefined) boardHeadCache.delete(oldestKey);
       }
-      boardHeadCache.set(file, { stamp, title, searchText });
+      boardHeadCache.set(file, { stamp, title, nextStep, searchText });
       return { exists: true, title, searchText: searchText || "" };
     } catch (error) {
       return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "", searchText: "" };
@@ -1714,6 +1721,7 @@ export async function serve({
         tabs: liveClientCount(session.key),
         fileExists: facts.fileExists !== undefined ? facts.fileExists : (existsByKey.get(String(session.key)) ?? true),
         title: facts.title !== undefined ? facts.title : cachedHead?.title || "",
+        nextStep: cachedHead?.nextStep || "",
         ...(facts.includeSearchText ? { searchText: facts.searchText || "", includeSearchText: true } : {}),
         version,
         now,
@@ -1910,6 +1918,49 @@ export async function serve({
         return;
       }
       next(error);
+    }
+  });
+
+  const getNotifyDestinations = createNotifyDestinations(String(env.LAVISH_AXI_NOTIFY_DESTINATIONS || "").trim(), env);
+  app.get("/api/hub/notification-destinations", async (_req, res) => {
+    res.set("Cache-Control", "no-store").json(await getNotifyDestinations());
+  });
+  app.post("/api/hub/notifications/test", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin notification test rejected" });
+        return;
+      }
+      const person = normalizeNotifyPersonName(req.body?.person);
+      const sendTo = normalizeNotifySendTo(req.body?.send_to);
+      const settings = notifySettingsStore.getSync();
+      if (!Object.hasOwn(settings, person) || !sendTo) {
+        throw new NotifySettingsError("Choose a person and a destination first");
+      }
+      if (!onEvent && !String(env.LAVISH_AXI_ON_EVENT || process.env.LAVISH_AXI_ON_EVENT || "").trim()) {
+        res.status(503).json({ error: "Notifications are not connected on this hub yet." });
+        return;
+      }
+      const delivery = emitHubEvent(
+        {
+          event: "notify_test",
+          person,
+          send_to: sendTo,
+          reason: "test",
+          title: "Test notification",
+          url: `http://${hostForUrl(LOOPBACK_HOST)}:${publicPort}/`,
+        },
+        { broadcast: false, notifySnapshot: { ...settings, [person]: { ...settings[person], send_to: sendTo } } },
+      );
+      const launched = await delivery.launched;
+      if (!launched.ok) {
+        res.status(503).json({ error: "Could not start the notification hook. Check the server log." });
+        return;
+      }
+      res.status(202).json({ message: "Test queued. Check your destination." });
+    } catch (error) {
+      if (error instanceof NotifySettingsError) res.status(error.statusCode).json({ error: error.message });
+      else next(error);
     }
   });
 

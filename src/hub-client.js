@@ -41,6 +41,8 @@ let needsInputOnly = false;
 let showOlderBoards = false;
 let editingClient = "";
 let clientDraft = "";
+let clientEditOrigin = "";
+let clientEditIsPeer = false;
 let savingClient = false;
 let pendingClientFocus = "";
 /** @type {Set<string>} */
@@ -60,6 +62,7 @@ let wsReconnectTimer;
 let wsReconnectAttempt = 0;
 let sawWsDisconnect = false;
 let notifySaveChain = Promise.resolve();
+let notifyDestinations = [];
 
 const list = /** @type {HTMLOListElement} */ (document.getElementById("boards"));
 const moreWrap = /** @type {HTMLDivElement | null} */ (document.getElementById("hubMoreWrap"));
@@ -205,14 +208,14 @@ function isNeedsInput(board) {
 }
 
 function displayBadge(board) {
-  if (board.state === "file-gone") return { label: board.state_label || "File gone", tone: "bad" };
+  if (board.state === "file-gone") return { label: "File unavailable", tone: "bad" };
   if (isCancelled(board)) return { label: "Cancelled", tone: "muted" };
   if (board.status === "ended") return { label: "Done", tone: "muted" };
-  if (isNeedsInput(board)) return { label: "Needs input", tone: "warn" };
-  return {
-    label: board.state === "nobody" ? "Open" : board.state_label || "Open",
-    tone: board.state === "nobody" ? "muted" : board.tone || "muted",
-  };
+  if (isNeedsInput(board)) return { label: "Needs you", tone: "warn" };
+  const waiting = waitingOn(board);
+  if (waiting) return { label: "Waiting on " + waiting, tone: "warn" };
+  if (board.state === "handed-off") return { label: "Ready for review", tone: "muted" };
+  return { label: "In progress", tone: "muted" };
 }
 
 function relativeTime(iso) {
@@ -304,7 +307,6 @@ function actionsHtml(board) {
   const disabled = busy.has(board.key) ? " disabled" : "";
   const actions = [];
   if (board.state === "file-gone") {
-    actions.push(`<button type="button" class="act" data-act="history" data-key="${key}">History</button>`);
     if (board.status !== "ended") {
       actions.push(`<button type="button" class="act" data-act="close" data-key="${key}"${disabled}>Close</button>`);
       actions.push(`<button type="button" class="act" data-act="cancel" data-key="${key}"${disabled}>Cancel</button>`);
@@ -313,11 +315,9 @@ function actionsHtml(board) {
   }
   if (board.status === "ended") {
     actions.push(`<button type="button" class="act" data-act="reopen" data-key="${key}"${disabled}>Reopen</button>`);
-    actions.push(`<button type="button" class="act" data-act="history" data-key="${key}">History</button>`);
     return actions.join("");
   }
   actions.push(`<a class="act primary" href="${escapeHtml(board.url)}">Open →</a>`);
-  actions.push(`<button type="button" class="act" data-act="history" data-key="${key}">History</button>`);
   actions.push(`<button type="button" class="act" data-act="close" data-key="${key}"${disabled}>Close</button>`);
   actions.push(`<button type="button" class="act" data-act="cancel" data-key="${key}"${disabled}>Cancel</button>`);
   return actions.join("");
@@ -340,17 +340,27 @@ function waitingOn(board) {
 
 function boardHtml(board) {
   const badge = displayBadge(board);
-  const waiting = waitingOn(board);
+  const href = safeHref(board.url);
+  const waiting = isNeedsInput(board) ? waitingOn(board) : "";
   return (
     `<li class="board" data-key="${escapeHtml(board.key)}">` +
-    `<div class="board-head"><h3 class="board-title">${escapeHtml(board.title)}</h3>` +
-    `<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span></div>` +
-    `<div class="board-summary">${clientHtml(board)}<span class="activity">${escapeHtml(relativeTime(board.last_activity))}</span></div>` +
-    (waiting && !isClosed(board) ? `<p class="waiting">Waiting on ${escapeHtml(waiting)}</p>` : "") +
-    (board.source ? `<p class="meta">On ${escapeHtml(board.source)}</p>` : "") +
+    `<div class="board-head"><h3 class="board-title" title="${escapeHtml(board.title)}">${escapeHtml(board.title)}</h3></div>` +
+    `<div class="board-summary">${clientHtml(board)}<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span><span class="activity">${escapeHtml(relativeTime(board.last_activity))}</span></div>` +
+    (waiting ? `<p class="next-step">Waiting on ${escapeHtml(waiting)}</p>` : "") +
+    (board.next_step
+      ? `<p class="next-step" title="${escapeHtml(board.next_step)}">Next: ${escapeHtml(board.next_step)}</p>`
+      : "") +
     `<div class="acts">${actionsHtml(board)}</div>` +
-    `<details class="board-details"><summary>Details</summary>` +
-    (board.source ? "" : `<p class="path">${escapeHtml(board.file)}</p>`) +
+    `<details class="board-details"><summary>More info</summary>` +
+    (board.source
+      ? `<p class="meta">Hub: ${escapeHtml(board.source)}</p>`
+      : `<p class="path">${escapeHtml(board.file)}</p>`) +
+    (href
+      ? `<div class="board-link"><a href="${escapeHtml(href)}">${escapeHtml(href)}</a><button type="button" class="act" data-copy-link="${escapeHtml(href)}">Copy link</button></div>`
+      : "") +
+    (!board.source
+      ? `<button type="button" class="act" data-act="history" data-key="${escapeHtml(board.key)}">History</button>`
+      : "") +
     `<p class="meta">${escapeHtml(metaLine(board))}</p>` +
     `<div data-board-metadata="${escapeHtml(board.key)}" data-readonly="${Boolean(board.source)}" data-metadata="${escapeHtml(JSON.stringify(board))}"></div></details>` +
     `</li>`
@@ -386,8 +396,27 @@ function applyViewData(data) {
   if (typeof data.needs_you_count === "number") needsYouCount = data.needs_you_count;
 }
 
+function destinationStatus(value) {
+  const destination = notifyDestinations.find((item) => item.id === value);
+  if (destination) return { label: destination.ready ? "Ready" : "Not connected", ready: destination.ready };
+  return {
+    label: value
+      ? /^https?:\/\//i.test(value)
+        ? "URL · use Send test to check"
+        : "Custom · use Send test to check"
+      : "Choose a destination",
+    ready: false,
+  };
+}
+
+function destinationOptions(value) {
+  return `<option value="">Choose a destination…</option>${notifyDestinations.map((item) => `<option value="${escapeHtml(item.id)}"${value === item.id ? " selected" : ""}>${escapeHtml(item.label)} · ${item.ready ? "Ready" : "Not connected"}</option>`).join("")}`;
+}
+
 function notifyRowHtml(person, cfg) {
   const safeName = escapeHtml(person);
+  const index = Object.keys(notifySettings).indexOf(person);
+  const status = destinationStatus(cfg.send_to);
   return (
     `<div class="notify-row" data-notify-row="${safeName}">` +
     `<div class="notify-person-head"><strong class="notify-person-name">${safeName}</strong>` +
@@ -396,7 +425,9 @@ function notifyRowHtml(person, cfg) {
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="tagged"${cfg.tagged ? " checked" : ""}><span>When tagged</span></label>` +
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="done"${cfg.done ? " checked" : ""}><span>When board is done</span></label>` +
     `</div>` +
-    `<label class="notify-sendto"><span>Send to</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Optional destination" maxlength="256"></label>` +
+    `<label class="notify-sendto"><span>Destination</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Paste a URL or pick below" maxlength="256"></label>` +
+    `<label class="notify-sendto"><span>Suggested destinations</span><select data-notify-pick="${safeName}" aria-describedby="destination-status-${index}">${destinationOptions(cfg.send_to)}</select></label>` +
+    `<div class="destination-check"><span class="destination-status" id="destination-status-${index}" data-ready="${status.ready}">${escapeHtml(status.label)}</span><button type="button" class="act" data-notify-test="${safeName}" aria-label="Send test for ${safeName}">Send test</button></div>` +
     `</div>`
   );
 }
@@ -438,6 +469,14 @@ function renderNotificationsPanel() {
       if (temp.firstElementChild) notifyRows.appendChild(temp.firstElementChild);
       continue;
     }
+    const statusElement = existing.querySelector(".destination-status");
+    const status = destinationStatus(cfg.send_to);
+    if (statusElement) {
+      statusElement.textContent = status.label;
+      statusElement.setAttribute("data-ready", String(status.ready));
+    }
+    const picker = /** @type {HTMLSelectElement | null} */ (existing.querySelector("select[data-notify-pick]"));
+    if (picker) picker.innerHTML = destinationOptions(cfg.send_to);
     for (const input of /** @type {NodeListOf<HTMLInputElement>} */ (
       existing.querySelectorAll("input[data-notify-field]")
     )) {
@@ -493,6 +532,8 @@ function cancelLoadMore() {
 }
 
 function beginFilterTransition() {
+  editingClient = "";
+  clientDraft = "";
   filterEpoch += 1;
   filterPending = true;
   hasMore = false;
@@ -552,7 +593,7 @@ function render() {
   const searching = Boolean(query || tagFilter.value);
   const pinned = filterPending ? [] : needsYouBoards;
   const pinnedKeys = new Set(pinned.map((board) => board.key));
-  const remaining = boards.filter((board) => !pinnedKeys.has(board.key));
+  const remaining = (filterPending ? [] : boards).filter((board) => !pinnedKeys.has(board.key));
   if (pinnedList) pinnedList.innerHTML = pinned.map(boardHtml).join("");
   if (pinnedSection) pinnedSection.hidden = pinned.length === 0;
   if (pinnedHint) pinnedHint.textContent = `${needsYouTotal} ${needsYouTotal === 1 ? "board" : "boards"}`;
@@ -933,6 +974,17 @@ function setNotifyPanelOpen(open) {
     settings.showModal();
     renderNotificationsPanel();
     renderPeersPanel();
+    void fetch("/api/hub/notification-destinations", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error();
+        return response.json();
+      })
+      .then((data) => {
+        notifyDestinations = Array.isArray(data.destinations) ? data.destinations : [];
+        renderNotificationsPanel();
+        if (data.error) setNotifyStatus(data.error, true);
+      })
+      .catch(() => setNotifyStatus("Suggested destinations are unavailable. You can still paste a URL.", true));
   } else settings.close();
   settingsToggle?.setAttribute("aria-expanded", String(open));
 }
@@ -957,6 +1009,17 @@ settings?.addEventListener("click", (event) => {
 });
 
 notifyRows?.addEventListener("change", (event) => {
+  const select = /** @type {HTMLSelectElement} */ (event.target);
+  const pickedPerson = select.dataset?.notifyPick;
+  if (pickedPerson && select.value && Object.hasOwn(notifySettings, pickedPerson)) {
+    const timer = sendToSaveTimers.get(pickedPerson);
+    if (timer) clearTimeout(timer);
+    sendToSaveTimers.delete(pickedPerson);
+    notifySettings[pickedPerson] = { ...notifySettings[pickedPerson], send_to: select.value };
+    void queueNotifyMutation({ patch: { person: pickedPerson, send_to: select.value } }, { rerender: true });
+    renderNotificationsPanel();
+    return;
+  }
   const input = /** @type {HTMLInputElement | null} */ (event.target);
   const person = input?.dataset?.notifyPerson;
   const field = input?.dataset?.notifyField;
@@ -973,7 +1036,7 @@ notifyRows?.addEventListener("change", (event) => {
     }
     const cleaned = input.value.trim();
     notifySettings[person] = { ...notifySettings[person], send_to: cleaned };
-    void queueNotifyMutation({ patch: { person, send_to: cleaned } });
+    void queueNotifyMutation({ patch: { person, send_to: cleaned } }, { rerender: true });
   }
 });
 notifyRows?.addEventListener("input", (event) => {
@@ -987,11 +1050,35 @@ notifyRows?.addEventListener("input", (event) => {
   if (existingTimer) clearTimeout(existingTimer);
   const timer = setTimeout(() => {
     sendToSaveTimers.delete(person);
-    void queueNotifyMutation({ patch: { person, send_to: cleaned } });
+    void queueNotifyMutation({ patch: { person, send_to: cleaned } }, { rerender: true });
   }, SEND_TO_DEBOUNCE_MS);
   sendToSaveTimers.set(person, timer);
 });
-notifyRows?.addEventListener("click", (event) => {
+notifyRows?.addEventListener("click", async (event) => {
+  const testButton = /** @type {HTMLButtonElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("button[data-notify-test]")
+  );
+  const testPerson = testButton?.dataset.notifyTest;
+  if (testButton && testPerson && !testButton.disabled && Object.hasOwn(notifySettings, testPerson)) {
+    testButton.disabled = true;
+    const sendTo = notifySettings[testPerson].send_to;
+    try {
+      await notifySaveChain;
+      const response = await fetch("/api/hub/notifications/test", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ person: testPerson, send_to: sendTo }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not send test");
+      setNotifyStatus(data.message);
+    } catch (error) {
+      setNotifyStatus(error.message || "Could not send test", true);
+    } finally {
+      testButton.disabled = false;
+    }
+    return;
+  }
   const button = /** @type {HTMLButtonElement | null} */ (
     /** @type {HTMLElement} */ (event.target).closest?.("button[data-notify-remove]") || null
   );
@@ -1123,7 +1210,43 @@ showOlder?.addEventListener("click", () => {
 });
 pinnedMore?.addEventListener("click", () => switchTab("needs-you"));
 
-document.addEventListener("click", (event) => {
+document.addEventListener("click", async (event) => {
+  const copy = /** @type {HTMLButtonElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("[data-copy-link]")
+  );
+  if (copy) {
+    try {
+      const value = copy.dataset.copyLink || "";
+      let copied = false;
+      if (window.navigator.clipboard?.writeText) {
+        try {
+          await window.navigator.clipboard.writeText(value);
+          copied = true;
+        } catch {
+          /* Fall back for plain-http origins and denied clipboard permissions. */
+        }
+      }
+      if (!copied) {
+        const textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.setAttribute("aria-label", "Board link");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        try {
+          textarea.select();
+          if (!document.execCommand("copy")) throw new Error("Copy unavailable");
+        } finally {
+          textarea.remove();
+          copy.focus();
+        }
+      }
+      copy.textContent = "Copied";
+    } catch {
+      showNote("Copy is unavailable here. Select the link in More info to copy it.", "error");
+    }
+    return;
+  }
   const button = /** @type {HTMLElement | null} */ (
     /** @type {HTMLElement} */ (event.target).closest?.("[data-client-edit], [data-client-cancel]")
   );
@@ -1137,6 +1260,8 @@ document.addEventListener("click", (event) => {
   const board = [...boards, ...needsYouBoards].find((item) => item.key === button.dataset.clientEdit);
   if (!board) return;
   editingClient = board.key;
+  clientEditOrigin = board.peer_origin || "";
+  clientEditIsPeer = Boolean(board.source);
   clientDraft = board.client || "";
   render();
   const input = /** @type {HTMLInputElement | null} */ (document.querySelector(".client-edit input"));
@@ -1161,14 +1286,22 @@ document.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (savingClient) return;
   const board = [...boards, ...needsYouBoards].find((item) => item.key === form.dataset.clientKey);
-  if (!board) return;
+  if (!board) {
+    editingClient = "";
+    render();
+    showNote("This board is no longer in this view. Refresh to edit it.", "error");
+    return;
+  }
   savingClient = true;
   render();
   try {
     const response = await fetch(`/api/${encodeURIComponent(board.key)}/metadata`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ client: clientDraft.trim(), ...(board.source ? { peer_origin: board.peer_origin } : {}) }),
+      body: JSON.stringify({
+        client: clientDraft.trim(),
+        ...(clientEditIsPeer ? { peer_origin: clientEditOrigin } : {}),
+      }),
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Could not save client");

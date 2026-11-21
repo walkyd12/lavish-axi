@@ -411,6 +411,7 @@ export function serializePeerBoard(peer, board) {
     source: peer.name,
     file: "",
     title: text(board.title, 200) || "Untitled board",
+    next_step: text(board.next_step, 240),
     url: `${peer.origin}/session/${board.key}`,
     status,
     ended_by: status === "ended" ? (board.ended_by === "user" ? "user" : "agent") : null,
