@@ -63,29 +63,45 @@ export function parseHubPeers(raw) {
       errors.push(`${HUB_PEERS_ENV}: peer "${name}" is listed twice`);
       continue;
     }
-    let url;
+    let peer;
     try {
-      url = new URL(value);
-    } catch {
-      errors.push(`${HUB_PEERS_ENV}: peer "${name}" has an invalid URL`);
-      continue;
-    }
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      errors.push(`${HUB_PEERS_ENV}: peer "${name}" must use http or https`);
-      continue;
-    }
-    if (url.username || url.password) {
-      errors.push(`${HUB_PEERS_ENV}: peer "${name}" must not carry credentials in its URL`);
-      continue;
-    }
-    if ((url.pathname && url.pathname !== "/") || url.search || url.hash) {
-      errors.push(`${HUB_PEERS_ENV}: peer "${name}" must be a bare origin; Lavish serves from the root of its host`);
+      peer = validateHubPeer(name, value);
+    } catch (error) {
+      errors.push(error.message);
       continue;
     }
     seen.add(name.toLowerCase());
-    peers.push({ name, origin: url.origin });
+    peers.push(peer);
   }
   return { peers, errors };
+}
+
+/** Validate a single peer using the same rules for persisted settings and env seeds.
+ * @param {unknown} rawName
+ * @param {unknown} rawOrigin
+ * @returns {HubPeer}
+ */
+export function validateHubPeer(rawName, rawOrigin) {
+  const name = typeof rawName === "string" ? rawName.trim() : "";
+  const value = typeof rawOrigin === "string" ? rawOrigin.trim() : "";
+  if (!PEER_NAME.test(name))
+    throw new Error("Hub name needs 1–32 letters, digits, - or _, starting with a letter or digit");
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${HUB_PEERS_ENV}: peer "${name}" has an invalid URL`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`${HUB_PEERS_ENV}: peer "${name}" must use http or https`);
+  }
+  if (url.username || url.password) {
+    throw new Error(`${HUB_PEERS_ENV}: peer "${name}" must not carry credentials in its URL`);
+  }
+  if ((url.pathname && url.pathname !== "/") || url.search || url.hash) {
+    throw new Error(`${HUB_PEERS_ENV}: peer "${name}" must be a bare origin; Lavish serves from the root of its host`);
+  }
+  return { name, origin: url.origin };
 }
 
 /** @param {string} key */
@@ -401,11 +417,11 @@ async function readCapped(response, maxBytes) {
  * carries nothing from the viewer - no cookies, no forwarded headers - and does not follow redirects.
  *
  * @param {HubPeer} peer
- * @param {{ timeoutMs?: number, maxBytes?: number, fetchImpl?: typeof fetch }} [options]
+ * @param {{ timeoutMs?: number, maxBytes?: number, fetchImpl?: typeof fetch, signal?: AbortSignal }} [options]
  */
 export async function fetchPeerBoards(
   peer,
-  { timeoutMs = PEER_TIMEOUT_MS, maxBytes = PEER_MAX_BYTES, fetchImpl = fetch } = {},
+  { timeoutMs = PEER_TIMEOUT_MS, maxBytes = PEER_MAX_BYTES, fetchImpl = fetch, signal } = {},
 ) {
   try {
     // `peers=0` asks the peer for its own boards only, so two hubs that list each other never loop.
@@ -413,7 +429,7 @@ export async function fetchPeerBoards(
       headers: { accept: "application/json" },
       redirect: "error",
       credentials: "omit",
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) {
       await response.body?.cancel().catch(() => {});
@@ -467,6 +483,8 @@ export function createPeerBoardSource(
   const inFlight = new Map();
   /** @type {Map<string, number>} */
   const invalidateSeq = new Map();
+  /** @type {Map<string, AbortController>} */
+  const controllers = new Map();
 
   /** @param {HubPeer} peer */
   function startOrJoinScrape(peer) {
@@ -474,7 +492,12 @@ export function createPeerBoardSource(
     const existing = inFlight.get(key);
     if (existing) return existing;
     const seqAtStart = invalidateSeq.get(key) || 0;
-    const task = fetchPeerBoards(peer, { timeoutMs, fetchImpl }).then((result) => {
+    const controller = new AbortController();
+    controllers.set(key, controller);
+    const task = fetchPeerBoards(peer, { timeoutMs, fetchImpl, signal: controller.signal }).then((result) => {
+      // Removed/replaced peers cannot repopulate caches or notify viewers after their scrape ends.
+      if (controllers.get(key) !== controller) return { peer, ...result };
+      controllers.delete(key);
       inFlight.delete(key);
       const invalidatedDuringFetch = (invalidateSeq.get(key) || 0) !== seqAtStart;
       if (result.ok) {
@@ -536,14 +559,16 @@ export function createPeerBoardSource(
       }),
     );
     return {
-      boards: results.flatMap((result) => result.boards),
-      peers: results.map((result) => ({
-        name: result.peer.name,
-        url: result.peer.origin,
-        ok: result.ok,
-        ...(result.pending ? { pending: true } : {}),
-        error: result.error || null,
-      })),
+      boards: results.filter((result) => peers.includes(result.peer)).flatMap((result) => result.boards),
+      peers: results
+        .filter((result) => peers.includes(result.peer))
+        .map((result) => ({
+          name: result.peer.name,
+          url: result.peer.origin,
+          ok: result.ok,
+          ...(result.pending ? { pending: true } : {}),
+          error: result.error || null,
+        })),
     };
   };
   /** @param {string} [peerName] */
@@ -567,6 +592,24 @@ export function createPeerBoardSource(
     for (const candidate of failed.keys()) {
       if (candidate.toLowerCase() === key) failed.delete(candidate);
     }
+  };
+  /** Replace configuration while keeping unchanged peers' caches and backoff. @param {HubPeer[]} next */
+  collect.setPeers = (next) => {
+    const retained = next.map(
+      (peer) => peers.find((old) => old.name === peer.name && old.origin === peer.origin) || peer,
+    );
+    for (const peer of peers) {
+      if (retained.includes(peer)) continue;
+      const key = peer.name.toLowerCase();
+      const controller = controllers.get(key);
+      controllers.delete(key);
+      controller?.abort();
+      inFlight.delete(key);
+      cached.delete(key);
+      failed.delete(peer.name);
+      invalidateSeq.delete(key);
+    }
+    peers = retained;
   };
   return collect;
 }
