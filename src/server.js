@@ -20,6 +20,7 @@ import {
   boardVersionBehind,
   filterHubBoards,
   normalizeCreator,
+  normalizeClient,
   serializeBoardMetadata,
 } from "./board-metadata.js";
 import {
@@ -70,6 +71,8 @@ import { normalizePromptAuthor, serializeChat, serializeChatAckIds, serializeCha
 import { OwnerStatusError, serializeOwnerStatus } from "./owner-status.js";
 import {
   boardTitle,
+  boardNeedsYou,
+  hubViewerNames,
   conversationMarkdown,
   createHubHtml,
   serializeHubBoard,
@@ -83,6 +86,7 @@ import {
   isPeerKey,
   PEER_MAX_BOARDS,
   relayPeerHubAction,
+  relayPeerBoardClient,
   resolvePeerBoardTarget,
   sanitizePeerHubEvent,
 } from "./hub-peers.js";
@@ -1626,6 +1630,28 @@ export async function serve({
   }
 
   const HUB_INITIAL_PEER_WAIT_MS = 80;
+  // Whois runs after first paint. Never let a slow identity probe hold GET /.
+  const hubViewers = new Map();
+  function cachedHubViewer(req) {
+    return hubViewers.get(normalizeRemoteIp(req.socket?.remoteAddress)) || [];
+  }
+  app.get("/api/hub/viewer", async (req, res) => {
+    const ip = normalizeRemoteIp(req.socket?.remoteAddress);
+    let viewer = [];
+    if (ip && !isOwnServerIp(ip) && typeof whoisPeer === "function") {
+      try {
+        const identity = await whoisPeer(ip, req.socket?.remotePort);
+        viewer = hubViewerNames(identity, resolvedApprovalUsers);
+      } catch {
+        /* Unknown identity uses the needs-input fallback. */
+      }
+    }
+    // Bound the cache; identity remains a display preference, never authorization.
+    if (hubViewers.size >= 256) hubViewers.clear();
+    hubViewers.set(ip, viewer);
+    res.setHeader("cache-control", "no-store");
+    res.json({ viewer });
+  });
 
   /**
    * @param {{
@@ -1635,6 +1661,11 @@ export async function serve({
    *   query?: string,
    *   tag?: string,
    *   state?: string,
+   *   client?: string,
+   *   person?: string,
+   *   needsInput?: boolean,
+   *   recent?: boolean,
+   *   viewer?: string[],
    *   limit?: number,
    *   offset?: number,
    * }} [options]
@@ -1646,6 +1677,11 @@ export async function serve({
     query = "",
     tag = "",
     state = "",
+    client = "",
+    person = "",
+    needsInput = false,
+    recent = false,
+    viewer = [],
     limit = DEFAULT_HUB_LIMIT,
     offset = 0,
   } = {}) {
@@ -1689,13 +1725,19 @@ export async function serve({
       ? remote.boards.map((board) => ({ ...board, version_behind: boardVersionBehind(board, version) }))
       : [];
     const sortedAll = sortHubBoards([...localSkeletons, ...remoteBoards]);
-    const summary = summarizeHubBoards(sortedAll);
+    const summary = {
+      ...summarizeHubBoards(sortedAll),
+      people: [...new Set([...Object.keys(notifySettingsStore.getSync()), ...resolvedApprovalUsers.keys()])],
+    };
+    const needsYou = sortedAll.filter((board) => boardNeedsYou(board, viewer));
+    const extraFilters = { client, person, needsInput, recent, now };
+    const sourceBoards = state === "needs-you" ? needsYou : sortedAll;
 
     const cleanQuery = String(query || "").trim();
     const cleanTag = String(tag || "").trim();
-    const cleanState = String(state || "").trim();
+    const cleanState = state === "needs-you" ? "open" : String(state || "").trim();
 
-    let candidates = filterHubBoards(sortedAll, { query: "", tag: cleanTag, state: cleanState });
+    let candidates = filterHubBoards(sourceBoards, { query: "", tag: cleanTag, state: cleanState, ...extraFilters });
     let filtered;
     if (cleanQuery) {
       const hydrated = await mapLimit(candidates, BOARD_IO_CONCURRENCY, async (board) => {
@@ -1710,7 +1752,9 @@ export async function serve({
           includeSearchText: true,
         });
       });
-      filtered = sortHubBoards(filterHubBoards(hydrated, { query: cleanQuery, tag: cleanTag, state: cleanState }));
+      filtered = sortHubBoards(
+        filterHubBoards(hydrated, { query: cleanQuery, tag: cleanTag, state: cleanState, ...extraFilters }),
+      );
     } else {
       filtered = candidates;
     }
@@ -1746,6 +1790,10 @@ export async function serve({
       }
       return {
         boards: peerSlice,
+        needs_you: [],
+        needs_you_total: 0,
+        needs_you_count: 0,
+        viewer: [],
         peers: [],
         ...summary,
         total: filtered.length,
@@ -1767,8 +1815,21 @@ export async function serve({
       });
     }
     const publicBoards = pageSlice.map(stripBoardSearchText);
+    const attention = filtered.filter((board) => boardNeedsYou(board, viewer));
+    const pageByKey = new Map(publicBoards.map((board) => [board.key, board]));
+    const pinned = await mapLimit(attention.slice(0, DEFAULT_HUB_LIMIT), BOARD_IO_CONCURRENCY, async (board) => {
+      if (pageByKey.has(board.key)) return pageByKey.get(board.key);
+      if (board.source || cleanQuery) return stripBoardSearchText(board);
+      const session = sessionByKey.get(board.key);
+      const head = await readBoardHead(session.file);
+      return buildLocalBoard(session, { fileExists: head.exists, title: head.title });
+    });
     return {
       boards: publicBoards,
+      needs_you: pinned,
+      needs_you_total: attention.length,
+      needs_you_count: needsYou.length,
+      viewer,
       peers: remote ? remote.peers : [],
       ...summary,
       total,
@@ -1779,7 +1840,7 @@ export async function serve({
     };
   }
 
-  app.get("/", async (_req, res, next) => {
+  app.get("/", async (req, res, next) => {
     try {
       res.setHeader("x-frame-options", "DENY");
       res.setHeader("content-security-policy", "frame-ancestors 'none'");
@@ -1787,6 +1848,7 @@ export async function serve({
         includePeers: true,
         maxPeerWaitMs: HUB_INITIAL_PEER_WAIT_MS,
         state: "open",
+        viewer: cachedHubViewer(req),
         limit: DEFAULT_HUB_LIMIT,
         offset: 0,
       });
@@ -1803,6 +1865,19 @@ export async function serve({
           hasMore: view.has_more,
           notifySettings: notifySettingsStore.getSync(),
           hostname: osHostname(),
+          title: String(env.LAVISH_AXI_HUB_TITLE || "")
+            .trim()
+            .slice(0, 120),
+          needsYou: view.needs_you,
+          needsYouTotal: view.needs_you_total,
+          needsYouCount: view.needs_you_count,
+          clients: view.clients,
+          people: view.people,
+          viewer: view.viewer,
+          identifyViewer: Boolean(
+            normalizeRemoteIp(req.socket?.remoteAddress) &&
+            !isOwnServerIp(normalizeRemoteIp(req.socket?.remoteAddress)),
+          ),
           theme,
         }),
       );
@@ -1895,6 +1970,11 @@ export async function serve({
         query: String(req.query.q || ""),
         tag: String(req.query.tag || ""),
         state: String(req.query.state || ""),
+        client: String(req.query.client || ""),
+        person: String(req.query.person || ""),
+        needsInput: req.query.needs_input === "1",
+        recent: req.query.recent === "1",
+        viewer: cachedHubViewer(req),
         limit: parseHubLimit(req.query.limit),
         offset: parseHubOffset(req.query.offset),
       });
@@ -2217,11 +2297,47 @@ export async function serve({
       res.status(403).json({ error: "cross-origin metadata write rejected" });
       return;
     }
-    if (isPeerKey(req.params.key)) {
-      res.status(400).json({ error: "edit a peer board on its own server" });
-      return;
-    }
     try {
+      if (Object.hasOwn(req.body || {}, "client")) {
+        const isPeer = isPeerKey(req.params.key);
+        if (Object.keys(req.body).some((field) => !["client", ...(isPeer ? ["peer_origin"] : [])].includes(field))) {
+          throw new BoardMetadataError("Use an exclusive client patch");
+        }
+        const client = normalizeClient(req.body.client);
+        if (isPeer) {
+          const target = resolvePeerBoardTarget(req.params.key, configuredPeers);
+          if (!target) return void res.status(404).json({ error: "peer board not found" });
+          if (req.body.peer_origin !== target.peer.origin)
+            return void res.status(409).json({ error: "peer hub changed; refresh before trying again" });
+          const relayed = await relayPeerBoardClient(target.peer, target.peerKey, client, hubPeerOptions);
+          if (relayed.ok) collectPeerBoards.invalidate(target.peer.name);
+          res.status(relayed.status).json(relayed.payload);
+          return;
+        }
+        const session = await store.updateBoardClient(req.params.key, client);
+        if (!session) return void res.status(404).json({ error: "session not found" });
+        const metadata = serializeBoardMetadata(session);
+        events.emit("board-metadata", req.params.key, metadata);
+        if (session.client_changed) {
+          const { title } = await readBoardHead(session.file);
+          emitHubEvent({
+            event: "tag_change",
+            key: req.params.key,
+            file: session.file,
+            url: session.url,
+            title: boardTitle(session, title),
+            creator: session.creator || "",
+            tags: metadata.tags,
+            client: metadata.client,
+            previous_client: session.previous_client,
+            added: [],
+            removed: [],
+          });
+        }
+        res.json(metadata);
+        return;
+      }
+      if (isPeerKey(req.params.key)) return void res.status(400).json({ error: "edit a peer board on its own server" });
       if (Object.hasOwn(req.body || {}, "creator") || Object.hasOwn(req.body || {}, "expected_file")) {
         const session = await store.fillEmptyCreator(req.params.key, req.body);
         if (!session) return void res.status(404).json({ error: "session not found" });

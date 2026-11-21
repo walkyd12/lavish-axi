@@ -169,6 +169,7 @@ export function sanitizePeerHubEvent(peer, rawEvent) {
     url: `${peer.origin}/session/${rawKey}`,
     title: text(rawEvent.title, 200) || "Untitled board",
     creator: text(rawEvent.creator, 120),
+    client: text(rawEvent.client, 64),
     tags,
     cancelled,
     ended_by: rawEvent.ended_by === "user" ? "user" : rawEvent.ended_by === "agent" ? "agent" : null,
@@ -181,6 +182,7 @@ export function sanitizePeerHubEvent(peer, rawEvent) {
     out.peer_instance = text(rawEvent.instance_id.trim(), 64);
   }
   if (event === "tag_change") {
+    if (typeof rawEvent.previous_client === "string") out.previous_client = text(rawEvent.previous_client, 64);
     out.added = sanitizeTagList(rawEvent.added);
     out.removed = sanitizeTagList(rawEvent.removed);
   }
@@ -307,6 +309,40 @@ export async function relayPeerHubAction(
   }
 }
 
+/** Relay only a bounded client patch to a configured peer, with no viewer credentials. */
+export async function relayPeerBoardClient(
+  peer,
+  peerKey,
+  client,
+  { timeoutMs = PEER_TIMEOUT_MS, fetchImpl = fetch } = {},
+) {
+  if (!BOARD_KEY.test(peerKey)) return { ok: false, status: 400, payload: { error: "invalid peer key" } };
+  try {
+    const response = await fetchOnceOrRetryStaleSocket(
+      fetchImpl,
+      `${peer.origin}/api/${encodeURIComponent(peerKey)}/metadata`,
+      {
+        method: "PUT",
+        headers: { accept: "application/json", "content-type": "application/json", origin: peer.origin },
+        body: JSON.stringify({ client }),
+        redirect: "error",
+        credentials: "omit",
+        signal: AbortSignal.timeout(timeoutMs),
+      },
+    );
+    const parsed = JSON.parse(await readCapped(response, 64 * 1024));
+    if (!response.ok)
+      return {
+        ok: false,
+        status: response.status,
+        payload: { error: text(parsed?.error, 200) || "Could not save client on connected hub" },
+      };
+    return { ok: true, status: 200, payload: { client: text(parsed?.client, 64) } };
+  } catch {
+    return { ok: false, status: 502, payload: { error: "Connected hub is not answering" } };
+  }
+}
+
 function text(value, max) {
   if (typeof value !== "string") return "";
   // eslint-disable-next-line no-control-regex
@@ -366,6 +402,7 @@ export function serializePeerBoard(peer, board) {
     peer_origin: peer.origin,
     tags,
     creator: text(board.creator, 120),
+    client: text(board.client, 64),
     created_version: text(board.created_version, 40),
     served_version: text(board.served_version, 40),
     closed: status === "ended",

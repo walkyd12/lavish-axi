@@ -2,7 +2,13 @@ import crypto from "node:crypto";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { BoardMetadataError, normalizeCreator, normalizeTags, serializeBoardMetadata } from "./board-metadata.js";
+import {
+  BoardMetadataError,
+  normalizeCreator,
+  normalizeClient,
+  normalizeTags,
+  serializeBoardMetadata,
+} from "./board-metadata.js";
 import {
   applyDiagnosticPass,
   dismissLayoutWarning as dismissWarningRecord,
@@ -139,6 +145,7 @@ export class SessionStore {
       status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
       tags: serializeBoardMetadata(existing).tags,
       creator: existing.creator || creator,
+      client: existing.client || "",
       created_version: existing.created_version || (!existing.key ? version : ""),
       served_version: version || existing.served_version || "",
       pending_prompts: existing.pending_prompts || 0,
@@ -221,6 +228,23 @@ export class SessionStore {
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
       return session;
+    });
+  }
+
+  async updateBoardClient(key, value) {
+    const client = normalizeClient(value);
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      const previous_client = session.client || "";
+      const client_changed = previous_client !== client;
+      if (client_changed) {
+        session.client = client;
+        session.updated_at = new Date().toISOString();
+        await this.writeState(state);
+      }
+      return { ...session, previous_client, client_changed };
     });
   }
 

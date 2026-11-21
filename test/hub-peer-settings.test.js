@@ -47,7 +47,7 @@ test("connected hubs seed once, validate same-origin writes, apply live and pers
     const html = await fetch(base).then((r) => r.text());
     assert.match(html, /Connected hubs/);
     assert.match(html, /id="peerPanel"[^>]*>/);
-    assert.doesNotMatch(html, /id="peerPanel"[^>]*hidden/);
+    assert.match(html, /id="peerPanel"[^>]*hidden/);
     assert.equal(
       (await post(base, { add: { name: "remote", origin: peerBase } }, "https://foreign.example")).status,
       403,

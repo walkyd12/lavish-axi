@@ -110,6 +110,23 @@ export function serializeHubBoard(session, facts = {}) {
   };
 }
 
+// Personalization only: these names never grant approval authority.
+export function hubViewerNames(whois, approvalUsers) {
+  const login = String(whois?.loginName || "")
+    .trim()
+    .toLowerCase();
+  if (!login) return [];
+  return [...new Set([login, ...[...approvalUsers].filter(([, aliases]) => aliases.has(login)).map(([name]) => name)])];
+}
+
+export function boardNeedsYou(board, viewer = []) {
+  if (board.status === "ended" || board.state === "file-gone" || board.cancelled) return false;
+  const names = new Set(viewer.map((name) => String(name).toLowerCase()));
+  return (board.tags || []).some(
+    (tag) => String(tag).toLowerCase() === "needs-input" || names.has(String(tag).toLowerCase()),
+  );
+}
+
 function stateSortRank(state) {
   if (state === "taking-input") return 0;
   if (state === "unread") return 1;
@@ -169,6 +186,9 @@ export function summarizeHubBoards(boards) {
   return {
     counts: { open, needs_input: needsInput, closed, cancelled },
     open_summary: { listening, unread, nobody },
+    clients: [...new Set(boards.map((board) => String(board.client || "")).filter(Boolean))].sort((a, b) =>
+      a.localeCompare(b),
+    ),
     tags: [...tagMap.values()].sort((a, b) => a.localeCompare(b)),
   };
 }
@@ -280,6 +300,14 @@ function markHtml(mark) {
  *   hasMore?: boolean,
  *   notifySettings?: Record<string, { tagged: boolean, done: boolean, send_to: string }>,
  *   hostname: string,
+ *   title?: string,
+ *   needsYou?: any[],
+ *   needsYouTotal?: number,
+ *   needsYouCount?: number,
+ *   clients?: string[],
+ *   people?: string[],
+ *   viewer?: string[],
+ *   identifyViewer?: boolean,
  *   generatedAt?: string,
  *   theme?: string,
  * }} data
@@ -296,6 +324,14 @@ export function createHubHtml({
   hasMore = false,
   notifySettings = undefined,
   hostname,
+  title = "",
+  needsYou = [],
+  needsYouTotal = 0,
+  needsYouCount = 0,
+  clients = [],
+  people = [],
+  viewer = [],
+  identifyViewer = false,
   generatedAt = new Date().toISOString(),
   theme = "",
 }) {
@@ -303,6 +339,13 @@ export function createHubHtml({
   const themed = hostThemeMarkup(theme, "hub");
   const bootstrap = jsonScript({
     boards,
+    needs_you: needsYou,
+    needs_you_total: needsYouTotal,
+    needs_you_count: needsYouCount,
+    clients,
+    people,
+    viewer,
+    identify_viewer: identifyViewer,
     peers,
     ...(counts ? { counts } : {}),
     ...(openSummary ? { open_summary: openSummary } : {}),
@@ -320,29 +363,36 @@ export function createHubHtml({
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>${escapeHtml(mark.accent + mark.rest)} boards · Lavish</title>
+<title>${escapeHtml(title || mark.accent + mark.rest)} boards · Lavish</title>
 ${HUB_FONTS}
 <link rel="stylesheet" href="/board-metadata.css">
 <link rel="stylesheet" href="/hub.css">
 ${themed.style}
 </head>
 <body>
-<header class="hero">${HUB_SCAPE}<div class="wrap inner"><div class="topline">${markHtml(mark)}<div class="topline-right"><span class="pill" id="hubPill" role="status">Loading…</span><button type="button" class="notify-toggle" id="peerToggle" aria-expanded="true" aria-controls="peerPanel">Connected hubs</button><button type="button" class="notify-toggle" id="notifyToggle" aria-expanded="false" aria-controls="notifyPanel">${GEAR_ICON}<span>Notifications</span></button></div></div><p class="kicker">Fusion Hub</p><h1>Your boards.</h1><p class="lede" id="hubLede">Every review this server knows, and who is there to read what you send.</p></div></header>
-<div class="ctaband"><div class="wrap"><nav class="tabs" aria-label="Boards"><button type="button" class="tab" id="tabOpen" aria-pressed="true">Open <span id="countOpen">0</span></button><button type="button" class="tab" id="tabNeedsInput" aria-pressed="false">Needs input <span id="countNeedsInput">0</span></button><button type="button" class="tab" id="tabClosed" aria-pressed="false">Closed <span id="countClosed">0</span></button><button type="button" class="tab" id="tabCancelled" aria-pressed="false">Cancelled <span id="countCancelled">0</span></button></nav></div></div>
+<header class="hero">${HUB_SCAPE}<div class="wrap inner"><div class="topline">${title ? `<span class="mark">${escapeHtml(title)}</span>` : markHtml(mark)}<button type="button" class="notify-toggle" id="settingsToggle" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="hubSettings">${GEAR_ICON}<span>Settings</span></button></div><h1>Your boards.</h1><p class="lede" id="hubLede">Open a board to review it or send a message.</p><span class="pill" id="hubPill" role="status" hidden></span></div></header>
+<div class="ctaband"><div class="wrap"><nav class="tabs" aria-label="Boards"><button type="button" class="tab" id="tabOpen" aria-pressed="true">Open <span id="countOpen">0</span></button><button type="button" class="tab" id="tabNeedsInput" aria-pressed="false">Needs you <span id="countNeedsInput">0</span></button><button type="button" class="tab" id="tabClosed" aria-pressed="false">Closed</button><button type="button" class="tab" id="tabCancelled" aria-pressed="false">Cancelled</button></nav></div></div>
 <main class="wrap">
-<div class="hub-settings">
-<section class="notify-panel" id="notifyPanel" aria-labelledby="notifyHeading" hidden><div class="notify-head"><div><p class="eyebrow">Event hook settings</p><h2 id="notifyHeading">Notifications</h2></div><button type="button" class="close-x" id="notifyClose" aria-label="Close notifications">×</button></div><p class="meta notify-copy">Choose who gets notified when tagged or when a board is marked done.</p><div class="notify-rows" id="notifyRows"></div><p class="meta" id="notifyEmpty" hidden>No people added yet.</p><form class="notify-add" id="notifyAddForm"><input id="notifyAddInput" name="person" type="text" placeholder="Add person" aria-label="Add person" maxlength="64" required><button type="submit" class="act primary">Add person</button></form><p class="meta notify-status" id="notifyStatus" role="status" hidden></p></section>
-<section class="notify-panel" id="peerPanel" aria-labelledby="peerHeading"><div class="notify-head"><h2 id="peerHeading">Connected hubs</h2></div><p class="meta notify-copy">Bring boards from other Lavish hubs into this list.</p><div class="notify-rows" id="peerRows"></div><form class="notify-add peer-add" id="peerAddForm"><label>Hub name<input id="peerName" name="name" type="text" placeholder="team-hub" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,31}" required></label><label>Hub URL<input id="peerOrigin" name="origin" type="url" placeholder="http://host:4388" maxlength="2048" required></label><button type="submit" class="act primary" id="peerAdd">Add hub</button></form><p class="meta notify-status" id="peerStatus" role="status" hidden></p></section>
-</div>
-<div class="hub-search"><label>Search boards<input id="hubSearch" type="search" placeholder="Title, tag or board text" aria-describedby="searchHint"></label><label>Filter by tag<select id="hubTag"><option value="">All tags</option></select></label></div>
-<p class="meta" id="searchHint">Search and tag filters include open and closed boards from every relay.</p>
+<div class="hub-search"><label>Search boards<input id="hubSearch" type="search" placeholder="Search titles, clients, tags or text" aria-describedby="searchHint"></label><label class="include-closed"><input id="includeClosed" type="checkbox">Include closed</label></div>
+<div class="filter-chips" id="hubFilters" aria-label="Filter boards"></div>
+<details class="more-filters"><summary>More tags</summary><label>Filter by tag<select id="hubTag"><option value="">All tags</option></select></label></details>
+<p class="meta" id="searchHint" role="status" aria-live="polite"></p>
 <p class="note" id="hubNote" role="status" hidden></p>
 <p class="note" id="peerNote" data-tone="offline" role="status" hidden></p>
+<section id="needsYouSection" aria-labelledby="needsYouHeading" hidden><div class="section-head"><h2 id="needsYouHeading">Needs you</h2><span class="meta" id="needsYouHint"></span></div><ol class="boards" id="needsYouBoards"></ol><button type="button" class="act primary" id="needsYouMore" hidden>See all that need you</button></section>
+<h2 class="list-heading" id="boardListHeading">Open boards</h2>
 <ol class="boards" id="boards" aria-live="polite"></ol>
 <div class="load-more-wrap" id="hubMoreWrap" hidden><button type="button" class="act primary" id="hubMore">Load more</button></div>
 <p class="empty" id="hubEmpty" hidden></p>
+<button type="button" class="act" id="showOlder" hidden>Show older boards</button>
+<datalist id="clientSuggestions"></datalist>
 <p class="foot">Updated <span id="hubUpdated"></span>. Close keeps the board's file and its conversation; Reopen brings it back. Lavish Editor</p>
 </main>
+<dialog class="settings-drawer" id="hubSettings" aria-labelledby="settingsHeading"><div class="history-head"><h2 id="settingsHeading">Settings</h2><button type="button" class="close-x" id="settingsClose" aria-label="Close settings">×</button></div><nav class="settings-tabs" aria-label="Settings sections"><button type="button" id="settingsNotifications" aria-pressed="true" aria-controls="notifyPanel">Notifications</button><button type="button" id="settingsPeers" aria-pressed="false" aria-controls="peerPanel">Connected hubs</button></nav><div class="hub-settings">
+<section class="notify-panel" id="notifyPanel" aria-labelledby="notifyHeading"><div class="notify-head"><div><h2 id="notifyHeading">Notifications</h2></div></div><p class="meta notify-copy">Choose who gets notified when tagged or when a board is marked done.</p><div class="notify-rows" id="notifyRows"></div><p class="meta" id="notifyEmpty" hidden>No people added yet.</p><form class="notify-add" id="notifyAddForm"><input id="notifyAddInput" name="person" type="text" placeholder="Add person" aria-label="Add person" maxlength="64" required><button type="submit" class="act primary">Add person</button></form><p class="meta notify-status" id="notifyStatus" role="status" hidden></p></section>
+<section class="notify-panel" id="peerPanel" aria-labelledby="peerHeading" hidden><div class="notify-head"><h2 id="peerHeading">Connected hubs</h2></div><p class="meta notify-copy">Bring boards from other Lavish hubs into this list.</p><div class="notify-rows" id="peerRows"></div><form class="notify-add peer-add" id="peerAddForm"><label>Hub name<input id="peerName" name="name" type="text" placeholder="team-hub" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,31}" required></label><label>Hub URL<input id="peerOrigin" name="origin" type="url" placeholder="http://host:4388" maxlength="2048" required></label><button type="submit" class="act primary" id="peerAdd">Add hub</button></form><p class="meta notify-status" id="peerStatus" role="status" hidden></p></section>
+</div>
+</dialog>
 <dialog class="history" id="history" aria-labelledby="historyTitle"><div class="history-head"><div><p class="eyebrow">Conversation</p><h2 id="historyTitle"></h2></div><button type="button" class="close-x" id="historyClose" aria-label="Close conversation">×</button></div><div class="history-body" id="historyBody"></div></dialog>
 <script id="hub-data" type="application/json">${bootstrap}</script>
 <script src="/board-metadata-client.js"></script>
