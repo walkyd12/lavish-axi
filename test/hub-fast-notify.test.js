@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -16,7 +16,7 @@ test("hub omits search_text on / and /api/hub, paginates Open newest-first with 
   const peer = await serve({
     port: 0,
     hosts: ["127.0.0.1"],
-    stateFile: path.join(dir, "peer.json"),
+    stateFile: path.join(dir, "peer", "state.json"),
     version: "0.1.96",
   });
   const peerBase = `http://127.0.0.1:${peer.port}`;
@@ -462,7 +462,15 @@ test("a slow or timing-out peer never holds GET / past the short initial budget 
     assert.ok(coldElapsed < 500, `expected cold GET / < 500ms despite 1600ms peer, got ${coldElapsed.toFixed(1)}ms`);
 
     // Wait for background scrape to warm cache, then invalidate cache and stall peer again!
-    const fullHub = await fetch(`${base}/api/hub`).then((r) => r.json());
+    const apiStart = performance.now();
+    await fetch(`${base}/api/hub`).then((r) => r.json());
+    assert.ok(performance.now() - apiStart < 500, "browser API also stays fast with a slow peer");
+    let fullHub;
+    const deadline = Date.now() + 3_000;
+    do {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      fullHub = await fetch(`${base}/api/hub`).then((r) => r.json());
+    } while (!fullHub.boards.some((b) => b.title === "Delayed Peer Board") && Date.now() < deadline);
     assert.ok(fullHub.boards.some((b) => b.title === "Delayed Peer Board"));
 
     // Create a real Lavish peer, warm its live-stream cache on central, then proxy through a stalling forwarder
@@ -477,7 +485,7 @@ test("a slow or timing-out peer never holds GET / past the short initial budget 
     const realPeer = await serve({
       port: 0,
       hosts: ["127.0.0.1"],
-      stateFile: path.join(dir, "real-peer.json"),
+      stateFile: path.join(dir, "real-peer", "state.json"),
       version: "0.1.96",
     });
     const peerBoardFile = path.join(dir, "real-peer-board.html");
@@ -487,10 +495,13 @@ test("a slow or timing-out peer never holds GET / past the short initial budget 
       headers: { "content-type": "application/json", origin: `http://127.0.0.1:${realPeer.port}` },
       body: JSON.stringify({ file: peerBoardFile, creator: "Walker" }),
     });
+    const secondDir = path.join(dir, "second");
+    await mkdir(secondDir);
+    await writeFile(path.join(secondDir, "state.json"), await readFile(path.join(dir, "state.json")));
     const server2 = await serve({
       port: 0,
       hosts: ["127.0.0.1"],
-      stateFile: path.join(dir, "state.json"),
+      stateFile: path.join(secondDir, "state.json"),
       version: "0.1.96",
       hubPeers: `walker=http://127.0.0.1:${realPeer.port}`,
       hubPeerOptions: { timeoutMs: 2_000, fetchImpl: controllableFetch },

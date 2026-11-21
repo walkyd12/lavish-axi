@@ -14,7 +14,7 @@ test("Fusion metadata survives rewrite, close, reopen and a new store; search in
   process.env.LAVISH_AXI_STATE_DIR = dir;
   const file = path.join(dir, "plan.html");
   await writeFile(file, "<title>Client roadmap</title><p>Orchid launch schedule</p><script>secretCodeWord</script>");
-  const peer = await serve({ port: 0, stateFile: path.join(dir, "peer.json"), version: "0.1.90" });
+  const peer = await serve({ port: 0, stateFile: path.join(dir, "peer", "state.json"), version: "0.1.90" });
   const peerBase = `http://127.0.0.1:${peer.port}`;
   const server = await serve({
     port: 0,
@@ -170,7 +170,7 @@ test("LAVISH_AXI_ON_EVENT emits board lifecycle, message attribution, tag diffs 
   await chmod(hookBin, 0o755);
 
   const events = [];
-  const peer = await serve({ port: 0, stateFile: path.join(dir, "peer.json"), version: "0.1.96" });
+  const peer = await serve({ port: 0, stateFile: path.join(dir, "peer", "state.json"), version: "0.1.96" });
   const peerBase = `http://127.0.0.1:${peer.port}`;
   const server = await serve({
     port: 0,
@@ -302,14 +302,16 @@ test("LAVISH_AXI_ON_EVENT emits board lifecycle, message attribution, tag diffs 
     );
     const reopenedPeerRes = await fetch(`${base}/api/hub/${encodeURIComponent(namespacedPeerKey)}/reopen`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBase }),
     });
     assert.equal(reopenedPeerRes.status, 200);
     assert.equal((await reopenedPeerRes.json()).closed, false);
 
     const cancelledPeerRes = await fetch(`${base}/api/hub/${encodeURIComponent(namespacedPeerKey)}/cancel`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBase }),
     });
     assert.equal(cancelledPeerRes.status, 200);
     assert.equal((await cancelledPeerRes.json()).cancelled, true);
@@ -401,7 +403,7 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
     if (String(url).includes("/api/hub?peers=0")) peerFetchCount += 1;
     return fetch(url, init);
   };
-  let peer = await serve({ port: 0, stateFile: path.join(dir, "peer-restart.json"), version: "0.1.96" });
+  let peer = await serve({ port: 0, stateFile: path.join(dir, "peer-restart", "state.json"), version: "0.1.96" });
   const peerPort = peer.port;
   const peerBase = `http://127.0.0.1:${peerPort}`;
   const events = [];
@@ -436,7 +438,13 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
       }).then((r) => r.json());
       peerKeys.push(reg.key);
     }
-    const aggregated = await fetch(`${base}/api/hub`).then((r) => r.json());
+    let aggregated;
+    const scrapeDeadline = Date.now() + 4_000;
+    do {
+      aggregated = await fetch(`${base}/api/hub`).then((r) => r.json());
+      if (aggregated.boards.filter((b) => b.source === "walker").length === 20) break;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    } while (Date.now() < scrapeDeadline);
     assert.equal(aggregated.peers[0].ok, true, "peer with 20x64KiB boards must not fail byte cap");
     assert.equal(aggregated.boards.filter((b) => b.source === "walker").length, 20);
     const searched = await fetch(`${base}/api/hub?q=BOARD_19_MARKER`).then((r) => r.json());
@@ -457,7 +465,7 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
     peer = await serve({
       port: peerPort,
       hosts: ["127.0.0.1"],
-      stateFile: path.join(dir, "peer-restart.json"),
+      stateFile: path.join(dir, "peer-restart", "state.json"),
       version: "0.1.96",
     });
     // Close the restarted peer's board through the central hub's one-tap peer relay (also verifies UND_ERR_SOCKET resilience!).
@@ -465,7 +473,8 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
       `${base}/api/hub/${encodeURIComponent(`peer:walker:${peerKeys[0]}`)}/close`,
       {
         method: "POST",
-        headers: { origin: base },
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({ peer_origin: peerBase }),
       },
     );
     assert.equal(relayCloseAfterRestart.status, 200);
@@ -487,11 +496,13 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
     // and replays ZERO already-processed peer close events, while delivering a fresh post-restart close!
     await fetch(`${base}/api/hub/${encodeURIComponent(`peer:walker:${peerKeys[0]}`)}/reopen`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBase }),
     });
     await fetch(`${base}/api/hub/${encodeURIComponent(`peer:walker:${peerKeys[0]}`)}/close`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBase }),
     });
     const secondCloseDeadline = Date.now() + 4_000;
     while (
@@ -688,7 +699,7 @@ test("hub viewer WebSockets and peer subscriptions prevent premature idle shutdo
     hub = await serve({
       port: 0,
       hosts: ["127.0.0.1"],
-      stateFile: path.join(dir, "hub-only.json"),
+      stateFile: path.join(dir, "hub-only", "state.json"),
       idleTimeoutMs: 120,
       version: "0.1.96",
     });
@@ -710,7 +721,7 @@ test("hub viewer WebSockets and peer subscriptions prevent premature idle shutdo
     peer = await serve({
       port: 0,
       hosts: ["127.0.0.1"],
-      stateFile: path.join(dir, "peer-idle.json"),
+      stateFile: path.join(dir, "peer-idle", "state.json"),
       version: "0.1.96",
     });
     hub = await serve({

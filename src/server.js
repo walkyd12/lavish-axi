@@ -79,7 +79,6 @@ import {
   createPeerBoardSource,
   HUB_PEERS_ENV,
   isPeerKey,
-  parseHubPeers,
   PEER_MAX_BOARDS,
   relayPeerHubAction,
   resolvePeerBoardTarget,
@@ -106,6 +105,7 @@ import {
 import { detectTailscale, isLoopbackIp, normalizeRemoteIp, whoisTailscalePeer } from "./tailscale.js";
 import { artifactTreeRoot, isArtifactPathError, isHtmlPath, resolveAllowedArtifactFile } from "./artifact-path.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
+import { HubPeerSettingsError, HubPeerSettingsStore } from "./hub-peer-settings.js";
 import { AsyncMutex } from "./async-mutex.js";
 import { generateSharePassword } from "./share-password.js";
 import {
@@ -1399,23 +1399,21 @@ export async function serve({
     return count;
   }
 
-  // LAVISH_AXI_HUB_PEERS (src/hub-peers.js): other Lavish servers whose boards this hub also
-  // lists, read from their /api/hub, with real-time lifecycle events pushed over their /events/hub
-  // WebSocket stream (never inferred by snapshot polling).
-  const parsedPeers = parseHubPeers(hubPeers);
-  for (const error of parsedPeers.errors) writeLog(`[lavish] ${error}; skipped`);
+  const peerSettings = new HubPeerSettingsStore(path.dirname(stateFile), hubPeers);
+  const peerSeedErrors = await peerSettings.init();
+  for (const error of peerSeedErrors) writeLog(`[lavish] ${error}; skipped`);
+  /** @type {import("./hub-peers.js").HubPeer[]} */
+  let configuredPeers = [];
   /** @type {Set<string>} */
   const livePeerStreams = new Set();
-  const collectPeerBoards = parsedPeers.peers.length
-    ? createPeerBoardSource(parsedPeers.peers, {
-        ...hubPeerOptions,
-        isStreamLive: (peerName) => livePeerStreams.has(String(peerName).toLowerCase()),
-        onSettled: () => notifyHubViewers(),
-      })
-    : null;
+  const collectPeerBoards = createPeerBoardSource([], {
+    ...hubPeerOptions,
+    isStreamLive: (peerName) => livePeerStreams.has(String(peerName).toLowerCase()),
+    onSettled: () => notifyHubViewers(),
+  });
   const PEER_WS_BACKOFF_MS = [200, 500, 1000, 2000, 5000];
-  /** @type {Array<{ close: () => void }>} */
-  const peerEventSubscriptions = [];
+  /** @type {Map<string, { origin: string, name: string, close: () => void }>} */
+  const peerEventSubscriptions = new Map();
   const peerCursorsFile = path.join(path.dirname(stateFile), "peer-cursors.json");
   /** @type {Record<string, { instance_id: string, seq: number }>} */
   const peerCursors = {};
@@ -1455,9 +1453,23 @@ export async function serve({
     return peerCursorWriteChain;
   }
 
+  function applyPeerSettings(peers) {
+    configuredPeers = peers;
+    collectPeerBoards.setPeers(peers);
+    startPeerEventSubscribers();
+    void collectPeerBoards({ maxWaitMs: 0 });
+    notifyHubViewers();
+  }
+
   function startPeerEventSubscribers() {
-    for (const peer of parsedPeers.peers) {
+    for (const [key, sub] of peerEventSubscriptions) {
+      if (configuredPeers.some((peer) => peer.name === sub.name && peer.origin === sub.origin)) continue;
+      sub.close();
+      peerEventSubscriptions.delete(key);
+    }
+    for (const peer of configuredPeers) {
       const peerKey = peer.name.toLowerCase();
+      if (peerEventSubscriptions.has(peerKey)) continue;
       const savedCursor = peerCursors[peerKey];
       let peerInstanceId = savedCursor?.instance_id || "";
       let lastSeq = savedCursor?.seq || 0;
@@ -1489,6 +1501,7 @@ export async function serve({
           const ws = new WebSocket(`${wsOrigin}/events/hub?${params}`);
           socket = ws;
           ws.on("open", () => {
+            if (closed || shuttingDown) return;
             attempt = 0;
             livePeerStreams.add(peerKey);
             collectPeerBoards?.invalidate(peer.name);
@@ -1533,6 +1546,7 @@ export async function serve({
                 if (cursorChanged) {
                   await persistPeerCursor(peerKey, peerInstanceId, lastSeq);
                 }
+                if (closed || shuttingDown) return;
                 collectPeerBoards?.invalidate(peer.name);
                 const sanitized = sanitizePeerHubEvent(peer, msg.event);
                 if (sanitized) emitHubEvent(sanitized);
@@ -1543,6 +1557,7 @@ export async function serve({
           });
           ws.on("error", () => {});
           ws.on("close", () => {
+            if (closed || shuttingDown) return;
             if (socket === ws) socket = null;
             livePeerStreams.delete(peerKey);
             collectPeerBoards?.invalidate(peer.name);
@@ -1555,7 +1570,9 @@ export async function serve({
       };
 
       connect();
-      peerEventSubscriptions.push({
+      peerEventSubscriptions.set(peerKey, {
+        origin: peer.origin,
+        name: peer.name,
         close() {
           closed = true;
           livePeerStreams.delete(peerKey);
@@ -1578,7 +1595,9 @@ export async function serve({
   }
 
   function closePeerEventSubscribers() {
-    for (const sub of peerEventSubscriptions.splice(0)) sub.close();
+    for (const sub of peerEventSubscriptions.values()) sub.close();
+    peerEventSubscriptions.clear();
+    collectPeerBoards.setPeers([]);
   }
 
   const PEER_TOTAL_SEARCH_TEXT_BUDGET = 16 * 1024 * 1024;
@@ -1790,6 +1809,33 @@ export async function serve({
     }
   });
 
+  app.get("/api/hub/peers", async (_req, res, next) => {
+    try {
+      const { peers } = await collectPeerBoards({ maxWaitMs: 0 });
+      res.json({ peers });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/hub/peers", async (req, res, next) => {
+    if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+      res.status(403).json({ error: "cross-origin peer settings write rejected" });
+      return;
+    }
+    try {
+      await peerSettings.mutate(req.body, applyPeerSettings);
+      const { peers } = await collectPeerBoards({ maxWaitMs: 0 });
+      res.json({ peers });
+    } catch (error) {
+      if (error instanceof HubPeerSettingsError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      next(error);
+    }
+  });
+
   app.get("/api/hub/notifications", async (_req, res, next) => {
     try {
       const current = await notifySettingsStore.get();
@@ -1843,6 +1889,7 @@ export async function serve({
       const view = await queryHub({
         includePeers: !peersOnly,
         peersOnly,
+        maxPeerWaitMs: HUB_INITIAL_PEER_WAIT_MS,
         query: String(req.query.q || ""),
         tag: String(req.query.tag || ""),
         state: String(req.query.state || ""),
@@ -1870,9 +1917,14 @@ export async function serve({
         return;
       }
       if (isPeerKey(req.params.key)) {
-        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        const target = resolvePeerBoardTarget(req.params.key, configuredPeers);
         if (!target) {
           res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        // peer_origin is optional for older tabs/API callers; when sent, a changed mapping fails closed.
+        if (req.body?.peer_origin !== undefined && req.body?.peer_origin !== target.peer.origin) {
+          res.status(409).json({ error: "peer hub changed; refresh before trying again" });
           return;
         }
         const relayed = await relayPeerHubAction(target.peer, target.peerKey, "close", hubPeerOptions);
@@ -1904,9 +1956,14 @@ export async function serve({
         return;
       }
       if (isPeerKey(req.params.key)) {
-        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        const target = resolvePeerBoardTarget(req.params.key, configuredPeers);
         if (!target) {
           res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        // peer_origin is optional for older tabs/API callers; when sent, a changed mapping fails closed.
+        if (req.body?.peer_origin !== undefined && req.body?.peer_origin !== target.peer.origin) {
+          res.status(409).json({ error: "peer hub changed; refresh before trying again" });
           return;
         }
         const relayed = await relayPeerHubAction(target.peer, target.peerKey, "cancel", hubPeerOptions);
@@ -1937,9 +1994,14 @@ export async function serve({
         return;
       }
       if (isPeerKey(req.params.key)) {
-        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        const target = resolvePeerBoardTarget(req.params.key, configuredPeers);
         if (!target) {
           res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        // peer_origin is optional for older tabs/API callers; when sent, a changed mapping fails closed.
+        if (req.body?.peer_origin !== undefined && req.body?.peer_origin !== target.peer.origin) {
+          res.status(409).json({ error: "peer hub changed; refresh before trying again" });
           return;
         }
         const relayed = await relayPeerHubAction(target.peer, target.peerKey, "reopen", hubPeerOptions);
@@ -4196,8 +4258,8 @@ export async function serve({
   }
   serverReady = true;
   await notifySettingsStore.init();
-  if (parsedPeers.peers.length > 0) await loadPeerCursors();
-  startPeerEventSubscribers();
+  await loadPeerCursors();
+  applyPeerSettings(peerSettings.get());
   scheduleBindRecovery();
 
   // `cause` is log-only and never reaches a chrome: `reason` is the user-facing SHUTDOWN_REASONS
@@ -4275,7 +4337,7 @@ export async function serve({
       activePolls.size > 0 ||
       hubViewStreamClients.size > 0 ||
       hubPeerStreamClients.size > 0 ||
-      peerEventSubscriptions.length > 0
+      peerEventSubscriptions.size > 0
     );
   }
 

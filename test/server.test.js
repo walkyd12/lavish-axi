@@ -7249,7 +7249,7 @@ test("the hub lists a peer's boards beside its own and never closes them", async
   const theirs = path.join(dir, "theirs.html");
   await writeFile(mine, "<!doctype html><html><head><title>Mine</title></head><body></body></html>");
   await writeFile(theirs, "<!doctype html><html><head><title>Theirs <b></title></head><body></body></html>");
-  const peer = await serve({ port: 0, stateFile: path.join(dir, "peer-state.json"), version: "9.9.9-test" });
+  const peer = await serve({ port: 0, stateFile: path.join(dir, "peer-state", "state.json"), version: "9.9.9-test" });
   const peerBase = `http://127.0.0.1:${peer.port}`;
   const hub = await serve({
     port: 0,
@@ -7307,14 +7307,16 @@ test("the hub lists a peer's boards beside its own and never closes them", async
     assert.equal(unknownClose.status, 404);
     const closePeer = await fetch(`${base}/api/hub/${encodeURIComponent(peerBoard.key)}/close`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBoard.peer_origin }),
     });
     assert.equal(closePeer.status, 200);
     const afterClose = await fetch(`${peerBase}/api/hub`).then((response) => response.json());
     assert.equal(afterClose.boards.find((board) => board.key === theirsKey).status, "ended");
     const reopenPeer = await fetch(`${base}/api/hub/${encodeURIComponent(peerBoard.key)}/reopen`, {
       method: "POST",
-      headers: { origin: base },
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ peer_origin: peerBoard.peer_origin }),
     });
     assert.equal(reopenPeer.status, 200);
     const still = await fetch(`${peerBase}/api/hub`).then((response) => response.json());

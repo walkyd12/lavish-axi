@@ -594,3 +594,40 @@ main.wrap {
 .notify-status[data-tone="saved"] {
   color: var(--good);
 }
+
+.hub-settings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 20px;
+}
+.hub-settings > [hidden] {
+  display: none;
+}
+.peer-add label {
+  display: grid;
+  gap: 6px;
+  flex: 1 1 180px;
+  min-width: 0;
+  font-size: 14px;
+}
+.peer-add input {
+  width: 100%;
+}
+.peer-row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+}
+.peer-url {
+  overflow-wrap: anywhere;
+}
+.peer-status[data-tone="good"] {
+  color: var(--good);
+}
+.peer-status[data-tone="bad"] {
+  color: var(--bad);
+}
+.peer-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}

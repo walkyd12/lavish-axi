@@ -80,6 +80,87 @@ const notifyAddForm = /** @type {HTMLFormElement | null} */ (document.getElement
 const notifyAddInput = /** @type {HTMLInputElement | null} */ (document.getElementById("notifyAddInput"));
 const notifyStatus = /** @type {HTMLParagraphElement | null} */ (document.getElementById("notifyStatus"));
 
+const peerToggle = /** @type {HTMLButtonElement | null} */ (document.getElementById("peerToggle"));
+const peerPanel = /** @type {HTMLElement | null} */ (document.getElementById("peerPanel"));
+const peerRows = /** @type {HTMLDivElement | null} */ (document.getElementById("peerRows"));
+const peerAddForm = /** @type {HTMLFormElement | null} */ (document.getElementById("peerAddForm"));
+const peerName = /** @type {HTMLInputElement | null} */ (document.getElementById("peerName"));
+const peerOrigin = /** @type {HTMLInputElement | null} */ (document.getElementById("peerOrigin"));
+const peerAdd = /** @type {HTMLButtonElement | null} */ (document.getElementById("peerAdd"));
+const peerStatus = /** @type {HTMLParagraphElement | null} */ (document.getElementById("peerStatus"));
+let peerSaving = false;
+
+function renderPeersPanel() {
+  if (!peerRows) return;
+  peerRows.innerHTML = peers.length
+    ? peers
+        .map((peer) => {
+          const status = peer.pending ? "Checking…" : peer.ok ? "ok" : "down";
+          return `<div class="notify-row peer-row"><div><strong>${escapeHtml(peer.name)}</strong><p class="meta peer-url">${escapeHtml(peer.url)}</p></div><span class="peer-status" data-tone="${peer.ok ? "good" : "bad"}">${status}</span><button type="button" class="notify-remove peer-remove" data-peer-remove="${escapeHtml(peer.name)}" aria-label="Remove ${escapeHtml(peer.name)}"${peerSaving ? " disabled" : ""}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div>`;
+        })
+        .join("")
+    : '<p class="meta">No hubs connected yet.</p>';
+}
+
+async function savePeerMutation(body) {
+  if (peerSaving) return false;
+  peerSaving = true;
+  if (peerAdd) peerAdd.disabled = true;
+  renderPeersPanel();
+  try {
+    const response = await fetch("/api/hub/peers", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Could not save connected hubs");
+    // Discard any hub fetch that began before the settings change.
+    activeFetchController?.abort();
+    activeFetchController = null;
+    cancelLoadMore();
+    peers = Array.isArray(data.peers) ? data.peers : [];
+    if (peerStatus) {
+      peerStatus.textContent = "Connected hubs saved.";
+      peerStatus.dataset.tone = "saved";
+      peerStatus.hidden = false;
+    }
+    void refresh();
+    return true;
+  } catch (error) {
+    if (peerStatus) {
+      peerStatus.textContent = error.message || "Could not save connected hubs";
+      peerStatus.dataset.tone = "error";
+      peerStatus.hidden = false;
+    }
+    return false;
+  } finally {
+    peerSaving = false;
+    if (peerAdd) peerAdd.disabled = false;
+    renderPeersPanel();
+  }
+}
+
+peerToggle?.addEventListener("click", () => {
+  if (!peerPanel) return;
+  peerPanel.hidden = !peerPanel.hidden;
+  peerToggle.setAttribute("aria-expanded", String(!peerPanel.hidden));
+});
+peerAddForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!peerName || !peerOrigin) return;
+  if (await savePeerMutation({ add: { name: peerName.value, origin: peerOrigin.value } })) {
+    peerName.value = "";
+    peerOrigin.value = "";
+  }
+});
+peerRows?.addEventListener("click", (event) => {
+  const button = /** @type {HTMLButtonElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("button[data-peer-remove]")
+  );
+  if (button && !button.disabled) void savePeerMutation({ remove: button.dataset.peerRemove });
+});
+
 function syncGlobalNotifyPeople() {
   window["lavishNotifyPeople"] = Object.keys(notifySettings);
   window.dispatchEvent(new CustomEvent("lavish:notify-people"));
@@ -455,6 +536,7 @@ function render() {
       " boards are missing from this list."
     : "";
   peerNote.hidden = !down.length;
+  renderPeersPanel();
 }
 
 function showNote(text, tone = "") {
@@ -629,7 +711,11 @@ async function closeBoard(board) {
   busy.add(board.key);
   render();
   try {
-    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/close", { method: "POST" });
+    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/close", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ peer_origin: board.peer_origin }),
+    });
     if (!response.ok) throw new Error(String(response.status));
     showNote(`Closed "${board.title}".`, "done");
   } catch {
@@ -644,7 +730,11 @@ async function cancelBoard(board) {
   busy.add(board.key);
   render();
   try {
-    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/cancel", { method: "POST" });
+    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ peer_origin: board.peer_origin }),
+    });
     if (!response.ok) throw new Error(String(response.status));
     showNote(`Cancelled "${board.title}".`, "done");
   } catch {
@@ -662,7 +752,7 @@ async function reopenBoard(board) {
     const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/reopen", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: "{}",
+      body: JSON.stringify({ peer_origin: board.peer_origin }),
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || result.status !== "opened") throw new Error(result.error || String(response.status));
