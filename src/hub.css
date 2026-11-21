@@ -1146,3 +1146,22 @@ button.armed { color: var(--bad); font-weight: 700; }
   font-size: 13px;
   font-weight: 700;
 }
+
+.board-head .fresh {
+  display: inline-block;
+  margin: 0 8px 4px 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+.fresh-new {
+  background: var(--accent, #0b6b4f);
+  color: #fff;
+}
+.fresh-updated {
+  border: 1px solid var(--accent, #0b6b4f);
+  color: var(--accent, #0b6b4f);
+}
