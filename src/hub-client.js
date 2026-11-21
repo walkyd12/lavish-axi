@@ -24,6 +24,49 @@ let filterPending = false;
 let filterFailed = false;
 // Actions must use the board actually shown, even if an editor delays a live repaint.
 const renderedBoards = new Map();
+
+// "New" / "Updated" badges, per viewer: boards you have never opened show New; boards with activity
+// since you last opened them show Updated. Stored in this browser only (a convenience, not shared state).
+const SEEN_KEY = "lavish-hub-seen-v1";
+let seenBoards = null;
+function loadSeen() {
+  if (seenBoards) return seenBoards;
+  try {
+    seenBoards = JSON.parse(localStorage.getItem(SEEN_KEY) || "null");
+  } catch {
+    seenBoards = null;
+  }
+  return seenBoards;
+}
+function saveSeen() {
+  try {
+    localStorage.setItem(SEEN_KEY, JSON.stringify(seenBoards || {}));
+  } catch {
+    /* private window etc.: badges just reset next load */
+  }
+}
+function seedSeen(boards) {
+  // First visit ever: everything already on the hub counts as seen, so only later boards say New.
+  if (loadSeen()) return;
+  seenBoards = {};
+  const now = Date.now();
+  for (const board of boards || []) seenBoards[board.key] = now;
+  saveSeen();
+}
+function markSeen(key) {
+  loadSeen();
+  if (!seenBoards) seenBoards = {};
+  seenBoards[key] = Date.now();
+  saveSeen();
+}
+function freshnessBadge(board) {
+  const seen = loadSeen();
+  if (!seen || board.status === "ended") return "";
+  const at = seen[board.key];
+  if (!at) return `<span class="fresh fresh-new">New</span>`;
+  const activity = Date.parse(board.last_activity || "") || 0;
+  return activity > at + 1000 ? `<span class="fresh fresh-updated">Updated</span>` : "";
+}
 let pendingWsRefreshAfterLoadMore = false;
 /** @type {Record<string, { tagged: boolean, done: boolean, send_to: string }>} */
 let notifySettings =
@@ -349,7 +392,7 @@ function boardHtml(board) {
   const waiting = isNeedsInput(board) ? waitingOn(board) : "";
   return (
     `<li class="board" data-key="${escapeHtml(board.key)}">` +
-    `<div class="board-head"><h3 class="board-title" title="${escapeHtml(board.title)}">${escapeHtml(board.title)}</h3></div>` +
+    `<div class="board-head">${freshnessBadge(board)}<h3 class="board-title" title="${escapeHtml(board.title)}">${escapeHtml(board.title)}</h3></div>` +
     `<div class="board-summary">${clientHtml(board)}<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span><span class="activity">${escapeHtml(relativeTime(board.last_activity))}</span></div>` +
     (waiting ? `<p class="next-step">Waiting on ${escapeHtml(waiting)}</p>` : "") +
     (board.next_step
@@ -630,6 +673,7 @@ function render() {
   const pinned = hideBoards ? [] : needsYouBoards;
   const pinnedKeys = new Set(pinned.map((board) => board.key));
   const remaining = (hideBoards ? [] : boards).filter((board) => !pinnedKeys.has(board.key));
+  if (!hideBoards && !searching) seedSeen([...pinned, ...remaining]);
   renderedBoards.clear();
   for (const board of [...pinned, ...remaining]) renderedBoards.set(board.key, { ...board });
   if (pinnedList) pinnedList.innerHTML = pinned.map(boardHtml).join("");
@@ -1447,3 +1491,10 @@ if (initial.identify_viewer) {
     })
     .catch(() => {});
 }
+
+// Opening a board clears its New/Updated badge for this viewer.
+document.addEventListener("click", (event) => {
+  const link = /** @type {HTMLElement} */ (event.target).closest?.("li.board a.act.primary");
+  const key = link?.closest("li.board")?.getAttribute("data-key");
+  if (key) markSeen(key);
+});
