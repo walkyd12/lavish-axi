@@ -137,7 +137,7 @@ export class SessionStore {
       url,
       status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
       tags: serializeBoardMetadata(existing).tags,
-      creator: existing.creator || (!existing.key ? creator : ""),
+      creator: existing.creator || creator,
       created_version: existing.created_version || (!existing.key ? version : ""),
       served_version: version || existing.served_version || "",
       pending_prompts: existing.pending_prompts || 0,

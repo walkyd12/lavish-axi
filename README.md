@@ -290,7 +290,7 @@ lavish-axi tag board.html --remove urgent --add review
 lavish-axi tag board.html
 ```
 
-Creator is the name supplied on the first open with `--creator`, otherwise the invoking agent identity (or `generic`). Later opens preserve it. Boards created before metadata was recorded display **Unknown**. Each card also shows the created and last-served Lavish versions. Registration/reopen and serving board chrome update the last-served version; the hub flags a known version older than its own server, with unknown versions left unflagged. CLI session listings (including closed boards), open, tag, and end output expose the metadata as TOON.
+Creator is the name supplied on the first open with `--creator`, otherwise the invoking agent identity (or `generic`). Later opens preserve a non-empty creator and fill an empty creator from the supplied name. Boards without attribution display **Unknown** until opened with a creator. Each card also shows the created and last-served Lavish versions. Registration/reopen and serving board chrome update the last-served version; the hub flags a known version older than its own server, with unknown versions left unflagged. CLI session listings (including closed boards), open, tag, and end output expose the metadata as TOON.
 
 Peer metadata comes only from the peer relay. **Open** links to that peer's chrome to view the board or edit tags there, while **Close**, **Cancel**, and **Reopen** work in one click from the central hub by relaying to that configured peer without forwarding viewer cookies or headers.
 
