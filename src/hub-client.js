@@ -383,7 +383,12 @@ function renderFilters() {
   filters.innerHTML =
     `<div class="filter-group" role="group" aria-label="Status">${chip("Needs input", "needs", "", needsInputOnly)}</div>` +
     (clients.length
-      ? `<div class="filter-group" role="group" aria-label="Clients"><span class="filter-label">Client</span>${clients.map((name) => chip(name, "client", name, name === selectedClient)).join("")}</div>`
+      ? `<div class="filter-group" role="group" aria-label="Clients"><span class="filter-label">Client</span>` +
+        `<select class="filter-select" data-filter-select="client" aria-label="Filter by client"><option value="">All clients</option>${clients
+          .map((name) => `<option value="${escapeHtml(name)}"${name === selectedClient ? " selected" : ""}>${escapeHtml(name)}</option>`)
+          .join("")}</select>` +
+        // Quick chips: the first three clients the server lists (busiest first when it orders them).
+        `${clients.slice(0, 3).map((name) => chip(name, "client", name, name === selectedClient)).join("")}</div>`
       : "") +
     (people.length
       ? `<div class="filter-group" role="group" aria-label="People"><span class="filter-label">People</span>${people.map((name) => chip(name, "person", name, name === selectedPerson)).join("")}</div>`
@@ -441,7 +446,7 @@ function notifyRowHtml(person, cfg) {
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="tagged"${cfg.tagged ? " checked" : ""}><span>When tagged</span></label>` +
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="done"${cfg.done ? " checked" : ""}><span>When board is done</span></label>` +
     `</div>` +
-    `<label class="notify-sendto"><span>Destination</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Paste a URL or pick below" maxlength="256"></label>` +
+    `<label class="notify-sendto"><span>Destination</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Paste a URL or pick below" maxlength="2048"></label>` +
     `<label class="notify-sendto"><span>Suggested destinations</span><select data-notify-pick="${safeName}" aria-describedby="destination-status-${index}">${destinationOptions(cfg.send_to)}</select></label>` +
     `<div class="destination-check"><span class="destination-status" id="destination-status-${index}" data-ready="${status.ready}">${escapeHtml(status.label)}</span><button type="button" class="act" data-notify-test="${safeName}" aria-label="Send test for ${safeName}">Send test</button></div>` +
     `</div>`
@@ -1225,6 +1230,16 @@ if (showing !== "open") {
   void refresh();
 }
 connectHubEvents();
+
+filters?.addEventListener("change", (event) => {
+  const select = /** @type {HTMLSelectElement | null} */ (
+    /** @type {HTMLElement} */ (event.target).closest?.("select[data-filter-select]")
+  );
+  if (!select || select.dataset.filterSelect !== "client") return;
+  selectedClient = select.value || "";
+  beginFilterTransition();
+  void refresh({ resetLimit: true });
+});
 
 filters?.addEventListener("click", (event) => {
   const button = /** @type {HTMLElement | null} */ (

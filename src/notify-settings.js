@@ -13,7 +13,7 @@ export const NOTIFY_PEOPLE_ENV = "LAVISH_AXI_NOTIFY_PEOPLE";
 export const NOTIFY_SETTINGS_FILENAME = "notify-settings.json";
 export const MAX_NOTIFY_PEOPLE = 100;
 export const MAX_NOTIFY_PERSON_LENGTH = 64;
-export const MAX_NOTIFY_SEND_TO_LENGTH = 256;
+export const MAX_NOTIFY_SEND_TO_LENGTH = 2048;
 // Keeps serialized `notify_settings` at <= 32 KiB so every `LAVISH_AXI_ON_EVENT` payload stays well
 // within the 64 KiB hook budget and Linux's 128 KiB single-argument `MAX_ARG_STRLEN` limit.
 export const MAX_NOTIFY_SETTINGS_BYTES = 32_768;

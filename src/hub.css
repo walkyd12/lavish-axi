@@ -1109,3 +1109,14 @@ main.wrap {
     display: block;
   }
 }
+
+.filter-select {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--card);
+  color: inherit;
+  max-width: 14rem;
+}

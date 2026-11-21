@@ -351,7 +351,7 @@ test("Send test reports an unconnected hook and launches a configured executable
       env: { ...env, LAVISH_AXI_ON_EVENT: hook },
     });
     assert.equal(
-      (await post("/api/hub/notifications/test", { person: "Reviewer", send_to: "x".repeat(257) })).status,
+      (await post("/api/hub/notifications/test", { person: "Reviewer", send_to: "x".repeat(2049) })).status,
       400,
     );
     assert.equal(
