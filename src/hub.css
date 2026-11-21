@@ -1137,3 +1137,12 @@ button.armed { color: var(--bad); font-weight: 700; }
 .board-details[open] > summary {
   display: none;
 }
+
+.notify-remove.armed {
+  width: auto;
+  padding: 0 12px;
+  border-radius: 999px;
+  color: var(--bad);
+  font-size: 13px;
+  font-weight: 700;
+}

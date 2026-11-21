@@ -201,7 +201,7 @@ test("notification picker replaces a focused destination and Send test uses the 
   // Keep the field focused while the picker changes, as with a delayed provider response.
   h.document.activeElement = field;
   await h.emit("notifyRows", "change", picker);
-  assert.equal(field.value, "dm");
+  assert.equal(field.value, "Reviewer DM"); // the box shows the friendly name; the stored route is "dm"
   field.value = "https://hooks.example/visible";
   const button = { dataset: { notifyTest: "Reviewer" }, closest: () => row };
   await h.emit("notifyRows", "click", { closest: () => button });
