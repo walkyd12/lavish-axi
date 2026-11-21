@@ -130,3 +130,13 @@ test("the hub page escapes board data into its bootstrap", () => {
   assert.match(html, /<span class="mk-accent">sch<\/span><span class="mk-rest">lab\.<\/span>/);
   assert.match(html, /<script src="\/hub-client\.js"><\/script>/);
 });
+
+test("version flags compare numeric versions and leave unknown or newer boards alone", async () => {
+  const { boardVersionBehind } = await import("../src/board-metadata.js");
+  assert.equal(boardVersionBehind({ served_version: "0.1.9" }, "0.1.96"), true);
+  assert.equal(boardVersionBehind({ served_version: "0.1.100" }, "0.1.96"), false);
+  assert.equal(boardVersionBehind({ created_version: "0.1.95" }, "0.1.96"), true);
+  assert.equal(boardVersionBehind({ served_version: "0.1.96" }, "0.1.96"), false);
+  assert.equal(boardVersionBehind({}, "0.1.96"), false);
+  assert.equal(boardVersionBehind({ served_version: "unknown" }, "0.1.96"), false);
+});

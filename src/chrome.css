@@ -1637,6 +1637,23 @@ body.lavish {
   display: flex;
   gap: 10px;
 }
+.approval-banner {
+  flex-wrap: wrap;
+}
+.approval-author-wrap {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+}
+#approvalAuthorInput {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  padding: 3px 6px;
+  width: 110px;
+}
 .composer textarea {
   width: 100%;
   max-width: 100%;

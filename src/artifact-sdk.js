@@ -1234,7 +1234,10 @@ export function createArtifactSdk(
 
     if (options.uid) item.uid = String(options.uid);
     if (options.selector) item.selector = String(options.selector);
-    if (options.tag) item.tag = String(options.tag);
+    if (options.tag) {
+      const requestedTag = String(options.tag);
+      item.tag = requestedTag === "send_approval" ? "message" : requestedTag;
+    }
     if (options.text) item.text = String(options.text);
     if (options.target) item.target = options.target;
     if (options.data) item.prompt += "\n\nContext data:\n" + JSON.stringify(options.data, null, 2);
@@ -1260,6 +1263,22 @@ export function createArtifactSdk(
 
   function endSession() {
     postArtifactMessage("lavish:endSession");
+  }
+
+  // Ask the outer chrome to present a human-only confirmation control. Artifact scripts run in the
+  // untrusted sandboxed iframe and can never submit an approval directly; only a trusted click on
+  // the outer chrome's confirmation control sends `/api/:key/approval`.
+  function requestApproval(options = {}) {
+    const originElement = options.element || document.activeElement || document.body;
+    const base = context(originElement);
+    postArtifactMessage("lavish:requestApproval", {
+      prompt: String(options.prompt || ""),
+      label: String(options.label || "Confirm action").slice(0, 120),
+      summary: String(options.summary || "").slice(0, 400),
+      author: String(options.author || "").slice(0, 80),
+      selector: String(options.selector || base.selector || "").slice(0, 512),
+      text: String(options.text || base.text || "").slice(0, 240),
+    });
   }
 
   function snapshot() {
@@ -2499,6 +2518,7 @@ export function createArtifactSdk(
   /** @type {Window & { lavish?: unknown }} */ (window).lavish = {
     queuePrompt,
     sendQueuedPrompts,
+    requestApproval,
     endSession,
     getQueuedPrompts: () => [],
     setStatus: (message) => postArtifactMessage("lavish:status", { message: String(message) }),

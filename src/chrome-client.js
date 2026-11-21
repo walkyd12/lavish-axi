@@ -173,6 +173,17 @@ const outdatedBanner = /** @type {HTMLDivElement} */ (document.getElementById("o
 const outdatedText = /** @type {HTMLSpanElement} */ (document.getElementById("outdatedText"));
 const outdatedReloadButton = /** @type {HTMLButtonElement} */ (document.getElementById("outdatedReload"));
 const outdatedDismissButton = /** @type {HTMLButtonElement} */ (document.getElementById("outdatedDismiss"));
+const approvalBanner = /** @type {HTMLDivElement | null} */ (document.getElementById("approvalBanner"));
+const approvalBannerText = /** @type {HTMLSpanElement | null} */ (document.getElementById("approvalBannerText"));
+const approvalAuthorInput = /** @type {HTMLInputElement | null} */ (document.getElementById("approvalAuthorInput"));
+const approvalTokenWrap = /** @type {HTMLLabelElement | null} */ (document.getElementById("approvalTokenWrap"));
+const approvalTokenInput = /** @type {HTMLInputElement | null} */ (document.getElementById("approvalTokenInput"));
+const approvalConfirmButton = /** @type {HTMLButtonElement | null} */ (document.getElementById("approvalConfirm"));
+const approvalCancelButton = /** @type {HTMLButtonElement | null} */ (document.getElementById("approvalCancel"));
+const initialViewerName = String(sessionData.initialViewerName || "").trim();
+const requiresApprovalToken = sessionData.requiresApprovalToken === true;
+const approvalAuthorStorageKey = "lavish-axi:reviewer-name";
+const approvalTokenStorageKey = "lavish-axi:approval-token";
 const endedOverlay = /** @type {HTMLDivElement} */ (document.getElementById("endedOverlay"));
 const layoutGateOverlay = /** @type {HTMLDivElement} */ (document.getElementById("layoutGateOverlay"));
 const layoutGateTitle = /** @type {HTMLDivElement} */ (document.getElementById("layoutGateTitle"));
@@ -1107,7 +1118,9 @@ function chatBubbleHtml(entry) {
     );
   }
   return (
-    "<small>You</small>" +
+    "<small>" +
+    escapeHtml(entry.author ? String(entry.author) : "You") +
+    "</small>" +
     anchorHtml(entry.anchor) +
     userBubbleTextHtml(entry, entry.text) +
     bubbleAttachmentsHtml(entry) +
@@ -2492,12 +2505,13 @@ function createChatAttachmentsController() {
     renderAttachments();
   }
 
-  function reset() {
-    for (const item of items) {
+  function reset(sentAttachments = null) {
+    for (const item of [...items]) {
+      if (sentAttachments && !sentAttachments.some((ref) => item.id === ref.id && item.name === ref.name)) continue;
       item.abortController?.abort();
       if (item.preview) URL.revokeObjectURL(item.preview);
+      items.splice(items.indexOf(item), 1);
     }
-    items.length = 0;
     capRejected = false;
     sendBlocked = false;
     renderAttachments();
@@ -2524,6 +2538,8 @@ function createChatAttachmentsController() {
 }
 
 const chatAttachmentController = createChatAttachmentsController();
+// The board workflow action sends the same uploaded composer chips as chat.
+window["lavishChatAttachments"] = chatAttachmentController;
 
 function sendQueued(endAfter) {
   if (ended) return;
@@ -3663,6 +3679,7 @@ async function endSession(terminal = null) {
 function markSessionEnded() {
   if (ended) return;
   ended = true;
+  window["lavishBoardMetadata"]?.update({ key, closed: true });
   pendingAcknowledgements.clear();
   clearSendAcknowledgementWarning();
   terminalSubmission = null;
@@ -4922,6 +4939,7 @@ window.addEventListener("message", (event) => {
   // removal note below: the iframe cannot be trusted to decide a delete, and the
   // chrome cannot see every live reference, so reclamation is the sweeper's job.
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
+  if (msg.type === "lavish:requestApproval") openApprovalConfirmation(msg);
   if (msg.type === "lavish:endSession") endSession();
   if (msg.type === "lavish:revisions") applyRevisionMessage(msg);
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
@@ -5189,6 +5207,132 @@ endButton.onclick = () => {
   closeMenus();
   endSession();
 };
+/** @type {{ prompt: string, label: string, selector: string, text: string, initialAuthor: string } | null} */
+let pendingChromeApproval = null;
+let approvalConfirmInFlight = false;
+
+function openApprovalConfirmation(msg) {
+  if (ended || !approvalBanner || !approvalBannerText) return;
+  const prompt = String(msg?.prompt || "").trim();
+  if (!prompt) return;
+  // The trusted bar displays the exact action it submits, never an independent artifact label.
+  const label = "Confirm action";
+  const author = String(msg?.author || "")
+    .trim()
+    .slice(0, 80);
+  pendingChromeApproval = {
+    prompt,
+    label,
+    selector: String(msg?.selector || "").slice(0, 512),
+    text: String(msg?.text || label).slice(0, 240),
+    initialAuthor: author,
+  };
+  let savedAuthor = "";
+  let savedToken = "";
+  try {
+    savedAuthor = String(localStorage.getItem(approvalAuthorStorageKey) || "").trim();
+    savedToken = String(localStorage.getItem(approvalTokenStorageKey) || "").trim();
+  } catch {
+    // Storage unavailable in restricted browser mode.
+  }
+  const preferredAuthor = initialViewerName || savedAuthor || author;
+  if (approvalAuthorInput && preferredAuthor) approvalAuthorInput.value = preferredAuthor;
+  if (approvalTokenWrap) approvalTokenWrap.hidden = !requiresApprovalToken;
+  if (approvalTokenInput && requiresApprovalToken && !approvalTokenInput.value && savedToken) {
+    approvalTokenInput.value = savedToken;
+  }
+  syncApprovalConfirmationText();
+  approvalBanner.hidden = false;
+  if (isMobileSheet() && !sheetOpen) setSheetOpen(true);
+  else pulseSheetDock();
+}
+
+function syncApprovalConfirmationText() {
+  if (!pendingChromeApproval || !approvalBannerText) return;
+  const author = String(approvalAuthorInput?.value || "").trim();
+  if (pendingChromeApproval.initialAuthor && author) {
+    pendingChromeApproval.prompt = pendingChromeApproval.prompt.replace(
+      " from " + pendingChromeApproval.initialAuthor + " [",
+      " from " + author + " [",
+    );
+    pendingChromeApproval.initialAuthor = author;
+  }
+  approvalBannerText.textContent = pendingChromeApproval.prompt;
+}
+if (approvalAuthorInput) approvalAuthorInput.addEventListener("input", syncApprovalConfirmationText);
+
+function closeApprovalConfirmation() {
+  pendingChromeApproval = null;
+  if (approvalBanner) approvalBanner.hidden = true;
+}
+
+async function submitApprovalConfirmation(event) {
+  // Only a real user-agent gesture in the top-level chrome may submit `/api/:key/approval`.
+  if (!event || event.isTrusted !== true || approvalConfirmInFlight || !pendingChromeApproval || ended) return;
+  const author = String(approvalAuthorInput?.value || "").trim();
+  if (!author) {
+    if (approvalBannerText && pendingChromeApproval) {
+      approvalBannerText.textContent = pendingChromeApproval.prompt + ": enter your reviewer name before confirming.";
+    }
+    approvalAuthorInput?.focus?.();
+    return;
+  }
+  const approvalToken = String(approvalTokenInput?.value || "").trim();
+  if (requiresApprovalToken && !approvalToken) {
+    if (approvalBannerText && pendingChromeApproval) {
+      approvalBannerText.textContent = pendingChromeApproval.prompt + ": enter your approval token before confirming.";
+    }
+    approvalTokenInput?.focus?.();
+    return;
+  }
+  syncApprovalConfirmationText();
+  const promptText = pendingChromeApproval.prompt;
+  approvalConfirmInFlight = true;
+  if (approvalConfirmButton) approvalConfirmButton.disabled = true;
+  try {
+    const response = await fetch("/api/" + encodeURIComponent(key) + "/approval", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        prompt: promptText,
+        selector: pendingChromeApproval.selector,
+        text: pendingChromeApproval.text,
+        author,
+        ...(approvalToken ? { approval_token: approvalToken } : {}),
+        chrome_load_token: chromeLoadToken,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Could not confirm approval");
+    try {
+      localStorage.setItem(approvalAuthorStorageKey, author);
+      if (approvalToken) localStorage.setItem(approvalTokenStorageKey, approvalToken);
+    } catch {
+      // Ignore storage failures.
+    }
+    if (Array.isArray(data.ack_ids)) for (const id of data.ack_ids) chatAckIds.add(id);
+    if (Array.isArray(data.chat)) syncChat(data.chat, data.chat_revision);
+    closeApprovalConfirmation();
+  } catch (error) {
+    if (approvalBannerText && pendingChromeApproval) {
+      approvalBannerText.textContent =
+        pendingChromeApproval.prompt + ": " + (error instanceof Error ? error.message : String(error));
+    }
+  } finally {
+    approvalConfirmInFlight = false;
+    if (approvalConfirmButton) approvalConfirmButton.disabled = false;
+  }
+}
+
+if (approvalConfirmButton) {
+  approvalConfirmButton.addEventListener("click", (event) => {
+    void submitApprovalConfirmation(event);
+  });
+}
+if (approvalCancelButton) {
+  approvalCancelButton.addEventListener("click", () => closeApprovalConfirmation());
+}
+
 handoffTakeoverButton.onclick = () => location.reload();
 if (outdatedReloadButton) outdatedReloadButton.onclick = () => reloadChromeForOutdatedBanner();
 if (outdatedDismissButton) {
@@ -5338,6 +5482,7 @@ events.set("chat-sync", (data) => {
 events.set("agent-presence", (data) => setAgentPresence(data.mode === "external-listener" ? "external" : data.state));
 events.set("layout-warnings", (data) => setLayoutWarnings(data.warnings || []));
 events.set("ended", () => markSessionEnded());
+events.set("board-metadata", (data) => window["lavishBoardMetadata"]?.update({ key, ...data }));
 events.set("owner-status", (data) => setOwnerStatus(data.owner || null));
 connectLiveEvents();
 

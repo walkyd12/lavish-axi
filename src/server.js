@@ -2,16 +2,24 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { open as openFile, readFile, realpath } from "node:fs/promises";
+import { open as openFile, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
-import { homedir, hostname as osHostname } from "node:os";
+import { homedir, hostname as osHostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import chokidar from "chokidar";
 import express from "express";
 
+import {
+  BoardMetadataError,
+  boardSearchText,
+  boardVersionBehind,
+  filterHubBoards,
+  normalizeCreator,
+  serializeBoardMetadata,
+} from "./board-metadata.js";
 import {
   classifySevereTextOverflow,
   classifyMaterialRectEscape,
@@ -56,10 +64,27 @@ import {
   splitExportWarnings,
 } from "./export-bundle.js";
 import { hostRejectedShareWrite, publishedDespiteError, publishToHtmlApp } from "./html-app.js";
-import { serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
+import { normalizePromptAuthor, serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
 import { OwnerStatusError, serializeOwnerStatus } from "./owner-status.js";
-import { boardTitle, conversationMarkdown, createHubHtml, serializeHubBoard, sortHubBoards } from "./hub.js";
-import { createPeerBoardSource, HUB_PEERS_ENV, isPeerKey, parseHubPeers } from "./hub-peers.js";
+import {
+  boardTitle,
+  conversationMarkdown,
+  createHubHtml,
+  serializeHubBoard,
+  sortHubBoards,
+  summarizeHubBoards,
+} from "./hub.js";
+import { createNotifySettingsStore, NOTIFY_PEOPLE_ENV, NotifySettingsError } from "./notify-settings.js";
+import {
+  createPeerBoardSource,
+  HUB_PEERS_ENV,
+  isPeerKey,
+  parseHubPeers,
+  PEER_MAX_BOARDS,
+  relayPeerHubAction,
+  resolvePeerBoardTarget,
+  sanitizePeerHubEvent,
+} from "./hub-peers.js";
 import { DraftTooLargeError, normalizeDraftTabId, serializeDrafts } from "./review-drafts.js";
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { injectLavishSdk } from "./html-transform.js";
@@ -78,7 +103,7 @@ import {
   sanitizeListenHosts,
   stateId,
 } from "./paths.js";
-import { detectTailscale } from "./tailscale.js";
+import { detectTailscale, isLoopbackIp, normalizeRemoteIp, whoisTailscalePeer } from "./tailscale.js";
 import { artifactTreeRoot, isArtifactPathError, isHtmlPath, resolveAllowedArtifactFile } from "./artifact-path.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
 import { AsyncMutex } from "./async-mutex.js";
@@ -296,6 +321,101 @@ export function resolveBrowserDisconnectGraceMs(env = process.env) {
   return Math.min(value, 2147483647);
 }
 
+function timingSafeEqualString(a, b) {
+  const bufA = Buffer.from(String(a || ""), "utf8");
+  const bufB = Buffer.from(String(b || ""), "utf8");
+  return bufA.length > 0 && bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Parse `LAVISH_AXI_APPROVAL_TOKENS="Name=secret,Other=secret2"` into reviewer -> secret entries.
+ * @param {string | Record<string, string> | undefined} raw
+ */
+export function parseApprovalTokens(raw) {
+  /** @type {Array<{ reviewer: string, token: string }>} */
+  const out = [];
+  if (!raw) return out;
+  if (typeof raw === "object") {
+    for (const [name, tok] of Object.entries(raw)) {
+      const reviewer = normalizePromptAuthor(name);
+      const token = typeof tok === "string" ? tok.trim() : "";
+      if (reviewer && token) out.push({ reviewer, token });
+    }
+    return out;
+  }
+  for (const part of String(raw).split(",")) {
+    const entry = part.trim();
+    if (!entry) continue;
+    const eq = entry.indexOf("=");
+    if (eq <= 0) continue;
+    const reviewer = normalizePromptAuthor(entry.slice(0, eq));
+    const token = entry.slice(eq + 1).trim();
+    if (reviewer && token) out.push({ reviewer, token });
+  }
+  return out;
+}
+
+/**
+ * Parse optional `LAVISH_AXI_APPROVAL_USERS="Name=login_or_handle,..."` alias map for Tailscale whois.
+ * @param {string | Record<string, string | string[]> | undefined} raw
+ */
+export function parseApprovalUsers(raw) {
+  /** @type {Map<string, Set<string>>} */
+  const map = new Map();
+  const add = (name, alias) => {
+    const cleanName = normalizePromptAuthor(name).toLowerCase();
+    const cleanAlias = String(alias || "")
+      .trim()
+      .toLowerCase();
+    if (!cleanName || !cleanAlias) return;
+    let set = map.get(cleanName);
+    if (!set) {
+      set = new Set();
+      map.set(cleanName, set);
+    }
+    set.add(cleanAlias);
+  };
+  if (!raw) return map;
+  if (typeof raw === "object") {
+    for (const [name, val] of Object.entries(raw)) {
+      for (const item of Array.isArray(val) ? val : [val]) add(name, item);
+    }
+    return map;
+  }
+  for (const part of String(raw).split(",")) {
+    const entry = part.trim();
+    const eq = entry.indexOf("=");
+    if (eq <= 0) continue;
+    for (const item of entry
+      .slice(eq + 1)
+      .split("|")
+      .map((s) => s.trim())) {
+      add(entry.slice(0, eq), item);
+    }
+  }
+  return map;
+}
+
+function reviewerMatchesName(suppliedAuthor, expectedReviewer) {
+  const sup = normalizePromptAuthor(suppliedAuthor).toLowerCase();
+  const exp = normalizePromptAuthor(expectedReviewer).toLowerCase();
+  if (!sup || !exp) return false;
+  if (sup === exp) return true;
+  const supFirst = sup.split(/\s+/)[0];
+  const expFirst = exp.split(/\s+/)[0];
+  return Boolean(supFirst && supFirst === expFirst && (sup === supFirst || exp === expFirst));
+}
+
+export function doesAuthorMatchTailscaleWhois(suppliedAuthor, whois, aliasMap) {
+  const sup = normalizePromptAuthor(suppliedAuthor).toLowerCase();
+  if (!sup || !whois) return false;
+  const login = String(whois.loginName || "")
+    .trim()
+    .toLowerCase();
+  const aliases = aliasMap?.get(sup) || aliasMap?.get(sup.split(/\s+/)[0]);
+  return Boolean(login && aliases?.has(login));
+}
+
 /**
  * @param {{ [key: string]: any }} [options]
  */
@@ -316,6 +436,9 @@ export async function serve({
   publicUrl = publicBaseUrl(env),
   allowedHosts,
   detectTailscale: detectTailscaleFn,
+  whoisPeer: whoisPeerFn,
+  approvalTokens = env.LAVISH_AXI_APPROVAL_TOKENS,
+  approvalUsers = env.LAVISH_AXI_APPROVAL_USERS,
   lookupHost,
   extraListenHosts = [],
   bindRecoveryDelaysMs = BIND_RECOVERY_DELAYS_MS,
@@ -323,7 +446,16 @@ export async function serve({
   theme = resolveHostTheme(env),
   hubPeers = env[HUB_PEERS_ENV],
   hubPeerOptions = {},
+  actionLabel = env.LAVISH_AXI_ACTION_LABEL,
+  onEvent = null,
 } = {}) {
+  const whoisPeer = whoisPeerFn === undefined ? whoisTailscalePeer : whoisPeerFn;
+  const resolvedApprovalTokens = parseApprovalTokens(approvalTokens);
+  const resolvedApprovalUsers = parseApprovalUsers(approvalUsers);
+  const resolvedActionLabel =
+    String(actionLabel || "Send")
+      .trim()
+      .slice(0, 64) || "Send";
   // Keep the transport dependency off fast metadata paths such as `--version`.
   const { WebSocket, WebSocketServer } = await import("ws");
   // LAVISH_AXI_PUBLIC_URL replaces the origin of every board link the server emits, and its
@@ -365,6 +497,9 @@ export async function serve({
   let bindRecoveryTimer = null;
   const app = express();
   const store = new SessionStore(stateFile);
+  const notifySettingsStore = createNotifySettingsStore(path.dirname(stateFile), {
+    seedPeople: String(env[NOTIFY_PEOPLE_ENV] ?? process.env[NOTIFY_PEOPLE_ENV] ?? ""),
+  });
   const events = new EventEmitter();
   const watchers = new Map();
   const activePolls = new Map();
@@ -408,6 +543,7 @@ export async function serve({
   // few boards.
   events.on("reload", (key) => {
     broadcastLiveEvent("reload", key);
+    notifyHubStateChanged();
     // Working (docs/delivery-acks.md): a save after a delivery is the agent acting on what it was
     // handed. The store writes nothing when no delivered, unanswered note exists.
     store
@@ -419,17 +555,366 @@ export async function serve({
   });
   // The transcript the chrome renders is computed here (src/chat-messages.js): agent text ships
   // with its rendered html, user entries ship as text with their anchor, never as html.
-  events.on("agent-reply", (key, entry) => broadcastLiveEvent("agent-reply", key, entry));
+  events.on("agent-reply", (key, entry) => {
+    broadcastLiveEvent("agent-reply", key, entry);
+    notifyHubStateChanged();
+  });
+  events.on("board-metadata", (key, metadata) => broadcastLiveEvent("board-metadata", key, metadata));
   events.on("chat-sync", (key, session) => broadcastLiveEvent("chat-sync", key, serializeChatSync(session)));
-  events.on("agent-presence", (key, state) =>
-    broadcastLiveEvent("agent-presence", key, presenceEventData(key, state, activePolls, deliveredFeedback)),
-  );
+  events.on("agent-presence", (key, state) => {
+    broadcastLiveEvent("agent-presence", key, presenceEventData(key, state, activePolls, deliveredFeedback));
+    notifyHubStateChanged();
+  });
   events.on("layout-warnings", (key, warnings) => broadcastLiveEvent("layout-warnings", key, { warnings }));
-  events.on("owner-status", (key, owner) => broadcastLiveEvent("owner-status", key, { owner: owner || null }));
+  events.on("owner-status", (key, owner) => {
+    broadcastLiveEvent("owner-status", key, { owner: owner || null });
+    notifyHubStateChanged();
+  });
   events.on("ended", (key, endedBy) => broadcastLiveEvent("ended", key, { ended_by: endedBy || null }));
   events.on("ended", (key, endedBy) => {
     runEndHook(key, endedBy).catch((error) => writeLog(`[lavish] end hook failed: ${error?.message || error}`));
+    emitLocalBoardEnded(key, endedBy).catch((error) =>
+      writeLog(`[lavish] board end event failed: ${error?.message || error}`),
+    );
   });
+
+  function tagDiff(before = [], after = []) {
+    const beforeLower = new Set((Array.isArray(before) ? before : []).map((tag) => String(tag).toLowerCase()));
+    const afterLower = new Set((Array.isArray(after) ? after : []).map((tag) => String(tag).toLowerCase()));
+    return {
+      added: (Array.isArray(after) ? after : []).filter((tag) => !beforeLower.has(String(tag).toLowerCase())),
+      removed: (Array.isArray(before) ? before : []).filter((tag) => !afterLower.has(String(tag).toLowerCase())),
+    };
+  }
+
+  const MAX_HOOK_ARG_BYTES = 65_536;
+
+  function compactEventPayload(
+    payload,
+    { promptMax = 16_384, chatMax = 8_192, promptLimit = 32, chatLimit = 40, minimalAttachments = false } = {},
+  ) {
+    const out = { ...payload };
+    if (typeof out.search_text === "string" && out.search_text.length > 16_384) {
+      out.search_text = out.search_text.slice(0, 16_384);
+    }
+    if (Array.isArray(out.prompts)) {
+      out.prompts =
+        promptLimit <= 0
+          ? []
+          : out.prompts.slice(-promptLimit).map((prompt) => ({
+              prompt: String(prompt?.prompt || "").slice(0, promptMax),
+              tag: String(prompt?.tag || "").slice(0, 64),
+              selector: String(prompt?.selector || "").slice(0, minimalAttachments ? 128 : 512),
+              text: String(prompt?.text || "").slice(0, minimalAttachments ? 64 : 256),
+              ...(prompt?.prompt_id ? { prompt_id: String(prompt.prompt_id).slice(0, 128) } : {}),
+              ...(prompt?.author ? { author: String(prompt.author).slice(0, 80) } : {}),
+              ...(prompt?.via === "cli" || prompt?.via === "chrome_approval" ? { via: prompt.via } : {}),
+              ...(prompt?.approval_auth && typeof prompt.approval_auth === "object"
+                ? { approval_auth: prompt.approval_auth }
+                : {}),
+              ...(!minimalAttachments && prompt?.target ? { target: prompt.target } : {}),
+              ...(Array.isArray(prompt?.attachments) && prompt.attachments.length > 0
+                ? {
+                    attachments: prompt.attachments
+                      .slice(0, 16)
+                      .filter((att) => att && typeof att === "object" && att.id)
+                      .map((att) => ({
+                        id: String(att.id).slice(0, 128),
+                        ...(att.name ? { name: String(att.name).slice(0, 200) } : {}),
+                        ...(!minimalAttachments && att.path ? { path: String(att.path).slice(0, 1024) } : {}),
+                        ...(!minimalAttachments && att.mime ? { mime: String(att.mime).slice(0, 64) } : {}),
+                        ...(!minimalAttachments && Number.isFinite(att.bytes) ? { bytes: Number(att.bytes) } : {}),
+                        ...(!minimalAttachments && Number.isFinite(att.width) ? { width: Number(att.width) } : {}),
+                        ...(!minimalAttachments && Number.isFinite(att.height) ? { height: Number(att.height) } : {}),
+                      })),
+                  }
+                : {}),
+            }));
+    }
+    if (Array.isArray(out.chat)) {
+      out.chat =
+        chatLimit <= 0
+          ? []
+          : out.chat.slice(-chatLimit).map((entry) => ({
+              role: entry?.role === "agent" ? "agent" : "user",
+              text: String(entry?.text || "").slice(0, chatMax),
+              ...(entry?.author ? { author: String(entry.author).slice(0, 80) } : {}),
+              ...(entry?.at ? { at: String(entry.at).slice(0, 40) } : {}),
+              ...(Array.isArray(entry?.attachments) && entry.attachments.length > 0
+                ? {
+                    attachments: entry.attachments
+                      .slice(0, 16)
+                      .filter((att) => att && typeof att === "object" && att.id)
+                      .map((att) => ({
+                        id: String(att.id).slice(0, 128),
+                        ...(att.name ? { name: String(att.name).slice(0, 200) } : {}),
+                      })),
+                  }
+                : {}),
+            }));
+    }
+    return out;
+  }
+
+  function fitNotifySettingsToBudget(notifySettings, maxBytes) {
+    if (!notifySettings || typeof notifySettings !== "object") return {};
+    if (Buffer.byteLength(JSON.stringify(notifySettings), "utf8") <= maxBytes) return notifySettings;
+    /** @type {Record<string, any>} */
+    const fitted = {};
+    // Prioritize rows with active notifications (`tagged || done`) first if an oversized disk file ever appears.
+    const entries = Object.entries(notifySettings).sort(
+      ([, a], [, b]) => Number(Boolean(b?.tagged || b?.done)) - Number(Boolean(a?.tagged || a?.done)),
+    );
+    for (const [name, cfg] of entries) {
+      const next = { ...fitted, [name]: cfg };
+      if (Buffer.byteLength(JSON.stringify(next), "utf8") > maxBytes) continue;
+      fitted[name] = cfg;
+    }
+    return fitted;
+  }
+
+  function serializeBoundedHookPayload(eventPayload, notifySettings, maxBytes = MAX_HOOK_ARG_BYTES) {
+    const boundedSettings = fitNotifySettingsToBudget(notifySettings, Math.floor(maxBytes / 2));
+    const tiers = [
+      () => ({ ...eventPayload, notify_settings: boundedSettings }),
+      () => ({
+        ...compactEventPayload(
+          { ...eventPayload, search_text: String(eventPayload.search_text || "").slice(0, 4_096) },
+          { promptMax: 1_024, chatMax: 512, promptLimit: 16, chatLimit: 20 },
+        ),
+        notify_settings: boundedSettings,
+      }),
+      () => ({
+        ...compactEventPayload(
+          { ...eventPayload, search_text: String(eventPayload.search_text || "").slice(0, 512) },
+          { promptMax: 256, chatMax: 128, promptLimit: 8, chatLimit: 8, minimalAttachments: true },
+        ),
+        notify_settings: boundedSettings,
+      }),
+      () => ({
+        ...compactEventPayload(
+          { ...eventPayload, search_text: "", chat: [] },
+          { promptMax: 128, chatMax: 0, promptLimit: 4, chatLimit: 0, minimalAttachments: true },
+        ),
+        notify_settings: boundedSettings,
+      }),
+      () => {
+        const minimal = compactEventPayload(
+          {
+            ...eventPayload,
+            title: String(eventPayload.title || "").slice(0, 200),
+            search_text: "",
+            chat: [],
+            prompts: [],
+          },
+          { promptLimit: 0, chatLimit: 0 },
+        );
+        delete minimal.search_text;
+        delete minimal.chat;
+        return { ...minimal, notify_settings: boundedSettings };
+      },
+    ];
+    for (const buildTier of tiers) {
+      const serialized = JSON.stringify(buildTier());
+      if (Buffer.byteLength(serialized, "utf8") <= maxBytes) return serialized;
+    }
+    const bareWithoutSettings = {
+      event: eventPayload.event,
+      key: eventPayload.key,
+      ...(eventPayload.file ? { file: eventPayload.file } : {}),
+      ...(eventPayload.url ? { url: eventPayload.url } : {}),
+      ...(eventPayload.base ? { base: eventPayload.base } : {}),
+      ...(eventPayload.action ? { action: eventPayload.action } : {}),
+      ...(eventPayload.action_label ? { action_label: eventPayload.action_label } : {}),
+      ...(Array.isArray(eventPayload.tags) ? { tags: eventPayload.tags.slice(0, 32) } : {}),
+      ...(Array.isArray(eventPayload.added) ? { added: eventPayload.added.slice(0, 32) } : {}),
+      ...(Array.isArray(eventPayload.removed) ? { removed: eventPayload.removed.slice(0, 32) } : {}),
+    };
+    const bareOverhead = Buffer.byteLength(JSON.stringify({ ...bareWithoutSettings, notify_settings: {} }), "utf8");
+    const bare = {
+      ...bareWithoutSettings,
+      notify_settings: fitNotifySettingsToBudget(boundedSettings, Math.max(0, maxBytes - bareOverhead - 32)),
+    };
+    return JSON.stringify(bare);
+  }
+
+  const MAX_HUB_EVENT_HISTORY = 256;
+  const HOOK_STEP_TIMEOUT_MS = 10_000;
+  const hubInstanceId = crypto.randomUUID();
+  let hubEventSeq = 0;
+  /** @type {Array<{ seq: number, event: Record<string, any> }>} */
+  const hubEventHistory = [];
+  /** @type {Set<import("ws").WebSocket>} */
+  const hubPeerStreamClients = new Set();
+  /** @type {Set<import("ws").WebSocket>} */
+  const hubViewStreamClients = new Set();
+  let hookQueue = Promise.resolve();
+
+  function sendToSocketSet(clients, wire) {
+    for (const subscriber of clients) {
+      if (subscriber.readyState === WebSocket.OPEN) {
+        try {
+          subscriber.send(wire);
+        } catch {
+          // closed subscriber cleans up via close/heartbeat
+        }
+      }
+    }
+  }
+
+  function notifyHubViewers() {
+    if (hubViewStreamClients.size === 0) return;
+    sendToSocketSet(hubViewStreamClients, JSON.stringify({ type: "hub-refresh", at: new Date().toISOString() }));
+  }
+
+  function notifyHubStateChanged() {
+    notifyHubViewers();
+    if (hubPeerStreamClients.size > 0) {
+      sendToSocketSet(hubPeerStreamClients, JSON.stringify({ type: "hub-invalidate" }));
+    }
+  }
+
+  function runDetachedHookOrdered(envVar, command, args, extraEnv = {}) {
+    if (!command) {
+      return { configured: false, launched: Promise.resolve({ ok: true, error: "" }) };
+    }
+    if (!path.isAbsolute(command)) {
+      const msg = `${envVar} must be an absolute path to an executable; skipped`;
+      writeLog(`[lavish] ${msg}`);
+      return { configured: true, launched: Promise.resolve({ ok: false, error: msg }) };
+    }
+    /** @type {(res: { ok: boolean, error: string }) => void} */
+    let resolveLaunched;
+    const launched = new Promise((resolve) => {
+      resolveLaunched = resolve;
+    });
+    let launchSettled = false;
+    const settleLaunch = (ok, error = "") => {
+      if (launchSettled) return;
+      launchSettled = true;
+      resolveLaunched({ ok, error });
+    };
+    hookQueue = hookQueue
+      .then(
+        () =>
+          new Promise((resolve) => {
+            let settled = false;
+            const finish = () => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              resolve();
+            };
+            const timer = setTimeout(() => {
+              settleLaunch(false, `event hook ${command} timed out`);
+              finish();
+            }, HOOK_STEP_TIMEOUT_MS);
+            timer.unref?.();
+            try {
+              const child = spawn(command, args, {
+                detached: true,
+                stdio: "ignore",
+                env: { ...process.env, ...env, ...extraEnv },
+              });
+              child.once("spawn", () => settleLaunch(true));
+              child.on("error", (error) => {
+                writeLog(`[lavish] event hook ${command} failed to start: ${error.message}`);
+                settleLaunch(false, error.message);
+                finish();
+              });
+              child.once("close", () => {
+                settleLaunch(true);
+                finish();
+              });
+              child.unref();
+            } catch (error) {
+              const message = String(error?.message || error);
+              writeLog(`[lavish] event hook ${command} failed: ${message}`);
+              settleLaunch(false, message);
+              finish();
+            }
+          }),
+      )
+      .catch(() => {
+        settleLaunch(false, "event hook queue failed");
+      });
+    return { configured: true, launched };
+  }
+
+  // LAVISH_AXI_ON_EVENT (and optional LAVISH_AXI_ON_ACTION for board_action) names an executable run
+  // (no shell, detached, fire-and-forget) whenever a hub/board event occurs (board_created,
+  // board_reopened, message, board_action, tag_change, board_closed, board_cancelled), receiving one
+  // compact JSON payload argument so external workflows stay event-driven without polling.
+  function emitHubEvent(payload) {
+    const base = `http://${hostForUrl(LOOPBACK_HOST)}:${publicPort}`;
+    const isLocal = !payload.source;
+    const seq = isLocal ? (hubEventSeq += 1) : undefined;
+    const eventPayload = compactEventPayload({
+      ...payload,
+      ...(isLocal ? { instance_id: hubInstanceId } : {}),
+      ...(seq ? { seq } : {}),
+      base,
+      at: new Date().toISOString(),
+    });
+    if (isLocal && seq) {
+      hubEventHistory.push({ seq, event: eventPayload });
+      if (hubEventHistory.length > MAX_HUB_EVENT_HISTORY) {
+        hubEventHistory.splice(0, hubEventHistory.length - MAX_HUB_EVENT_HISTORY);
+      }
+      const wire = JSON.stringify({ type: "hub-event", instance_id: hubInstanceId, seq, event: eventPayload });
+      sendToSocketSet(hubPeerStreamClients, wire);
+      sendToSocketSet(hubViewStreamClients, wire);
+    } else {
+      notifyHubViewers();
+    }
+    const notifySnapshot = notifySettingsStore.getSync();
+    const hookPayload = { ...eventPayload, notify_settings: notifySnapshot };
+    if (typeof onEvent === "function") {
+      Promise.resolve()
+        .then(() => onEvent(hookPayload))
+        .catch((error) => writeLog(`[lavish] onEvent callback failed: ${error?.message || error}`));
+    }
+    const serialized = serializeBoundedHookPayload(eventPayload, notifySnapshot, MAX_HOOK_ARG_BYTES);
+    const hookEnv = { LAVISH_AXI_EVENT: String(eventPayload.event || "") };
+    const eventCommand = String(env.LAVISH_AXI_ON_EVENT || process.env.LAVISH_AXI_ON_EVENT || "").trim();
+    const launchResults = [runDetachedHookOrdered("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv)];
+    if (eventPayload.event === "board_action") {
+      const actionCommand = String(env.LAVISH_AXI_ON_ACTION || process.env.LAVISH_AXI_ON_ACTION || "").trim();
+      if (actionCommand && actionCommand !== eventCommand) {
+        launchResults.push(runDetachedHookOrdered("LAVISH_AXI_ON_ACTION", actionCommand, [serialized], hookEnv));
+      }
+    }
+    const configuredLaunches = launchResults.filter((item) => item.configured).map((item) => item.launched);
+    return {
+      configured: configuredLaunches.length > 0,
+      launched:
+        configuredLaunches.length === 0
+          ? Promise.resolve({ ok: true, error: "" })
+          : Promise.all(configuredLaunches).then((outcomes) => {
+              const failedOutcome = outcomes.find((item) => !item.ok);
+              return failedOutcome || { ok: true, error: "" };
+            }),
+    };
+  }
+
+  async function emitLocalBoardEnded(key, endedBy) {
+    const session = await store.findByKey(key);
+    if (!session) return;
+    const head = await readBoardHead(session.file, { includeSearchText: true });
+    const cancelled = session.ended_reason === "cancelled";
+    emitHubEvent({
+      event: cancelled ? "board_cancelled" : "board_closed",
+      key,
+      file: session.file,
+      url: session.url,
+      title: boardTitle(session, head.title),
+      creator: session.creator || "",
+      tags: session.tags || [],
+      cancelled,
+      ended_by: endedBy === "user" ? "user" : "agent",
+      search_text: head.searchText || "",
+    });
+  }
 
   // LAVISH_AXI_ON_END names an executable run (no shell) whenever a session ends - from the
   // browser, Send & End, the hub, or `lavish-axi end` - with the board file, session key, who
@@ -437,7 +922,7 @@ export async function serve({
   // board's copy (GET /api/:key/export) and conversation (GET /api/:key/conversation). Detached and
   // fire-and-forget: a slow or failing hook never delays or fails the end.
   async function runEndHook(key, endedBy) {
-    const command = String(process.env.LAVISH_AXI_ON_END || "").trim();
+    const command = String(env.LAVISH_AXI_ON_END || process.env.LAVISH_AXI_ON_END || "").trim();
     if (!command) return;
     if (!path.isAbsolute(command)) {
       writeLog("[lavish] LAVISH_AXI_ON_END must be an absolute path to an executable; skipped");
@@ -489,6 +974,7 @@ export async function serve({
     browserDisconnectPending.delete(key);
     liveEventClients.set(client, key);
     refreshIdleTimer();
+    notifyHubStateChanged();
     let cleanedUp = false;
     const cleanup = () => {
       if (cleanedUp) return;
@@ -496,6 +982,7 @@ export async function serve({
       liveEventClients.delete(client);
       scheduleBrowserDisconnect(key);
       refreshIdleTimer();
+      notifyHubStateChanged();
     };
     onClose(cleanup);
     return cleanup;
@@ -819,15 +1306,88 @@ export async function serve({
 
   // ---- The hub (src/hub.js) ----
   // The front page lists every board with a state computed from what this server already knows.
-  async function readBoardHead(file) {
+  const DEFAULT_HUB_LIMIT = 50;
+  const MAX_HUB_LIMIT = 200;
+  const BOARD_IO_CONCURRENCY = 32;
+  const MAX_BOARD_HEAD_CACHE = 2048;
+  /** @type {Map<string, { stamp: string, title: string, searchText: string | null }>} */
+  const boardHeadCache = new Map();
+
+  /**
+   * @template T, R
+   * @param {T[]} items
+   * @param {number} concurrency
+   * @param {(item: T, index: number) => Promise<R>} worker
+   * @returns {Promise<R[]>}
+   */
+  async function mapLimit(items, concurrency, worker) {
+    if (items.length === 0) return [];
+    const results = new Array(items.length);
+    let cursor = 0;
+    const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      for (;;) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= items.length) return;
+        results[index] = await worker(items[index], index);
+      }
+    });
+    await Promise.all(runners);
+    return results;
+  }
+
+  async function checkBoardFileExists(file) {
+    try {
+      const st = await stat(file);
+      return st.isFile();
+    } catch (error) {
+      return error?.code !== "ENOENT" && error?.code !== "ENOTDIR";
+    }
+  }
+
+  async function readBoardHead(file, { includeSearchText = false } = {}) {
+    let st;
+    try {
+      st = await stat(file, { bigint: true });
+    } catch (error) {
+      boardHeadCache.delete(file);
+      return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "", searchText: "" };
+    }
+    if (!st.isFile()) {
+      boardHeadCache.delete(file);
+      return { exists: false, title: "", searchText: "" };
+    }
+    const stamp = `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+    const cached = boardHeadCache.get(file);
+    if (cached && cached.stamp === stamp && (!includeSearchText || cached.searchText !== null)) {
+      return { exists: true, title: cached.title, searchText: cached.searchText || "" };
+    }
+    const maxBytes = includeSearchText ? 1024 * 1024 : 64 * 1024;
+    const toRead = Math.min(Number(st.size), maxBytes);
+    if (toRead === 0) {
+      boardHeadCache.set(file, { stamp, title: "", searchText: "" });
+      return { exists: true, title: "", searchText: "" };
+    }
     let handle;
     try {
       handle = await openFile(file, "r");
-      const buffer = Buffer.alloc(64 * 1024);
+      const buffer = Buffer.allocUnsafe(toRead);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      return { exists: true, title: extractArtifactHead(buffer.subarray(0, bytesRead).toString("utf8")).title };
+      const html = buffer.subarray(0, bytesRead).toString("utf8");
+      const title = extractArtifactHead(html.slice(0, 64 * 1024)).title;
+      const searchText = includeSearchText
+        ? boardSearchText(html).slice(0, 64 * 1024)
+        : cached && cached.stamp === stamp
+          ? cached.searchText
+          : null;
+      if (!boardHeadCache.has(file) && boardHeadCache.size >= MAX_BOARD_HEAD_CACHE) {
+        const oldestKey = boardHeadCache.keys().next().value;
+        if (oldestKey !== undefined) boardHeadCache.delete(oldestKey);
+      }
+      boardHeadCache.set(file, { stamp, title, searchText });
+      return { exists: true, title, searchText: searchText || "" };
     } catch (error) {
-      return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "" };
+      return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "", searchText: "" };
     } finally {
       await handle?.close().catch(() => {});
     }
@@ -840,47 +1400,437 @@ export async function serve({
   }
 
   // LAVISH_AXI_HUB_PEERS (src/hub-peers.js): other Lavish servers whose boards this hub also
-  // lists, read from their /api/hub. A bad entry is logged and dropped, never fatal.
+  // lists, read from their /api/hub, with real-time lifecycle events pushed over their /events/hub
+  // WebSocket stream (never inferred by snapshot polling).
   const parsedPeers = parseHubPeers(hubPeers);
   for (const error of parsedPeers.errors) writeLog(`[lavish] ${error}; skipped`);
-  const collectPeerBoards = parsedPeers.peers.length ? createPeerBoardSource(parsedPeers.peers, hubPeerOptions) : null;
+  /** @type {Set<string>} */
+  const livePeerStreams = new Set();
+  const collectPeerBoards = parsedPeers.peers.length
+    ? createPeerBoardSource(parsedPeers.peers, {
+        ...hubPeerOptions,
+        isStreamLive: (peerName) => livePeerStreams.has(String(peerName).toLowerCase()),
+        onSettled: () => notifyHubViewers(),
+      })
+    : null;
+  const PEER_WS_BACKOFF_MS = [200, 500, 1000, 2000, 5000];
+  /** @type {Array<{ close: () => void }>} */
+  const peerEventSubscriptions = [];
+  const peerCursorsFile = path.join(path.dirname(stateFile), "peer-cursors.json");
+  /** @type {Record<string, { instance_id: string, seq: number }>} */
+  const peerCursors = {};
+  let peerCursorWriteChain = Promise.resolve();
 
-  /** @param {{ includePeers?: boolean }} [options] */
-  async function hubView({ includePeers = true } = {}) {
-    const [local, remote] = await Promise.all([
-      hubBoards(),
-      includePeers && collectPeerBoards ? collectPeerBoards() : null,
-    ]);
-    if (!remote) return { boards: local, peers: [] };
-    return { boards: sortHubBoards([...local, ...remote.boards]), peers: remote.peers };
+  async function loadPeerCursors() {
+    try {
+      const raw = await readFile(peerCursorsFile, "utf8");
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return;
+      for (const [k, val] of Object.entries(parsed)) {
+        if (!val || typeof val !== "object") continue;
+        const inst = typeof val.instance_id === "string" ? val.instance_id.trim() : "";
+        const seq = Number(val.seq);
+        if (inst || (Number.isInteger(seq) && seq >= 0)) {
+          peerCursors[k.toLowerCase()] = {
+            instance_id: inst,
+            seq: Number.isInteger(seq) && seq >= 0 ? seq : 0,
+          };
+        }
+      }
+    } catch {
+      // Missing or unreadable sidecar starts fresh.
+    }
   }
 
-  async function hubBoards() {
-    const sessions = await store.listSessions();
+  function persistPeerCursor(peerKey, instanceId, seq) {
+    peerCursors[peerKey] = { instance_id: instanceId, seq };
+    const snapshot = `${JSON.stringify(peerCursors, null, 2)}\n`;
+    peerCursorWriteChain = peerCursorWriteChain
+      .then(async () => {
+        const tmp = `${peerCursorsFile}.${process.pid}.tmp`;
+        await writeFile(tmp, snapshot, { mode: 0o600 });
+        await rename(tmp, peerCursorsFile);
+      })
+      .catch(() => {});
+    return peerCursorWriteChain;
+  }
+
+  function startPeerEventSubscribers() {
+    for (const peer of parsedPeers.peers) {
+      const peerKey = peer.name.toLowerCase();
+      const savedCursor = peerCursors[peerKey];
+      let peerInstanceId = savedCursor?.instance_id || "";
+      let lastSeq = savedCursor?.seq || 0;
+      let attempt = 0;
+      let closed = false;
+      let peerFrameQueue = Promise.resolve();
+      /** @type {import("ws").WebSocket | null} */
+      let socket = null;
+      /** @type {ReturnType<typeof setTimeout> | null} */
+      let retryTimer = null;
+      const wsOrigin = peer.origin.replace(/^http/i, "ws");
+
+      const scheduleReconnect = () => {
+        if (closed || shuttingDown || retryTimer) return;
+        const delay = PEER_WS_BACKOFF_MS[Math.min(attempt, PEER_WS_BACKOFF_MS.length - 1)];
+        attempt += 1;
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          connect();
+        }, delay);
+        retryTimer.unref?.();
+      };
+
+      const connect = () => {
+        if (closed || shuttingDown) return;
+        try {
+          const params = new URLSearchParams({ peers: "0", since: String(lastSeq) });
+          if (peerInstanceId) params.set("instance", peerInstanceId);
+          const ws = new WebSocket(`${wsOrigin}/events/hub?${params}`);
+          socket = ws;
+          ws.on("open", () => {
+            attempt = 0;
+            livePeerStreams.add(peerKey);
+            collectPeerBoards?.invalidate(peer.name);
+            notifyHubViewers();
+          });
+          ws.on("message", (raw) => {
+            peerFrameQueue = peerFrameQueue
+              .then(async () => {
+                if (closed || shuttingDown) return;
+                const msg = JSON.parse(String(raw));
+                if (!msg || typeof msg !== "object") return;
+                if (msg.type === "hub-hello") {
+                  const nextInstance = typeof msg.instance_id === "string" ? msg.instance_id.trim() : "";
+                  if (nextInstance && nextInstance !== peerInstanceId) {
+                    peerInstanceId = nextInstance;
+                    lastSeq = 0;
+                    await persistPeerCursor(peerKey, peerInstanceId, lastSeq);
+                    collectPeerBoards?.invalidate(peer.name);
+                    notifyHubViewers();
+                  }
+                  return;
+                }
+                if (msg.type === "hub-invalidate") {
+                  collectPeerBoards?.invalidate(peer.name);
+                  notifyHubViewers();
+                  return;
+                }
+                if (msg.type !== "hub-event") return;
+                let cursorChanged = false;
+                const eventInstance = typeof msg.instance_id === "string" ? msg.instance_id.trim() : "";
+                if (eventInstance && eventInstance !== peerInstanceId) {
+                  peerInstanceId = eventInstance;
+                  lastSeq = 0;
+                  cursorChanged = true;
+                }
+                const seq = Number(msg.seq);
+                if (Number.isInteger(seq) && seq > 0) {
+                  if (seq <= lastSeq) return;
+                  lastSeq = seq;
+                  cursorChanged = true;
+                }
+                if (cursorChanged) {
+                  await persistPeerCursor(peerKey, peerInstanceId, lastSeq);
+                }
+                collectPeerBoards?.invalidate(peer.name);
+                const sanitized = sanitizePeerHubEvent(peer, msg.event);
+                if (sanitized) emitHubEvent(sanitized);
+              })
+              .catch(() => {
+                // ignore malformed peer frame
+              });
+          });
+          ws.on("error", () => {});
+          ws.on("close", () => {
+            if (socket === ws) socket = null;
+            livePeerStreams.delete(peerKey);
+            collectPeerBoards?.invalidate(peer.name);
+            notifyHubViewers();
+            scheduleReconnect();
+          });
+        } catch {
+          scheduleReconnect();
+        }
+      };
+
+      connect();
+      peerEventSubscriptions.push({
+        close() {
+          closed = true;
+          livePeerStreams.delete(peerKey);
+          if (retryTimer) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+          }
+          if (socket) {
+            try {
+              socket.terminate();
+            } catch {
+              // ignore
+            }
+            socket = null;
+          }
+        },
+      });
+    }
+    refreshIdleTimer();
+  }
+
+  function closePeerEventSubscribers() {
+    for (const sub of peerEventSubscriptions.splice(0)) sub.close();
+  }
+
+  const PEER_TOTAL_SEARCH_TEXT_BUDGET = 16 * 1024 * 1024;
+
+  function stripBoardSearchText(board) {
+    if (!board || typeof board !== "object" || !Object.hasOwn(board, "search_text")) return board;
+    const copy = { ...board };
+    delete copy.search_text;
+    return copy;
+  }
+
+  function parseHubLimit(rawLimit) {
+    if (rawLimit === undefined || rawLimit === "") return DEFAULT_HUB_LIMIT;
+    const parsed = Number(rawLimit);
+    if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_HUB_LIMIT;
+    return Math.min(Math.floor(parsed), MAX_HUB_LIMIT);
+  }
+
+  function parseHubOffset(rawOffset) {
+    if (rawOffset === undefined || rawOffset === "") return 0;
+    const parsed = Number(rawOffset);
+    if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+    return Math.min(Math.floor(parsed), 1_000_000);
+  }
+
+  const HUB_INITIAL_PEER_WAIT_MS = 80;
+
+  /**
+   * @param {{
+   *   includePeers?: boolean,
+   *   maxPeerWaitMs?: number,
+   *   peersOnly?: boolean,
+   *   query?: string,
+   *   tag?: string,
+   *   state?: string,
+   *   limit?: number,
+   *   offset?: number,
+   * }} [options]
+   */
+  async function queryHub({
+    includePeers = true,
+    maxPeerWaitMs = undefined,
+    peersOnly = false,
+    query = "",
+    tag = "",
+    state = "",
+    limit = DEFAULT_HUB_LIMIT,
+    offset = 0,
+  } = {}) {
+    const [sessions, remote] = await Promise.all([
+      store.listSessions(),
+      includePeers && collectPeerBoards ? collectPeerBoards({ maxWaitMs: maxPeerWaitMs }) : null,
+    ]);
     const now = Date.now();
-    const boards = await Promise.all(
-      sessions.map(async (session) => {
-        const head = await readBoardHead(session.file);
-        const holder = activePolls.get(session.key);
-        return serializeHubBoard(session, {
-          listener: holder ? listenerLabel(holder) : null,
-          tabs: liveClientCount(session.key),
+    /** @type {Map<string, any>} */
+    const sessionByKey = new Map();
+    const openSessions = [];
+    for (const session of sessions) {
+      sessionByKey.set(String(session.key), session);
+      if (session.status !== "ended") openSessions.push(session);
+    }
+    const openExists = await mapLimit(openSessions, BOARD_IO_CONCURRENCY, (session) =>
+      checkBoardFileExists(session.file),
+    );
+    /** @type {Map<string, boolean>} */
+    const existsByKey = new Map();
+    for (let i = 0; i < openSessions.length; i += 1) {
+      existsByKey.set(String(openSessions[i].key), openExists[i]);
+    }
+
+    const buildLocalBoard = (session, facts = {}) => {
+      const holder = activePolls.get(session.key);
+      const cachedHead = boardHeadCache.get(session.file);
+      return serializeHubBoard(session, {
+        listener: holder ? listenerLabel(holder) : null,
+        tabs: liveClientCount(session.key),
+        fileExists: facts.fileExists !== undefined ? facts.fileExists : (existsByKey.get(String(session.key)) ?? true),
+        title: facts.title !== undefined ? facts.title : cachedHead?.title || "",
+        ...(facts.includeSearchText ? { searchText: facts.searchText || "", includeSearchText: true } : {}),
+        version,
+        now,
+      });
+    };
+
+    const localSkeletons = sessions.map((session) => buildLocalBoard(session));
+    const remoteBoards = remote
+      ? remote.boards.map((board) => ({ ...board, version_behind: boardVersionBehind(board, version) }))
+      : [];
+    const sortedAll = sortHubBoards([...localSkeletons, ...remoteBoards]);
+    const summary = summarizeHubBoards(sortedAll);
+
+    const cleanQuery = String(query || "").trim();
+    const cleanTag = String(tag || "").trim();
+    const cleanState = String(state || "").trim();
+
+    let candidates = filterHubBoards(sortedAll, { query: "", tag: cleanTag, state: cleanState });
+    let filtered;
+    if (cleanQuery) {
+      const hydrated = await mapLimit(candidates, BOARD_IO_CONCURRENCY, async (board) => {
+        if (board.source) return board;
+        const session = sessionByKey.get(board.key);
+        if (!session) return board;
+        const head = await readBoardHead(session.file, { includeSearchText: true });
+        return buildLocalBoard(session, {
           fileExists: head.exists,
           title: head.title,
-          now,
+          searchText: head.searchText,
+          includeSearchText: true,
         });
-      }),
-    );
-    return sortHubBoards(boards);
+      });
+      filtered = sortHubBoards(filterHubBoards(hydrated, { query: cleanQuery, tag: cleanTag, state: cleanState }));
+    } else {
+      filtered = candidates;
+    }
+
+    if (peersOnly) {
+      let peerSlice = filtered.slice(0, PEER_MAX_BOARDS);
+      if (!cleanQuery && peerSlice.length > 0) {
+        peerSlice = await mapLimit(peerSlice, BOARD_IO_CONCURRENCY, async (board) => {
+          if (board.source) return board;
+          const session = sessionByKey.get(board.key);
+          if (!session) return board;
+          const head = await readBoardHead(session.file, { includeSearchText: true });
+          return buildLocalBoard(session, {
+            fileExists: head.exists,
+            title: head.title,
+            searchText: head.searchText,
+            includeSearchText: true,
+          });
+        });
+      }
+      if (peerSlice.length > 0) {
+        const perBoardMax = Math.min(
+          64 * 1024,
+          Math.max(4 * 1024, Math.floor(PEER_TOTAL_SEARCH_TEXT_BUDGET / peerSlice.length)),
+        );
+        if (perBoardMax < 64 * 1024) {
+          peerSlice = peerSlice.map((board) =>
+            typeof board.search_text === "string" && board.search_text.length > perBoardMax
+              ? { ...board, search_text: board.search_text.slice(0, perBoardMax) }
+              : board,
+          );
+        }
+      }
+      return {
+        boards: peerSlice,
+        peers: [],
+        ...summary,
+        total: filtered.length,
+        limit: PEER_MAX_BOARDS,
+        offset: 0,
+        has_more: filtered.length > peerSlice.length,
+      };
+    }
+
+    const total = filtered.length;
+    let pageSlice = filtered.slice(offset, offset + limit);
+    if (!cleanQuery && pageSlice.length > 0) {
+      pageSlice = await mapLimit(pageSlice, BOARD_IO_CONCURRENCY, async (board) => {
+        if (board.source) return board;
+        const session = sessionByKey.get(board.key);
+        if (!session) return board;
+        const head = await readBoardHead(session.file, { includeSearchText: false });
+        return buildLocalBoard(session, { fileExists: head.exists, title: head.title });
+      });
+    }
+    const publicBoards = pageSlice.map(stripBoardSearchText);
+    return {
+      boards: publicBoards,
+      peers: remote ? remote.peers : [],
+      ...summary,
+      total,
+      limit,
+      offset,
+      has_more: offset + publicBoards.length < total,
+      notify_settings: notifySettingsStore.getSync(),
+    };
   }
 
   app.get("/", async (_req, res, next) => {
     try {
       res.setHeader("x-frame-options", "DENY");
       res.setHeader("content-security-policy", "frame-ancestors 'none'");
-      const view = await hubView();
-      res.type("html").send(createHubHtml({ ...view, hostname: osHostname(), theme }));
+      const view = await queryHub({
+        includePeers: true,
+        maxPeerWaitMs: HUB_INITIAL_PEER_WAIT_MS,
+        state: "open",
+        limit: DEFAULT_HUB_LIMIT,
+        offset: 0,
+      });
+      res.type("html").send(
+        createHubHtml({
+          boards: view.boards,
+          peers: view.peers,
+          counts: view.counts,
+          openSummary: view.open_summary,
+          tags: view.tags,
+          total: view.total,
+          limit: view.limit,
+          offset: view.offset,
+          hasMore: view.has_more,
+          notifySettings: notifySettingsStore.getSync(),
+          hostname: osHostname(),
+          theme,
+        }),
+      );
     } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/hub/notifications", async (_req, res, next) => {
+    try {
+      const current = await notifySettingsStore.get();
+      res.json({ notify_settings: current, revision: notifySettingsStore.revision() });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/hub/notifications", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin notification settings write rejected" });
+        return;
+      }
+      const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : null;
+      let saved;
+      if (body && Object.hasOwn(body, "seed")) {
+        saved = await notifySettingsStore.seedIfMissing(typeof body.seed === "string" ? body.seed : "");
+      } else if (body && Object.hasOwn(body, "add")) {
+        saved = await notifySettingsStore.addPerson(body.add);
+      } else if (body && Object.hasOwn(body, "remove")) {
+        saved = await notifySettingsStore.removePerson(body.remove);
+      } else if (body && Object.hasOwn(body, "patch")) {
+        saved = await notifySettingsStore.patchPerson(body.patch);
+      } else {
+        const rawSettings = body && Object.hasOwn(body, "notify_settings") ? body.notify_settings : req.body;
+        const expectedRevision = body && typeof body.revision === "string" ? body.revision.trim() : "";
+        saved = await notifySettingsStore.save(rawSettings, { expectedRevision });
+      }
+      notifyHubViewers();
+      res.json({ notify_settings: saved, revision: notifySettingsStore.revision() });
+    } catch (error) {
+      if (error instanceof NotifySettingsError) {
+        res.status(error.statusCode || 400).json({
+          error: error.message,
+          notify_settings: notifySettingsStore.getSync(),
+          revision: notifySettingsStore.revision(),
+        });
+        return;
+      }
       next(error);
     }
   });
@@ -888,9 +1838,23 @@ export async function serve({
   app.get("/api/hub", async (req, res, next) => {
     try {
       // `?peers=0` is what a peer hub asks for: this server's own boards only, so hubs that list
-      // each other never loop.
-      const view = await hubView({ includePeers: req.query.peers !== "0" });
-      res.json({ ...view, generated_at: new Date().toISOString() });
+      // each other never loop, and bounded to PEER_MAX_BOARDS so a large peer never overflows PEER_MAX_BYTES.
+      const peersOnly = req.query.peers === "0";
+      const view = await queryHub({
+        includePeers: !peersOnly,
+        peersOnly,
+        query: String(req.query.q || ""),
+        tag: String(req.query.tag || ""),
+        state: String(req.query.state || ""),
+        limit: parseHubLimit(req.query.limit),
+        offset: parseHubOffset(req.query.offset),
+      });
+      res.json({
+        ...view,
+        action_label: resolvedActionLabel,
+        version,
+        generated_at: new Date().toISOString(),
+      });
     } catch (error) {
       next(error);
     }
@@ -898,15 +1862,22 @@ export async function serve({
 
   // Close from the hub. Same-origin like /prompts: only the hub page may close a board this way.
   // Unlike the board's own End, it never shuts the server down - the reviewer is still on the hub.
+  // Configured peer boards relay to that peer's own hub endpoint with zero viewer headers forwarded.
   app.post("/api/hub/:key/close", async (req, res, next) => {
     try {
       if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
         res.status(403).json({ error: "cross-origin close rejected" });
         return;
       }
-      // A peer's board belongs to the peer: this hub only links to it and never ends it.
       if (isPeerKey(req.params.key)) {
-        res.status(400).json({ error: "a peer's board is closed on its own server" });
+        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        if (!target) {
+          res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        const relayed = await relayPeerHubAction(target.peer, target.peerKey, "close", hubPeerOptions);
+        if (relayed.ok) collectPeerBoards?.invalidate(target.peer.name);
+        res.status(relayed.status).json(relayed.payload);
         return;
       }
       const session = await store.endSession(req.params.key, "user");
@@ -914,9 +1885,331 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key, session.ended_by);
-      res.json({ status: "ended", ended_by: session.ended_by });
+      if (session.end_changed) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+        events.emit("ended", req.params.key, session.ended_by);
+      }
+      res.json({ status: "ended", ended_by: session.ended_by, ...serializeBoardMetadata(session) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Cancel from the hub or board chrome: ends the board without marking it Done, so external brain
+  // hooks skip cancelled boards while keeping them searchable and restorable from Cancelled.
+  app.post("/api/hub/:key/cancel", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin cancel rejected" });
+        return;
+      }
+      if (isPeerKey(req.params.key)) {
+        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        if (!target) {
+          res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        const relayed = await relayPeerHubAction(target.peer, target.peerKey, "cancel", hubPeerOptions);
+        if (relayed.ok) collectPeerBoards?.invalidate(target.peer.name);
+        res.status(relayed.status).json(relayed.payload);
+        return;
+      }
+      const session = await store.endSession(req.params.key, "user", { cancelled: true });
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (session.end_changed) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+        events.emit("ended", req.params.key, session.ended_by);
+      }
+      res.json({ status: "ended", ended_by: session.ended_by, ...serializeBoardMetadata(session) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Reactivate a closed or cancelled board from the hub in one tap (local or configured peer).
+  app.post("/api/hub/:key/reopen", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin reopen rejected" });
+        return;
+      }
+      if (isPeerKey(req.params.key)) {
+        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        if (!target) {
+          res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        const relayed = await relayPeerHubAction(target.peer, target.peerKey, "reopen", hubPeerOptions);
+        if (relayed.ok) collectPeerBoards?.invalidate(target.peer.name);
+        res.status(relayed.status).json(relayed.payload);
+        return;
+      }
+      const existing = await store.findByKey(req.params.key);
+      if (!existing) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const file = await resolveAllowedArtifactFile(existing.file);
+      const key = sessionKey(file);
+      const sessionUrl = `${linkOrigin()}/session/${key}`;
+      const wasReopened = existing.status === "ended";
+      const session = await store.upsertSession(file, sessionUrl, { version });
+      if (wasReopened) {
+        clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+      }
+      logEvent?.(`session reopened from hub key=${key} file=${file}`);
+      await syncOutstandingRepairs(key);
+      await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
+      if (wasReopened) {
+        const { title } = await readBoardHead(session.file);
+        emitHubEvent({
+          event: "board_reopened",
+          key,
+          file: session.file,
+          url: session.url,
+          title: boardTitle(session, title),
+          creator: session.creator || "",
+          tags: session.tags || [],
+          created_version: session.created_version || "",
+          served_version: session.served_version || "",
+        });
+      }
+      res.json({
+        key,
+        file,
+        url: sessionUrl,
+        status: "opened",
+        ...serializeBoardMetadata(session),
+        ...networkWarningField(),
+      });
+    } catch (error) {
+      if (isArtifactPathError(error)) {
+        res.status(error.statusCode).json({
+          status: "error",
+          code: error.code,
+          error: error.message,
+        });
+        return;
+      }
+      next(error);
+    }
+  });
+
+  // Generic configurable board workflow action (default label "Send", overridden via
+  // LAVISH_AXI_ACTION_LABEL). Normal board chat stays free conversation; clicking this control (or
+  // passing --send from the CLI) fires `board_action` so each person's external workflow can run.
+  app.post("/api/:key/action", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin action rejected" });
+        return;
+      }
+      if (isPeerKey(req.params.key)) {
+        res.status(400).json({ error: "run actions on a peer board from its own server" });
+        return;
+      }
+      let current = await store.findByKey(req.params.key);
+      if (!current) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (current.status === "ended") {
+        res.status(409).json({ status: "ended", error: "session already ended", ended_by: current.ended_by });
+        return;
+      }
+      const activeHolder = activePolls.get(req.params.key);
+      const inlinePrompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
+      const inlineAuthor = typeof req.body?.author === "string" ? req.body.author.trim() : "";
+      const inlineAttachments = req.body?.attachments;
+      let acceptedPrompts = [];
+      let clearedTags = [];
+      if (inlinePrompt || inlineAttachments != null) {
+        const queued = await store.queuePrompts(
+          req.params.key,
+          {
+            prompts: [
+              {
+                uid: "",
+                prompt: inlinePrompt,
+                selector: "",
+                tag: "message",
+                text: "Board message",
+                prompt_id: `action-${crypto.randomUUID()}`,
+                ...(inlineAuthor ? { author: inlineAuthor } : {}),
+                ...(inlineAttachments != null ? { attachments: inlineAttachments } : {}),
+              },
+            ],
+          },
+          {
+            resolveAttachment: (sessionKeyValue, id) => resolveAttachment(attachmentStateRoot, sessionKeyValue, id),
+            maxPerPrompt: attachmentConfig.maxPerPrompt,
+            maxPromptBytes: attachmentConfig.maxPromptBytes,
+          },
+        );
+        if (!queued) {
+          res.status(404).json({ error: "session not found" });
+          return;
+        }
+        if (queued.ended) {
+          res.status(409).json({ status: "ended", error: "session already ended", ended_by: queued.ended_by });
+          return;
+        }
+        if (queued.rejected) {
+          res.status(400).json({
+            error: "some attachments could not be delivered",
+            rejected: queued.rejected,
+            caps: queued.caps,
+          });
+          return;
+        }
+        if (queued.conflict) {
+          res.status(409).json({ status: "conflict", error: "message could not be queued" });
+          return;
+        }
+        current = queued;
+        acceptedPrompts = Array.isArray(queued.accepted_prompts) ? queued.accepted_prompts : [];
+        clearedTags = Array.isArray(queued.cleared_tags) ? queued.cleared_tags : [];
+        if (queued.fresh_feedback) {
+          emitHubEvent({
+            event: "message",
+            key: req.params.key,
+            file: current.file,
+            url: current.url,
+            creator: current.creator || "",
+            tags: current.tags || [],
+            had_listener: Boolean(activeHolder),
+            listener: activeHolder ? listenerLabel(activeHolder) : null,
+            prompts: acceptedPrompts,
+          });
+          events.emit("feedback", req.params.key, current.ended_by);
+          events.emit("chat-sync", req.params.key, current);
+        }
+      }
+      if (Array.isArray(current.tags) && current.tags.some((tag) => String(tag).toLowerCase() === "needs-input")) {
+        const priorTags = current.tags;
+        const updated = await store.updateBoardTags(req.params.key, { remove: ["needs-input"] });
+        if (updated) {
+          const diff = tagDiff(priorTags, updated.tags || []);
+          clearedTags = [...clearedTags, ...diff.removed];
+          current = updated;
+        }
+      }
+      const metadata = serializeBoardMetadata(current);
+      const head = await readBoardHead(current.file);
+      if (clearedTags.length) {
+        events.emit("board-metadata", req.params.key, metadata);
+        emitHubEvent({
+          event: "tag_change",
+          key: req.params.key,
+          file: current.file,
+          url: current.url,
+          title: boardTitle(current, head.title),
+          creator: current.creator || "",
+          tags: metadata.tags,
+          added: [],
+          removed: clearedTags,
+        });
+      }
+      const actionName =
+        String(req.body?.action || "send")
+          .trim()
+          .slice(0, 40) || "send";
+      const actionHook = emitHubEvent({
+        event: "board_action",
+        action: actionName,
+        action_label: resolvedActionLabel,
+        key: req.params.key,
+        file: current.file,
+        url: current.url,
+        title: boardTitle(current, head.title),
+        creator: current.creator || "",
+        tags: metadata.tags,
+        had_listener: Boolean(activeHolder),
+        listener: activeHolder ? listenerLabel(activeHolder) : null,
+        ...(inlineAuthor ? { author: inlineAuthor } : {}),
+        prompts: acceptedPrompts.length ? acceptedPrompts : current.prompts || [],
+        chat: current.chat || [],
+      });
+      // Send stays fire-and-forget (as before 11/21): waiting on the ordered hook queue could outlast a
+      // caller's timeout and invite a retry that dispatches the same work twice. Launch failures are logged.
+      void actionHook;
+      res.json({
+        status: "sent",
+        action: actionName,
+        action_label: resolvedActionLabel,
+        ...metadata,
+        ...serializeChatSync(current),
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.put("/api/:key/metadata", async (req, res, next) => {
+    if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+      res.status(403).json({ error: "cross-origin metadata write rejected" });
+      return;
+    }
+    if (isPeerKey(req.params.key)) {
+      res.status(400).json({ error: "edit a peer board on its own server" });
+      return;
+    }
+    try {
+      if (Object.hasOwn(req.body || {}, "creator") || Object.hasOwn(req.body || {}, "expected_file")) {
+        const session = await store.fillEmptyCreator(req.params.key, req.body);
+        if (!session) return void res.status(404).json({ error: "session not found" });
+        if (session.conflict) return void res.status(409).json({ error: "creator update preconditions changed" });
+        const metadata = serializeBoardMetadata(session);
+        events.emit("board-metadata", req.params.key, metadata);
+        res.json(metadata);
+        return;
+      }
+      const prior = await store.findByKey(req.params.key);
+      const session = await store.updateBoardTags(req.params.key, req.body);
+      if (!session) return void res.status(404).json({ error: "session not found" });
+      const metadata = serializeBoardMetadata(session);
+      events.emit("board-metadata", req.params.key, metadata);
+      const { added, removed } = tagDiff(prior?.tags || [], metadata.tags);
+      if (added.length || removed.length) {
+        const { title } = await readBoardHead(session.file);
+        emitHubEvent({
+          event: "tag_change",
+          key: req.params.key,
+          file: session.file,
+          url: session.url,
+          title: boardTitle(session, title),
+          creator: session.creator || "",
+          tags: metadata.tags,
+          added,
+          removed,
+        });
+      }
+      res.json(metadata);
+    } catch (error) {
+      if (error instanceof BoardMetadataError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
+      next(error);
+    }
+  });
+
+  app.get("/board-metadata.css", async (_req, res, next) => {
+    try {
+      res.type("text/css").send(await readFile(new URL("./board-metadata.css", import.meta.url), "utf8"));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/board-metadata-client.js", async (_req, res, next) => {
+    try {
+      res
+        .type("application/javascript")
+        .send(await readFile(new URL("./board-metadata-client.js", import.meta.url), "utf8"));
     } catch (error) {
       next(error);
     }
@@ -937,6 +2230,7 @@ export async function serve({
         return;
       }
       res.json({
+        ...serializeBoardMetadata(session),
         key: session.key,
         file: session.file,
         title: boardTitle(session, title),
@@ -1015,6 +2309,13 @@ export async function serve({
 
   app.post("/api/sessions", async (req, res, next) => {
     try {
+      let creator;
+      try {
+        creator = normalizeCreator(req.body?.creator);
+      } catch (error) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
       const file = await resolveAllowedArtifactFile(req.body?.file);
       const key = sessionKey(file);
       const reopen = Boolean(req.body.reopen);
@@ -1032,23 +2333,41 @@ export async function serve({
           file,
           url: sessionUrl,
           status: "user-ended",
+          ...serializeBoardMetadata(existing),
           ...networkWarningField(),
         });
         return;
       }
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
-      const session = await store.upsertSession(file, sessionUrl);
+      const wasNew = !existing;
+      const wasReopened = Boolean(existing && existing.status === "ended");
+      const session = await store.upsertSession(file, sessionUrl, { creator: creator || undefined, version });
       if (existing?.status === "ended") {
         clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
       }
       logEvent?.(`session opened key=${key} file=${file}`);
       await syncOutstandingRepairs(key);
       await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
+      if (wasNew || wasReopened) {
+        const { title } = await readBoardHead(session.file);
+        emitHubEvent({
+          event: wasNew ? "board_created" : "board_reopened",
+          key,
+          file: session.file,
+          url: session.url,
+          title: boardTitle(session, title),
+          creator: session.creator || "",
+          tags: session.tags || [],
+          created_version: session.created_version || "",
+          served_version: session.served_version || "",
+        });
+      }
       res.json({
         key,
         file,
         url,
         status: "opened",
+        ...serializeBoardMetadata(session),
         ...networkWarningField(),
       });
     } catch (error) {
@@ -1390,12 +2709,44 @@ export async function serve({
         return;
       }
       const freshFeedback = session.fresh_feedback === true;
+      const acceptedPrompts = Array.isArray(session.accepted_prompts) ? session.accepted_prompts : [];
+      const clearedTags = Array.isArray(session.cleared_tags) ? session.cleared_tags : [];
+      const activeHolder = activePolls.get(req.params.key);
       if (shouldEndSession) clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
       let publishedSession = session;
       if (hasLayoutWarningPrompt) {
         await syncOutstandingRepairs(req.params.key);
         publishedSession = (await store.findByKey(req.params.key)) || session;
         events.emit("layout-warnings", req.params.key, serializeLayoutWarnings(publishedSession.layout_warnings));
+      }
+      if (clearedTags.length) {
+        const metadata = serializeBoardMetadata(publishedSession);
+        const { title } = await readBoardHead(publishedSession.file);
+        events.emit("board-metadata", req.params.key, metadata);
+        emitHubEvent({
+          event: "tag_change",
+          key: req.params.key,
+          file: publishedSession.file,
+          url: publishedSession.url,
+          title: boardTitle(publishedSession, title),
+          creator: publishedSession.creator || "",
+          tags: metadata.tags,
+          added: [],
+          removed: clearedTags,
+        });
+      }
+      if (freshFeedback) {
+        emitHubEvent({
+          event: "message",
+          key: req.params.key,
+          file: publishedSession.file,
+          url: publishedSession.url,
+          creator: publishedSession.creator || "",
+          tags: publishedSession.tags || [],
+          had_listener: Boolean(activeHolder),
+          listener: activeHolder ? listenerLabel(activeHolder) : null,
+          prompts: acceptedPrompts,
+        });
       }
       if (shouldEndSession) events.emit("ended", req.params.key, publishedSession.ended_by);
       else if (freshFeedback) events.emit("feedback", req.params.key, publishedSession.ended_by);
@@ -1409,6 +2760,204 @@ export async function serve({
         ...serializeChatSync(publishedSession),
       });
       if (shouldEndSession) await shutdownIfNoLiveSessions();
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  function isOwnServerIp(ip) {
+    if (!ip || isLoopbackIp(ip)) return true;
+    if (tailscale?.ipv4 && normalizeRemoteIp(tailscale.ipv4) === ip) return true;
+    for (const bound of boundHosts) {
+      if (normalizeRemoteIp(bound) === ip) return true;
+    }
+    try {
+      for (const entries of Object.values(networkInterfaces() || {})) {
+        for (const entry of entries || []) {
+          if (entry?.address && normalizeRemoteIp(entry.address) === ip) return true;
+        }
+      }
+    } catch {
+      // ignore interface enumeration failure
+    }
+    return false;
+  }
+
+  async function resolveRemoteViewerName(req) {
+    const socketIp = normalizeRemoteIp(req.socket?.remoteAddress);
+    if (!socketIp || isOwnServerIp(socketIp) || typeof whoisPeer !== "function") return "";
+    try {
+      const whois = await whoisPeer(socketIp, req.socket?.remotePort);
+      return whois?.displayName ? normalizePromptAuthor(whois.displayName) : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function verifyApprovalReviewer(req, suppliedAuthor) {
+    const authHeader = String(req.headers.authorization || "").trim();
+    const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
+    const providedToken =
+      typeof req.body?.approval_token === "string" && req.body.approval_token.trim()
+        ? req.body.approval_token.trim()
+        : bearer;
+    if (providedToken && resolvedApprovalTokens.length > 0) {
+      const matched = resolvedApprovalTokens.find((entry) => timingSafeEqualString(providedToken, entry.token));
+      if (!matched) {
+        return { ok: false, status: 403, error: "invalid approval token" };
+      }
+      if (suppliedAuthor && !reviewerMatchesName(suppliedAuthor, matched.reviewer)) {
+        return { ok: false, status: 403, error: "supplied reviewer name does not match approval token" };
+      }
+      return { ok: true, auth: { method: "token", reviewer: matched.reviewer } };
+    }
+    if (resolvedApprovalTokens.length > 0) {
+      return { ok: false, status: 403, error: "an approval token is required to confirm this action" };
+    }
+    const socketIp = normalizeRemoteIp(req.socket?.remoteAddress);
+    if (!socketIp || isOwnServerIp(socketIp)) {
+      return {
+        ok: false,
+        status: 403,
+        error:
+          "reviewer identity could not be verified from loopback; open this board from your personal Tailscale device or configure LAVISH_AXI_APPROVAL_TOKENS",
+      };
+    }
+    const whois = typeof whoisPeer === "function" ? await whoisPeer(socketIp, req.socket?.remotePort) : null;
+    if (!whois) {
+      return {
+        ok: false,
+        status: 403,
+        error: "reviewer identity could not be verified via Tailscale whois",
+      };
+    }
+    if (!doesAuthorMatchTailscaleWhois(suppliedAuthor, whois, resolvedApprovalUsers)) {
+      return {
+        ok: false,
+        status: 403,
+        error: "supplied reviewer name does not match authenticated Tailscale user",
+      };
+    }
+    return {
+      ok: true,
+      auth: {
+        method: "tailscale",
+        reviewer: suppliedAuthor,
+        ...(whois.loginName ? { login: whois.loginName } : {}),
+        ...(whois.displayName ? { display_name: whois.displayName } : {}),
+        ...(whois.nodeName ? { node: whois.nodeName } : {}),
+        ip: whois.ip || socketIp,
+      },
+    };
+  }
+
+  // Human-confirmed approval from the outer review chrome (`chrome-client.js`), never from the
+  // sandboxed artifact iframe or CLI/bot callers. Requires same-origin, the active reviewer
+  // handoff capability (`chrome_load_token`), an open `/events/:key` browser WebSocket on this
+  // session, and a server-verified reviewer identity (either a configured approval token or a
+  // personal Tailscale peer verified via `tailscale whois`).
+  app.post("/api/:key/approval", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin approval rejected" });
+        return;
+      }
+      const fetchSite = String(req.headers["sec-fetch-site"] || "")
+        .trim()
+        .toLowerCase();
+      if (fetchSite && fetchSite !== "same-origin") {
+        res.status(403).json({ error: "cross-site approval rejected" });
+        return;
+      }
+      const author = normalizePromptAuthor(req.body?.author);
+      const promptText = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
+      if (!author || !promptText) {
+        res.status(400).json({ error: "reviewer name and approval text are required" });
+        return;
+      }
+      if (!hasLiveEventClient(req.params.key)) {
+        res.status(403).json({ error: "an active browser review session is required" });
+        return;
+      }
+      const validHandoff = await store.verifyReviewerHandoff(req.params.key, req.body?.chrome_load_token);
+      if (!validHandoff) {
+        res.status(409).json({ error: "review tab is superseded or expired; reload to confirm" });
+        return;
+      }
+      const verified = await verifyApprovalReviewer(req, author);
+      if (!verified.ok) {
+        res.status(verified.status).json({ error: verified.error });
+        return;
+      }
+      const activeHolder = activePolls.get(req.params.key);
+      const result = await store.queuePrompts(
+        req.params.key,
+        {
+          prompts: [
+            {
+              uid: "",
+              prompt: promptText,
+              selector: typeof req.body?.selector === "string" ? req.body.selector.slice(0, 512) : "",
+              tag: "send_approval",
+              text: typeof req.body?.text === "string" ? req.body.text.slice(0, 240) : "Approval",
+              prompt_id: `approval-${crypto.randomUUID()}`,
+              author: verified.auth.reviewer,
+            },
+          ],
+        },
+        {
+          trustedApproval: verified.auth,
+          resolveAttachment: (sessionKeyValue, id) => resolveAttachment(attachmentStateRoot, sessionKeyValue, id),
+          maxPerPrompt: attachmentConfig.maxPerPrompt,
+          maxPromptBytes: attachmentConfig.maxPromptBytes,
+        },
+      );
+      if (!result) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (result.ended) {
+        res.status(409).json({ status: "ended", error: "session already ended", ended_by: result.ended_by });
+        return;
+      }
+      const acceptedPrompts = Array.isArray(result.accepted_prompts) ? result.accepted_prompts : [];
+      const clearedTags = Array.isArray(result.cleared_tags) ? result.cleared_tags : [];
+      if (clearedTags.length) {
+        const metadata = serializeBoardMetadata(result);
+        const { title } = await readBoardHead(result.file);
+        events.emit("board-metadata", req.params.key, metadata);
+        emitHubEvent({
+          event: "tag_change",
+          key: req.params.key,
+          file: result.file,
+          url: result.url,
+          title: boardTitle(result, title),
+          creator: result.creator || "",
+          tags: metadata.tags,
+          added: [],
+          removed: clearedTags,
+        });
+      }
+      if (result.fresh_feedback) {
+        emitHubEvent({
+          event: "message",
+          key: req.params.key,
+          file: result.file,
+          url: result.url,
+          creator: result.creator || "",
+          tags: result.tags || [],
+          had_listener: Boolean(activeHolder),
+          listener: activeHolder ? listenerLabel(activeHolder) : null,
+          prompts: acceptedPrompts,
+        });
+        events.emit("feedback", req.params.key, result.ended_by);
+      }
+      events.emit("chat-sync", req.params.key, result);
+      res.json({
+        status: "approved",
+        pending_prompts: result.pending_prompts,
+        ...serializeChatSync(result),
+      });
     } catch (error) {
       next(error);
     }
@@ -1436,6 +2985,7 @@ export async function serve({
         res.status(409).json({ status: "ended", ended_by: result.ended_by });
         return;
       }
+      if (result.changed) notifyHubStateChanged();
       res.json({ status: "saved" });
     } catch (error) {
       if (error instanceof DraftTooLargeError) {
@@ -1540,10 +3090,12 @@ export async function serve({
   app.post("/api/:key/end", async (req, res, next) => {
     try {
       const session = await store.endSession(req.params.key, "user");
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key, session?.ended_by);
-      res.json({ status: "ended" });
-      await shutdownIfNoLiveSessions();
+      if (session?.end_changed) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+        events.emit("ended", req.params.key, session.ended_by);
+      }
+      res.json({ status: "ended", ...(session ? serializeBoardMetadata(session) : { closed: true }) });
+      if (session?.end_changed) await shutdownIfNoLiveSessions();
     } catch (error) {
       next(error);
     }
@@ -1594,6 +3146,34 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
+      next(error);
+    }
+  });
+
+  // Append external context to the conversation without delivering or answering work.
+  app.post("/api/:key/note", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin note rejected" });
+        return;
+      }
+      const text = String(req.body?.text || "").trim();
+      if (!text) {
+        res.status(400).json({ error: "note text required" });
+        return;
+      }
+      const session = await store.addNote(req.params.key, { ...req.body, text });
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (session.status === "ended") {
+        res.status(409).json({ status: "ended", ended_by: session.ended_by });
+        return;
+      }
+      events.emit("chat-sync", req.params.key, session);
+      res.json({ status: "sent" });
+    } catch (error) {
       next(error);
     }
   });
@@ -1738,11 +3318,13 @@ export async function serve({
     try {
       const file = await canonicalFile(req.body.file);
       const key = sessionKey(file);
-      const session = await store.endSession(key, "agent");
-      clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
-      events.emit("ended", key, session?.ended_by);
-      res.json({ status: "ended" });
-      await shutdownIfNoLiveSessions();
+      const session = await store.endSession(key, "agent", { cancelled: req.body?.cancel === true });
+      if (session?.end_changed) {
+        clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+        events.emit("ended", key, session.ended_by);
+      }
+      res.json({ status: "ended", ...(session ? serializeBoardMetadata(session) : { closed: true }) });
+      if (session?.end_changed) await shutdownIfNoLiveSessions();
     } catch (error) {
       next(error);
     }
@@ -1755,7 +3337,7 @@ export async function serve({
         sendSessionNotFound(req, res);
         return;
       }
-      const session = chromeLoad.session;
+      const session = (await store.recordServedVersion(req.params.key, version)) || chromeLoad.session;
       if (refuseNonHtmlArtifact(session, res)) return;
       await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
       const artifactHtml = await readFile(session.file, "utf8").catch(() => "");
@@ -1771,6 +3353,7 @@ export async function serve({
       // `frame-src 'self'` keeps the artifact iframe on this server: a board script that
       // navigates its own frame to another site (`location.href = "https://x/?data"`) is refused
       // by the browser before any request leaves. Links meant for elsewhere open a new tab.
+      const viewerName = await resolveRemoteViewerName(req);
       res.setHeader("content-security-policy", "frame-ancestors 'none'; frame-src 'self'");
       res.type("html").send(
         createChromeHtml(session, {
@@ -1783,6 +3366,10 @@ export async function serve({
           chromeLoadToken: chromeLoad.chrome_load_token,
           attachmentMaxBytes: attachmentConfig.maxBytes,
           attachmentMaxCount: attachmentConfig.maxPerPrompt,
+          actionLabel: resolvedActionLabel,
+          notifyPeople: Object.keys(notifySettingsStore.getSync()),
+          initialViewerName: viewerName,
+          requiresApprovalToken: resolvedApprovalTokens.length > 0,
           theme,
         }),
       );
@@ -2250,6 +3837,7 @@ export async function serve({
   });
 
   const eventWebSocketServer = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+  const hubEventWebSocketServer = new WebSocketServer({ noServer: true, maxPayload: 4096 });
 
   function rejectEventUpgrade(socket, status, message) {
     const body = `${message}\n`;
@@ -2259,18 +3847,14 @@ export async function serve({
   }
 
   function handleEventUpgrade(req, socket, head) {
-    let pathname;
+    let parsedUrl;
     try {
-      pathname = new URL(String(req.url || ""), "http://lavish.local").pathname;
+      parsedUrl = new URL(String(req.url || ""), "http://lavish.local");
     } catch {
       rejectEventUpgrade(socket, 400, "Bad Request");
       return;
     }
-    const match = pathname.match(/^\/events\/([^/]+)$/);
-    if (!match) {
-      rejectEventUpgrade(socket, 404, "Not Found");
-      return;
-    }
+    const pathname = parsedUrl.pathname;
 
     const hostAllowed = allowAnyHostname
       ? parseHostAuthority(req.headers.host) !== null
@@ -2278,6 +3862,86 @@ export async function serve({
           { host: req.headers.host, forwardedHost: req.headers["x-forwarded-host"] },
           allowedHostnames,
         );
+
+    if (pathname === "/events/hub") {
+      // Server-to-server peer hubs connect header-less (like /api/poll); any present browser
+      // Origin/Referer must match this server's own origin.
+      if (
+        !hostAllowed ||
+        (hasPresentOriginOrReferer(req) && !isSameOriginRequest(req, allowedHostnames, allowAnyHostname))
+      ) {
+        rejectEventUpgrade(socket, 403, "Forbidden");
+        return;
+      }
+      const sinceRaw = Number(parsedUrl.searchParams.get("since") || "0");
+      const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? Math.floor(sinceRaw) : 0;
+      const peersOnly = parsedUrl.searchParams.get("peers") === "0";
+      const requestedInstance = String(parsedUrl.searchParams.get("instance") || "").trim();
+      // If a peer server restarted with a fresh `hubInstanceId`, its `seq` restarted at 0, so a
+      // subscriber presenting an older `instance` gets every event since this instance booted.
+      const effectiveSince = requestedInstance && requestedInstance !== hubInstanceId ? 0 : since;
+      const targetSet = peersOnly ? hubPeerStreamClients : hubViewStreamClients;
+      hubEventWebSocketServer.handleUpgrade(req, socket, head, (webSocket) => {
+        webSocket.on("error", () => {});
+        if (liveEventHeartbeatMs != null && liveEventHeartbeatMs > 0) {
+          let awaitingPong = false;
+          const heartbeat = setInterval(() => {
+            if (awaitingPong) {
+              webSocket.terminate();
+              return;
+            }
+            awaitingPong = true;
+            try {
+              webSocket.ping();
+            } catch {
+              webSocket.terminate();
+            }
+          }, liveEventHeartbeatMs);
+          heartbeat.unref?.();
+          webSocket.on("pong", () => {
+            awaitingPong = false;
+          });
+          webSocket.once("close", () => clearInterval(heartbeat));
+        }
+        if (webSocket.readyState === WebSocket.OPEN) {
+          try {
+            webSocket.send(JSON.stringify({ type: "hub-hello", instance_id: hubInstanceId, seq: hubEventSeq }));
+          } catch {
+            // closed immediately
+          }
+        }
+        for (const entry of hubEventHistory) {
+          if (entry.seq > effectiveSince && webSocket.readyState === WebSocket.OPEN) {
+            try {
+              webSocket.send(
+                JSON.stringify({
+                  type: "hub-event",
+                  instance_id: hubInstanceId,
+                  seq: entry.seq,
+                  event: entry.event,
+                }),
+              );
+            } catch {
+              break;
+            }
+          }
+        }
+        targetSet.add(webSocket);
+        refreshIdleTimer();
+        webSocket.once("close", () => {
+          targetSet.delete(webSocket);
+          refreshIdleTimer();
+        });
+      });
+      return;
+    }
+
+    const match = pathname.match(/^\/events\/([^/]+)$/);
+    if (!match) {
+      rejectEventUpgrade(socket, 404, "Not Found");
+      return;
+    }
+
     // WebSocket reads are not protected by CORS. Require the chrome page's exact Origin as well
     // as the normal Host allowlist so a foreign site cannot read a known session's live events.
     if (!hostAllowed || !req.headers.origin || !isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
@@ -2531,6 +4195,9 @@ export async function serve({
     writeLog(`[lavish] WARNING: ${describeBindFailure(listenHost, error)}`);
   }
   serverReady = true;
+  await notifySettingsStore.init();
+  if (parsedPeers.peers.length > 0) await loadPeerCursors();
+  startPeerEventSubscribers();
   scheduleBindRecovery();
 
   // `cause` is log-only and never reaches a chrome: `reason` is the user-facing SHUTDOWN_REASONS
@@ -2572,6 +4239,16 @@ export async function serve({
       }
     }
     liveEventClients.clear();
+    closePeerEventSubscribers();
+    for (const subscriber of [...hubPeerStreamClients, ...hubViewStreamClients]) {
+      try {
+        subscriber.terminate();
+      } catch {
+        // best effort
+      }
+    }
+    hubPeerStreamClients.clear();
+    hubViewStreamClients.clear();
     for (const timer of browserDisconnectTimers.values()) clearTimeout(timer);
     browserDisconnectTimers.clear();
     for (const w of watchers.values()) {
@@ -2592,18 +4269,29 @@ export async function serve({
     }
   }
 
-  // Idle self-shutdown: the timer only runs while nothing is connected. Any live event chrome or
-  // active long-poll cancels it; losing the last connection (re)arms it.
+  function hasActiveHubOrSessionConnections() {
+    return (
+      liveEventClients.size > 0 ||
+      activePolls.size > 0 ||
+      hubViewStreamClients.size > 0 ||
+      hubPeerStreamClients.size > 0 ||
+      peerEventSubscriptions.length > 0
+    );
+  }
+
+  // Idle self-shutdown: the timer only runs while nothing is connected. Any live event chrome,
+  // hub viewer, peer hub stream/subscription, or active long-poll cancels it; losing the last
+  // connection (re)arms it.
   function refreshIdleTimer() {
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = null;
     }
     if (shuttingDown || idleTimeoutMs == null) return;
-    if (liveEventClients.size > 0 || activePolls.size > 0) return;
+    if (hasActiveHubOrSessionConnections()) return;
     idleTimer = setTimeout(() => {
       idleTimer = null;
-      if (!shuttingDown && liveEventClients.size === 0 && activePolls.size === 0) {
+      if (!shuttingDown && !hasActiveHubOrSessionConnections()) {
         shutdown("", "", `idle-timeout after ${idleTimeoutMs}ms with no connections`);
       }
     }, idleTimeoutMs);
@@ -2611,12 +4299,12 @@ export async function serve({
   }
 
   // When the final open session ends with nothing connected, there is nothing left to serve,
-  // so step down immediately rather than waiting out the idle timeout. If a browser chrome or
-  // poll is still attached (e.g. the user is about to reopen), leave the server up and let the
-  // idle timer reap it once those connections drop. Best-effort: never let a read failure
-  // block the end response.
+  // so step down immediately rather than waiting out the idle timeout. If a browser chrome, hub
+  // viewer, peer subscription, or poll is still attached (e.g. the user is about to reopen), leave
+  // the server up and let the idle timer reap it once those connections drop. Best-effort: never
+  // let a read failure block the end response.
   async function shutdownIfNoLiveSessions() {
-    if (liveEventClients.size > 0 || activePolls.size > 0) return;
+    if (hasActiveHubOrSessionConnections()) return;
     try {
       const sessions = await store.listSessions();
       if (sessions.every((session) => session.status === "ended")) {
@@ -2917,7 +4605,7 @@ export function isAllowedRequestHost({ host, forwardedHost }, allowedHostnames) 
 }
 
 function hasPresentOriginOrReferer(req) {
-  return Boolean(req.get("origin") || req.get("referer"));
+  return Boolean(req.headers?.origin || req.headers?.referer);
 }
 
 // Guard state-changing, outward-facing routes (publishing to a third-party host) against CSRF: a
@@ -3350,6 +5038,10 @@ export function createChromeHtml(
     attachmentMaxBytes = 0,
     attachmentMaxCount = 0,
     attachmentAcceptedMime = ACCEPTED_IMAGE_MIME,
+    actionLabel = "Send",
+    notifyPeople = [],
+    initialViewerName = "",
+    requiresApprovalToken = false,
     theme = "",
   } = {},
 ) {
@@ -3380,6 +5072,8 @@ export function createChromeHtml(
     initialArtifactLoadToken: artifactLoadToken,
     initialArtifactLoadSequence: artifactLoadSequence,
     chromeLoadToken,
+    initialViewerName: initialViewerName || "",
+    requiresApprovalToken: requiresApprovalToken === true,
     layoutGateEnabled,
     modeToggleHotkeyKey: MODE_TOGGLE_HOTKEY_KEY,
     attachmentMaxBytes,
@@ -3403,15 +5097,17 @@ export function createChromeHtml(
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>${escapeHtml(title)}</title>
 ${faviconTag}
+<script src="/board-metadata-client.js" defer></script>
+<link rel="stylesheet" href="/board-metadata.css">
 <link rel="stylesheet" href="/chrome.css">
 ${themed.style}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><span class="presence-pill" id="presencePill" role="status" aria-live="polite" data-tone="off"><span class="presence-dot" aria-hidden="true"></span><span class="presence-text" id="presencePillText">Connecting…</span></span><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="panel" aria-expanded="true" aria-label="Hide conversation" title="Hide conversation">${chromeIcons.sidebar}<span class="sidebar-toggle-count" id="sidebarToggleCount" aria-hidden="true" hidden></span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="layoutToggle" type="button" title="Switch between the phone and desktop layouts. Remembered on this device.">${chromeIcons.phone}<span id="layoutToggleText">Layout: Auto</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}" data-people="${escapeHtml(JSON.stringify(Array.isArray(notifyPeople) ? notifyPeople : []))}" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><label class="approval-author-wrap" id="approvalTokenWrap" for="approvalTokenInput" hidden><span>Token</span><input id="approvalTokenInput" type="password" maxlength="200" placeholder="Approval token"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
-<div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
+<div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p><button type="button" class="button ended-action" data-reactivate data-key="${session.key}" data-file="${escapeHtml(session.file)}">Reactivate board</button><p><a href="/">Fusion Hub</a></p></div></div>
 <div class="whiteboard-overlay" id="whiteboardOverlay" hidden><div class="whiteboard-shell"><div class="whiteboard-error" id="whiteboardError" hidden></div><button class="whiteboard-close" id="whiteboardClose" type="button" aria-label="Close whiteboard"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button><iframe id="whiteboardFrame" title="Excalidraw whiteboard" sandbox="allow-scripts allow-popups"></iframe></div></div>
 <script id="lavish-session" type="application/json">${sessionJson}</script>
 <script>${CHROME_BOOT_FAILSAFE_JS}</script>

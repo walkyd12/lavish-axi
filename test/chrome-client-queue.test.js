@@ -19,7 +19,7 @@ const servedChromeIds = new Set(
 
 const SERVED_TAB_ICON = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>";
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, initialOwnerStatus?: any, initialDrafts?: any[], revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialViewerName?: string, requiresApprovalToken?: boolean, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, initialOwnerStatus?: any, initialDrafts?: any[], revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = {
   key: "abc",
@@ -588,6 +588,7 @@ async function createChromeHarness({
     postedToFrame,
     postedToWhiteboard,
     clipboardWrites,
+    composerAttachments: () => context.window["lavishChatAttachments"],
     createInlineWhiteboard() {
       const posted = [];
       // A real inline whiteboard frame is created by the SDK inside the
@@ -9967,4 +9968,115 @@ test("the layout menu item cycles Auto, Phone, Desktop and is remembered on the 
     device: { screen: { width: 1920, height: 1080 }, innerWidth: 1280, innerHeight: 900, coarse: false },
   });
   assert.equal(later.element("layoutToggleText").textContent, "Layout: Phone");
+});
+
+test("lavish:requestApproval never auto-submits and requires a trusted human click in the outer chrome", async () => {
+  const approvalCalls = [];
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    sessionData: {
+      ...defaultSessionData,
+      chromeLoadToken: "chrome-cap-token-1",
+      initialViewerName: "Walker",
+      requiresApprovalToken: true,
+    },
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/approval")) {
+        approvalCalls.push(JSON.parse(String(init?.body || "{}")));
+        return {
+          ok: true,
+          json: async () => ({ status: "approved", chat: [], ack_ids: [], chat_revision: 1 }),
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:requestApproval",
+    artifact_load_token: chrome.artifactLoadToken(),
+    prompt: "Send approved draft from Gibson [ref r123456 sha256 " + "c".repeat(64) + "]: ok",
+    label: "Send approved draft",
+    summary: "Approve exact pinned draft",
+    author: "Gibson",
+    selector: "#send-approved-email",
+  });
+  assert.equal(approvalCalls.length, 0, "iframe message alone never submits an approval");
+  assert.equal(chrome.element("approvalBanner").hidden, false);
+
+  // Synthetic untrusted clicks (`isTrusted: false` or omitted) are ignored.
+  chrome.element("approvalConfirm").click({ isTrusted: false });
+  chrome.element("approvalConfirm").click({});
+  await flushPromises();
+  assert.equal(approvalCalls.length, 0, "untrusted synthetic clicks never submit /approval");
+
+  // Server-verified Tailscale viewer name overrides the untrusted iframe's `author`, and missing token is blocked.
+  assert.equal(chrome.element("approvalAuthorInput").value, "Walker");
+  assert.equal(chrome.element("approvalTokenWrap").hidden, false);
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(approvalCalls.length, 0, "missing required approval token blocks submit");
+
+  // Supplying the reviewer's token and clicking Confirm with a trusted user gesture (`isTrusted: true`) submits.
+  chrome.element("approvalTokenInput").value = "tok-walker-secret";
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(approvalCalls.length, 1);
+  assert.equal(approvalCalls[0].author, "Walker");
+  assert.equal(approvalCalls[0].approval_token, "tok-walker-secret");
+  assert.equal(approvalCalls[0].chrome_load_token, "chrome-cap-token-1");
+  assert.match(approvalCalls[0].prompt, /^Send approved draft from Walker \[/);
+  assert.equal(chrome.element("approvalBanner").hidden, true);
+});
+
+test("confirmation displays the exact submitted action instead of an artifact label", async () => {
+  const calls = [];
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialViewerName: "Walker" },
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/approval")) calls.push(JSON.parse(String(init?.body || "{}")));
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  const prompt =
+    "Send approved draft from Walker [ref rabc1234 sha256 " + "c".repeat(64) + " recipients alex@example.com]: ok";
+  chrome.sendFrameMessage({
+    type: "lavish:requestApproval",
+    artifact_load_token: chrome.artifactLoadToken(),
+    prompt,
+    label: "Approve board",
+    summary: "Save these notes",
+    author: "Walker",
+    selector: "#send-approved-email",
+  });
+  assert.equal(chrome.element("approvalBannerText").textContent, prompt);
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].prompt, prompt);
+});
+
+test("workflow success clears sent composer chips while keeping images added during the request", async () => {
+  let nextUpload = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ attachment: { id: String(++nextUpload).repeat(64) + ".png" } }),
+    }),
+  });
+  const controller = chrome.composerAttachments();
+  chrome.element("chatInput").dispatch("paste", clipboardEvent(pastedImage("sent.png")));
+  await flushPromises();
+  await flushPromises();
+  const sent = controller.collectReady();
+  assert.equal(sent.length, 1);
+  chrome.element("chatInput").dispatch("paste", clipboardEvent(pastedImage("new.png")));
+  await flushPromises();
+  await flushPromises();
+  controller.reset(sent);
+  assert.deepEqual(JSON.parse(JSON.stringify(controller.collectReady())), [
+    { id: "2".repeat(64) + ".png", name: "new.png" },
+  ]);
+  assert.doesNotMatch(chrome.element("chatAttachments").innerHTML, /sent\.png/);
+  assert.match(chrome.element("chatAttachments").innerHTML, /new\.png/);
 });

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { BoardMetadataError, normalizeCreator, normalizeTags, serializeBoardMetadata } from "./board-metadata.js";
 import {
   applyDiagnosticPass,
   dismissLayoutWarning as dismissWarningRecord,
@@ -14,12 +15,14 @@ import {
   queueLayoutWarnings as queueWarningRecords,
   serializeLayoutWarnings,
 } from "./layout-warnings.js";
+import { resolveAllowedArtifactFile } from "./artifact-path.js";
 import { AsyncMutex } from "./async-mutex.js";
 import {
   boundStoredChat,
   chatEntryForPrompt,
   collectChatAckIds,
   markPreReceipt,
+  normalizePromptAuthor,
   normalizePromptId,
   stampDelivered,
   stampDone,
@@ -114,15 +117,16 @@ export class SessionStore {
     });
   }
 
-  async upsertSession(file, url) {
+  async upsertSession(file, url, { creator = undefined, version = "" } = {}) {
+    creator = normalizeCreator(creator);
     // `canonicalFile` (a realpath) does not touch state, so resolve it before
     // taking the lock and keep only the read-modify-write inside the critical
     // section.
     const absolute = await canonicalFile(file);
-    return this.lock.runExclusive(() => this.#upsertSessionLocked(absolute, url));
+    return this.lock.runExclusive(() => this.#upsertSessionLocked(absolute, url, creator, version));
   }
 
-  async #upsertSessionLocked(absolute, url) {
+  async #upsertSessionLocked(absolute, url, creator, version) {
     const key = sessionKey(absolute);
     const state = await this.readState();
     const existing = state.sessions[key] || {};
@@ -133,6 +137,10 @@ export class SessionStore {
       file: absolute,
       url,
       status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
+      tags: serializeBoardMetadata(existing).tags,
+      creator: existing.creator || creator,
+      created_version: existing.created_version || (!existing.key ? version : ""),
+      served_version: version || existing.served_version || "",
       pending_prompts: existing.pending_prompts || 0,
       prompts: existingPrompts,
       // The warning inbox is durable review state, not deliverable feedback: reopening a session
@@ -178,6 +186,79 @@ export class SessionStore {
     return session;
   }
 
+  // Metadata-only attribution repair: never creates or revives a session.
+  async fillEmptyCreator(key, patch) {
+    if (
+      !patch ||
+      typeof patch !== "object" ||
+      Array.isArray(patch) ||
+      Object.keys(patch).some((name) => !["creator", "expected_file"].includes(name)) ||
+      typeof patch.expected_file !== "string" ||
+      !path.isAbsolute(patch.expected_file)
+    )
+      throw new BoardMetadataError("Use creator and an absolute expected_file");
+    const creator = normalizeCreator(patch.creator);
+    if (!creator) throw new BoardMetadataError("Creator is required");
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      if (
+        session.status === "ended" ||
+        session.creator ||
+        session.file !== patch.expected_file ||
+        sessionKey(patch.expected_file) !== key
+      )
+        return { conflict: true };
+      // Check the stored path under the same lock as status/creator. A replaced symlink
+      // cannot redirect this write: it always addresses the original session key.
+      try {
+        if ((await resolveAllowedArtifactFile(patch.expected_file)) !== session.file) return { conflict: true };
+      } catch {
+        return { conflict: true };
+      }
+      session.creator = creator;
+      session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return session;
+    });
+  }
+
+  async updateBoardTags(key, patch) {
+    if (
+      !patch ||
+      typeof patch !== "object" ||
+      Array.isArray(patch) ||
+      Object.keys(patch).some((key) => !["add", "remove"].includes(key))
+    ) {
+      throw new BoardMetadataError("Use add and remove tag lists");
+    }
+    const add = normalizeTags(patch.add || []);
+    const remove = new Set(normalizeTags(patch.remove || []).map((tag) => tag.toLowerCase()));
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      const tags = normalizeTags([...(session.tags || []).filter((tag) => !remove.has(tag.toLowerCase())), ...add]);
+      if (JSON.stringify(tags) === JSON.stringify(session.tags || [])) return session;
+      session.tags = tags;
+      session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return session;
+    });
+  }
+
+  async recordServedVersion(key, version) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session || session.served_version === version) return session || null;
+      session.served_version = version;
+      await this.writeState(state);
+      return session;
+    });
+  }
+
   // `options.resolveAttachment(key, id) => Promise<metadata|null>` is the trust
   // boundary for image attachments: a prompt only ever carries the client's
   // claimed `id` (and display `name`); every authoritative field (absolute path,
@@ -207,6 +288,7 @@ export class SessionStore {
     // snapshots and failures are preserved. Attachments are still re-derived through the resolver,
     // because restore re-enters the same trust boundary.
     const restoring = options.restore === true;
+    const trustedApproval = !restoring ? sanitizeApprovalAuth(options.trustedApproval) : null;
     const alreadyEnded = session.status === "ended";
     // A session already ended by someone else (an agent's `lavish-axi end`, or the user in
     // another tab) must not accept a further batch as if it were queued for delivery: no agent
@@ -219,7 +301,7 @@ export class SessionStore {
     if (alreadyEnded && !restoring) {
       return { ended: true, ended_by: session.ended_by };
     }
-    let normalized = prompts.map(normalizePrompt);
+    let normalized = prompts.map((item) => normalizePrompt(item, { restoring, trustedApproval }));
     if (!restoring) {
       const acknowledgedIds = new Set(
         [
@@ -346,6 +428,14 @@ export class SessionStore {
     if (!restoring || (existingPrompts.length === 0 && !session.dom_snapshot)) {
       session.dom_snapshot = restoredSnapshot;
     }
+    let clearedTags = [];
+    if (!restoring && acceptedPrompts.length > 0 && Array.isArray(session.tags)) {
+      const removed = session.tags.filter((tag) => String(tag).toLowerCase() === "needs-input");
+      if (removed.length) {
+        session.tags = session.tags.filter((tag) => String(tag).toLowerCase() !== "needs-input");
+        clearedTags = removed;
+      }
+    }
     session.status =
       shouldEndSession || alreadyEnded
         ? "ended"
@@ -353,10 +443,18 @@ export class SessionStore {
             (restoring && Array.isArray(session.artifact_failures) && session.artifact_failures.length > 0)
           ? "feedback"
           : "open";
-    if (shouldEndSession) session.ended_by = "user";
+    if (shouldEndSession) {
+      session.ended_by = "user";
+      delete session.ended_reason;
+    }
     session.updated_at = new Date().toISOString();
     await this.writeState(state);
-    return { ...session, fresh_feedback: !restoring && acceptedPrompts.length > 0 };
+    return {
+      ...session,
+      fresh_feedback: !restoring && acceptedPrompts.length > 0,
+      accepted_prompts: !restoring ? storedPrompts : [],
+      cleared_tags: clearedTags,
+    };
   }
 
   // Record (or, for `{ clear: true }`, remove) the owner's statement about itself. Throws
@@ -406,6 +504,18 @@ export class SessionStore {
         artifact_load_token: activeLoad?.artifactLoadToken || "",
         artifact_load_sequence: activeLoad?.requestSequence || 0,
       };
+    });
+  }
+
+  async verifyReviewerHandoff(key, handoffToken) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return false;
+      this.#activeArtifactLoad(session);
+      const activeHandoffToken = this.chromeLoadContexts.get(key) || "";
+      const provided = typeof handoffToken === "string" ? handoffToken.trim() : "";
+      return Boolean(activeHandoffToken && provided && provided === activeHandoffToken);
     });
   }
 
@@ -738,18 +848,47 @@ export class SessionStore {
   // `endedBy` distinguishes a human ending review from the browser chrome ("user") from an
   // agent explicitly closing the loop via `lavish-axi end` ("agent"). Only a user-initiated end
   // blocks a plain reopen - see `SessionStore` callers in server.js.
-  async endSession(key, endedBy = "agent") {
+  async endSession(key, endedBy = "agent", { cancelled = false } = {}) {
     return this.runExclusive(async () => {
       const state = await this.readState();
       const session = state.sessions[key];
       if (!session) {
         return null;
       }
-      const existingEndedBy = session.status === "ended" ? session.ended_by : undefined;
-      const nextEndedBy = endedBy === "user" || existingEndedBy === "user" ? "user" : "agent";
+      if (session.status === "ended") return { ...session, end_changed: false };
+      const nextEndedBy = endedBy === "user" ? "user" : "agent";
       session.status = "ended";
       session.ended_by = nextEndedBy;
+      if (cancelled) session.ended_reason = "cancelled";
+      else delete session.ended_reason;
       session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return { ...session, end_changed: true };
+    });
+  }
+
+  // Context-only chat: no prompt delivery, receipt settlement, or lifecycle change.
+  async addNote(key, { text, author, source }) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session || session.status === "ended") return session || null;
+      const at = new Date().toISOString();
+      session.chat = [
+        ...(session.chat || []),
+        {
+          role: "user",
+          kind: "message",
+          receipt: "none",
+          text,
+          at,
+          author: normalizePromptAuthor(author),
+          source: String(source || "").slice(0, 200),
+        },
+      ];
+      applyTranscriptBound(session);
+      session.chat_revision = normalizeRevision(session.chat_revision) + 1;
+      session.updated_at = at;
       await this.writeState(state);
       return session;
     });
@@ -889,10 +1028,28 @@ function applyTranscriptBound(session) {
   return chatChanged || session.chat_ack_ids.length !== existingAckCount;
 }
 
+function sanitizeApprovalAuth(auth) {
+  if (!auth || typeof auth !== "object") return null;
+  const method = auth.method === "tailscale" || auth.method === "token" ? auth.method : "";
+  const reviewer = normalizePromptAuthor(auth.reviewer);
+  if (!method || !reviewer) return null;
+  /** @type {Record<string, string>} */
+  const clean = { method, reviewer };
+  if (method === "tailscale") {
+    if (typeof auth.login === "string" && auth.login.trim()) clean.login = auth.login.trim().slice(0, 160);
+    if (typeof auth.display_name === "string" && auth.display_name.trim()) {
+      clean.display_name = auth.display_name.trim().slice(0, 120);
+    }
+    if (typeof auth.node === "string" && auth.node.trim()) clean.node = auth.node.trim().slice(0, 160);
+    if (typeof auth.ip === "string" && auth.ip.trim()) clean.ip = auth.ip.trim().slice(0, 64);
+  }
+  return clean;
+}
+
 // Returns `{ prompt, malformed }`: `malformed` is non-empty when the payload's
 // `attachments` field exists but cannot be honored as written, which fails the
 // whole batch rather than being normalized away (C4, see queuePrompts).
-function normalizePrompt(prompt) {
+function normalizePrompt(prompt, { restoring = false, trustedApproval = null } = {}) {
   const normalized = {
     uid: String(prompt.uid || ""),
     prompt: String(prompt.prompt || ""),
@@ -902,6 +1059,22 @@ function normalizePrompt(prompt) {
   };
   const promptId = normalizePromptId(prompt.prompt_id);
   if (promptId) normalized.prompt_id = promptId;
+  const author = normalizePromptAuthor(prompt.author);
+  if (author) normalized.author = author;
+  const restoredAuth = restoring ? sanitizeApprovalAuth(prompt.approval_auth) : null;
+  if (trustedApproval) {
+    normalized.tag = "send_approval";
+    normalized.via = "chrome_approval";
+    normalized.author = trustedApproval.reviewer;
+    normalized.approval_auth = trustedApproval;
+  } else if (restoring && prompt.via === "chrome_approval" && restoredAuth) {
+    normalized.via = "chrome_approval";
+    normalized.author = restoredAuth.reviewer;
+    normalized.approval_auth = restoredAuth;
+  } else {
+    if (prompt.via === "cli") normalized.via = "cli";
+    if (normalized.tag === "send_approval") normalized.tag = "message";
+  }
   const target = normalizeTarget(prompt.target);
   if (target) normalized.target = target;
   const { refs, malformed } = normalizeAttachmentRefs(prompt.attachments);
