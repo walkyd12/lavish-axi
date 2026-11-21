@@ -2505,12 +2505,13 @@ function createChatAttachmentsController() {
     renderAttachments();
   }
 
-  function reset() {
-    for (const item of items) {
+  function reset(sentAttachments = null) {
+    for (const item of [...items]) {
+      if (sentAttachments && !sentAttachments.some((ref) => item.id === ref.id && item.name === ref.name)) continue;
       item.abortController?.abort();
       if (item.preview) URL.revokeObjectURL(item.preview);
+      items.splice(items.indexOf(item), 1);
     }
-    items.length = 0;
     capRejected = false;
     sendBlocked = false;
     renderAttachments();
@@ -2537,6 +2538,8 @@ function createChatAttachmentsController() {
 }
 
 const chatAttachmentController = createChatAttachmentsController();
+// The board workflow action sends the same uploaded composer chips as chat.
+window["lavishChatAttachments"] = chatAttachmentController;
 
 function sendQueued(endAfter) {
   if (ended) return;

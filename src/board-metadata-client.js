@@ -138,16 +138,26 @@
       const notice = /** @type {HTMLElement} */ (root.querySelector(".metadata-notice"));
       const chatInput = /** @type {HTMLTextAreaElement | null} */ (document.getElementById("chatInput"));
       const typed = chatInput ? chatInput.value.trim() : "";
+      const composerAttachments = window["lavishChatAttachments"];
+      if (composerAttachments?.hasPending() || composerAttachments?.hasErrors()) {
+        composerAttachments.noteSendBlocked();
+        return;
+      }
+      const attachments = composerAttachments?.collectReady() || [];
       button.disabled = true;
       try {
         const response = await fetch(`/api/${encodeURIComponent(root.dataset.boardMetadata)}/action`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(typed ? { prompt: typed } : {}),
+          body: JSON.stringify({
+            ...(typed ? { prompt: typed } : {}),
+            ...(attachments.length ? { attachments } : {}),
+          }),
         });
         const result = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(result.error || "Could not send action");
-        if (typed && chatInput) chatInput.value = "";
+        if (typed && chatInput?.value.trim() === typed) chatInput.value = "";
+        composerAttachments?.reset(attachments);
         render(root, { ...metadata, ...result });
         const freshNotice = /** @type {HTMLElement | null} */ (root.querySelector(".metadata-notice"));
         if (freshNotice) {

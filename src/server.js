@@ -2023,9 +2023,10 @@ export async function serve({
       const activeHolder = activePolls.get(req.params.key);
       const inlinePrompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
       const inlineAuthor = typeof req.body?.author === "string" ? req.body.author.trim() : "";
+      const inlineAttachments = req.body?.attachments;
       let acceptedPrompts = [];
       let clearedTags = [];
-      if (inlinePrompt) {
+      if (inlinePrompt || inlineAttachments != null) {
         const queued = await store.queuePrompts(
           req.params.key,
           {
@@ -2038,6 +2039,7 @@ export async function serve({
                 text: "Board message",
                 prompt_id: `action-${crypto.randomUUID()}`,
                 ...(inlineAuthor ? { author: inlineAuthor } : {}),
+                ...(inlineAttachments != null ? { attachments: inlineAttachments } : {}),
               },
             ],
           },
@@ -2047,25 +2049,43 @@ export async function serve({
             maxPromptBytes: attachmentConfig.maxPromptBytes,
           },
         );
-        if (queued && !queued.ended && !queued.rejected && !queued.conflict) {
-          current = queued;
-          acceptedPrompts = Array.isArray(queued.accepted_prompts) ? queued.accepted_prompts : [];
-          clearedTags = Array.isArray(queued.cleared_tags) ? queued.cleared_tags : [];
-          if (queued.fresh_feedback) {
-            emitHubEvent({
-              event: "message",
-              key: req.params.key,
-              file: current.file,
-              url: current.url,
-              creator: current.creator || "",
-              tags: current.tags || [],
-              had_listener: Boolean(activeHolder),
-              listener: activeHolder ? listenerLabel(activeHolder) : null,
-              prompts: acceptedPrompts,
-            });
-            events.emit("feedback", req.params.key, current.ended_by);
-            events.emit("chat-sync", req.params.key, current);
-          }
+        if (!queued) {
+          res.status(404).json({ error: "session not found" });
+          return;
+        }
+        if (queued.ended) {
+          res.status(409).json({ status: "ended", error: "session already ended", ended_by: queued.ended_by });
+          return;
+        }
+        if (queued.rejected) {
+          res.status(400).json({
+            error: "some attachments could not be delivered",
+            rejected: queued.rejected,
+            caps: queued.caps,
+          });
+          return;
+        }
+        if (queued.conflict) {
+          res.status(409).json({ status: "conflict", error: "message could not be queued" });
+          return;
+        }
+        current = queued;
+        acceptedPrompts = Array.isArray(queued.accepted_prompts) ? queued.accepted_prompts : [];
+        clearedTags = Array.isArray(queued.cleared_tags) ? queued.cleared_tags : [];
+        if (queued.fresh_feedback) {
+          emitHubEvent({
+            event: "message",
+            key: req.params.key,
+            file: current.file,
+            url: current.url,
+            creator: current.creator || "",
+            tags: current.tags || [],
+            had_listener: Boolean(activeHolder),
+            listener: activeHolder ? listenerLabel(activeHolder) : null,
+            prompts: acceptedPrompts,
+          });
+          events.emit("feedback", req.params.key, current.ended_by);
+          events.emit("chat-sync", req.params.key, current);
         }
       }
       if (Array.isArray(current.tags) && current.tags.some((tag) => String(tag).toLowerCase() === "needs-input")) {

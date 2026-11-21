@@ -588,6 +588,7 @@ async function createChromeHarness({
     postedToFrame,
     postedToWhiteboard,
     clipboardWrites,
+    composerAttachments: () => context.window["lavishChatAttachments"],
     createInlineWhiteboard() {
       const posted = [];
       // A real inline whiteboard frame is created by the SDK inside the
@@ -10053,4 +10054,29 @@ test("confirmation displays the exact submitted action instead of an artifact la
   await flushPromises();
   assert.equal(calls.length, 1);
   assert.equal(calls[0].prompt, prompt);
+});
+
+test("workflow success clears sent composer chips while keeping images added during the request", async () => {
+  let nextUpload = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ attachment: { id: String(++nextUpload).repeat(64) + ".png" } }),
+    }),
+  });
+  const controller = chrome.composerAttachments();
+  chrome.element("chatInput").dispatch("paste", clipboardEvent(pastedImage("sent.png")));
+  await flushPromises();
+  await flushPromises();
+  const sent = controller.collectReady();
+  assert.equal(sent.length, 1);
+  chrome.element("chatInput").dispatch("paste", clipboardEvent(pastedImage("new.png")));
+  await flushPromises();
+  await flushPromises();
+  controller.reset(sent);
+  assert.deepEqual(JSON.parse(JSON.stringify(controller.collectReady())), [
+    { id: "2".repeat(64) + ".png", name: "new.png" },
+  ]);
+  assert.doesNotMatch(chrome.element("chatAttachments").innerHTML, /sent\.png/);
+  assert.match(chrome.element("chatAttachments").innerHTML, /new\.png/);
 });
