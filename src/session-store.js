@@ -249,7 +249,7 @@ export class SessionStore {
     // snapshots and failures are preserved. Attachments are still re-derived through the resolver,
     // because restore re-enters the same trust boundary.
     const restoring = options.restore === true;
-    const trustedApproval = options.trustedApproval === true && !restoring;
+    const trustedApproval = !restoring ? sanitizeApprovalAuth(options.trustedApproval) : null;
     const alreadyEnded = session.status === "ended";
     // A session already ended by someone else (an agent's `lavish-axi end`, or the user in
     // another tab) must not accept a further batch as if it were queued for delivery: no agent
@@ -962,10 +962,28 @@ function applyTranscriptBound(session) {
   return chatChanged || session.chat_ack_ids.length !== existingAckCount;
 }
 
+function sanitizeApprovalAuth(auth) {
+  if (!auth || typeof auth !== "object") return null;
+  const method = auth.method === "tailscale" || auth.method === "token" ? auth.method : "";
+  const reviewer = normalizePromptAuthor(auth.reviewer);
+  if (!method || !reviewer) return null;
+  /** @type {Record<string, string>} */
+  const clean = { method, reviewer };
+  if (method === "tailscale") {
+    if (typeof auth.login === "string" && auth.login.trim()) clean.login = auth.login.trim().slice(0, 160);
+    if (typeof auth.display_name === "string" && auth.display_name.trim()) {
+      clean.display_name = auth.display_name.trim().slice(0, 120);
+    }
+    if (typeof auth.node === "string" && auth.node.trim()) clean.node = auth.node.trim().slice(0, 160);
+    if (typeof auth.ip === "string" && auth.ip.trim()) clean.ip = auth.ip.trim().slice(0, 64);
+  }
+  return clean;
+}
+
 // Returns `{ prompt, malformed }`: `malformed` is non-empty when the payload's
 // `attachments` field exists but cannot be honored as written, which fails the
 // whole batch rather than being normalized away (C4, see queuePrompts).
-function normalizePrompt(prompt, { restoring = false, trustedApproval = false } = {}) {
+function normalizePrompt(prompt, { restoring = false, trustedApproval = null } = {}) {
   const normalized = {
     uid: String(prompt.uid || ""),
     prompt: String(prompt.prompt || ""),
@@ -977,13 +995,16 @@ function normalizePrompt(prompt, { restoring = false, trustedApproval = false } 
   if (promptId) normalized.prompt_id = promptId;
   const author = normalizePromptAuthor(prompt.author);
   if (author) normalized.author = author;
+  const restoredAuth = restoring ? sanitizeApprovalAuth(prompt.approval_auth) : null;
   if (trustedApproval) {
     normalized.tag = "send_approval";
     normalized.via = "chrome_approval";
-    normalized.user_gesture = true;
-  } else if (restoring && prompt.via === "chrome_approval" && prompt.user_gesture === true && author) {
+    normalized.author = trustedApproval.reviewer;
+    normalized.approval_auth = trustedApproval;
+  } else if (restoring && prompt.via === "chrome_approval" && restoredAuth) {
     normalized.via = "chrome_approval";
-    normalized.user_gesture = true;
+    normalized.author = restoredAuth.reviewer;
+    normalized.approval_auth = restoredAuth;
   } else {
     if (prompt.via === "cli") normalized.via = "cli";
     if (normalized.tag === "send_approval") normalized.tag = "message";

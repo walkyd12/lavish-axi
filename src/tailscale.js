@@ -135,6 +135,106 @@ export async function detectTailscale({
   return null;
 }
 
+export function normalizeRemoteIp(address) {
+  const raw = typeof address === "string" ? address.trim() : "";
+  if (!raw) return "";
+  const unwrapped = raw.toLowerCase().startsWith("::ffff:") ? raw.slice(7) : raw;
+  return isIP(unwrapped) ? unwrapped : "";
+}
+
+export function isLoopbackIp(address) {
+  const ip = normalizeRemoteIp(address);
+  if (!ip) return false;
+  return ip === "::1" || ip === "127.0.0.1" || ip.startsWith("127.");
+}
+
+/**
+ * Parse `tailscale whois --json` into a verified personal-device peer identity, or null when the
+ * peer is this node itself, a tagged server/bot node, or lacks a user profile. Never throws.
+ * @param {string} raw
+ * @returns {{ loginName: string, displayName: string, nodeName: string, ip: string } | null}
+ */
+export function parseTailscaleWhois(raw) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!data || typeof data !== "object") return null;
+  const node = data.Node && typeof data.Node === "object" ? data.Node : null;
+  if (node?.SelfNode === true) return null;
+  if (Array.isArray(node?.Tags) && node.Tags.length > 0) return null;
+  const profile = data.UserProfile && typeof data.UserProfile === "object" ? data.UserProfile : null;
+  if (!profile) return null;
+  const loginName = typeof profile.LoginName === "string" ? profile.LoginName.trim() : "";
+  const displayName = typeof profile.DisplayName === "string" ? profile.DisplayName.trim() : "";
+  if ((!loginName && !displayName) || loginName.toLowerCase() === "tagged-devices") return null;
+  const rawNodeName =
+    (typeof node?.ComputedName === "string" && node.ComputedName.trim()) ||
+    (typeof node?.Hostinfo?.Hostname === "string" && node.Hostinfo.Hostname.trim()) ||
+    (typeof node?.Name === "string" && node.Name.trim()) ||
+    "";
+  const nodeName = rawNodeName.replace(/\.$/, "").toLowerCase();
+  const addresses = Array.isArray(node?.Addresses) ? node.Addresses : [];
+  let peerIp = "";
+  for (const addr of addresses) {
+    if (typeof addr !== "string") continue;
+    const bare = addr.split("/")[0].trim();
+    if (isIP(bare) === 4) {
+      peerIp = bare;
+      break;
+    }
+    if (!peerIp && isIP(bare)) peerIp = bare;
+  }
+  return { loginName, displayName, nodeName, ip: peerIp };
+}
+
+/**
+ * Identify a remote Tailscale peer via `tailscale whois --json`. Loopback addresses, tagged server
+ * nodes, self connections, missing binaries, and probe errors all return null - never throws.
+ * @param {string | undefined} remoteAddress
+ * @param {number | undefined} [remotePort]
+ * @param {{ execFile?: typeof execFileAsync, timeoutMs?: number, commands?: string[], now?: () => number, env?: NodeJS.ProcessEnv, resolveCommand?: typeof resolveTailscaleCommand }} [options]
+ */
+export async function whoisTailscalePeer(
+  remoteAddress,
+  remotePort = undefined,
+  {
+    execFile = execFileAsync,
+    timeoutMs = 1500,
+    commands = tailscaleCommandCandidates(),
+    now = Date.now,
+    env = process.env,
+    resolveCommand = resolveTailscaleCommand,
+  } = {},
+) {
+  const ip = normalizeRemoteIp(remoteAddress);
+  if (!ip || isLoopbackIp(ip)) return null;
+  const hasPort = Number.isInteger(remotePort) && Number(remotePort) > 0 && Number(remotePort) <= 65535;
+  const target = hasPort ? (isIP(ip) === 6 ? `[${ip}]:${remotePort}` : `${ip}:${remotePort}`) : ip;
+  const deadline = now() + timeoutMs;
+  for (const command of commands) {
+    if (deadline - now() <= 0) break;
+    try {
+      const resolvedCommand = await resolveCommand(command, env);
+      if (!resolvedCommand) continue;
+      const remainingMs = deadline - now();
+      if (remainingMs <= 0) break;
+      const { stdout } = await execFile(resolvedCommand, ["whois", "--json", target], {
+        timeout: remainingMs,
+        maxBuffer: 512_000,
+        encoding: "utf8",
+      });
+      const parsed = parseTailscaleWhois(String(stdout || ""));
+      if (parsed) return { ...parsed, ip: parsed.ip || ip };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 function isIncompleteRunningTailscaleStatus(raw) {
   let data;
   try {

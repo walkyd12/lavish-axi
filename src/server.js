@@ -2,10 +2,10 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { open as openFile, readFile, realpath } from "node:fs/promises";
+import { open as openFile, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
-import { homedir, hostname as osHostname } from "node:os";
+import { homedir, hostname as osHostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -95,7 +95,7 @@ import {
   sanitizeListenHosts,
   stateId,
 } from "./paths.js";
-import { detectTailscale } from "./tailscale.js";
+import { detectTailscale, isLoopbackIp, normalizeRemoteIp, whoisTailscalePeer } from "./tailscale.js";
 import { artifactTreeRoot, isArtifactPathError, isHtmlPath, resolveAllowedArtifactFile } from "./artifact-path.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
 import { AsyncMutex } from "./async-mutex.js";
@@ -313,6 +313,115 @@ export function resolveBrowserDisconnectGraceMs(env = process.env) {
   return Math.min(value, 2147483647);
 }
 
+function timingSafeEqualString(a, b) {
+  const bufA = Buffer.from(String(a || ""), "utf8");
+  const bufB = Buffer.from(String(b || ""), "utf8");
+  return bufA.length > 0 && bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Parse `LAVISH_AXI_APPROVAL_TOKENS="Name=secret,Other=secret2"` into reviewer -> secret entries.
+ * @param {string | Record<string, string> | undefined} raw
+ */
+export function parseApprovalTokens(raw) {
+  /** @type {Array<{ reviewer: string, token: string }>} */
+  const out = [];
+  if (!raw) return out;
+  if (typeof raw === "object") {
+    for (const [name, tok] of Object.entries(raw)) {
+      const reviewer = normalizePromptAuthor(name);
+      const token = typeof tok === "string" ? tok.trim() : "";
+      if (reviewer && token) out.push({ reviewer, token });
+    }
+    return out;
+  }
+  for (const part of String(raw).split(",")) {
+    const entry = part.trim();
+    if (!entry) continue;
+    const eq = entry.indexOf("=");
+    if (eq <= 0) continue;
+    const reviewer = normalizePromptAuthor(entry.slice(0, eq));
+    const token = entry.slice(eq + 1).trim();
+    if (reviewer && token) out.push({ reviewer, token });
+  }
+  return out;
+}
+
+/**
+ * Parse optional `LAVISH_AXI_APPROVAL_USERS="Name=login_or_handle,..."` alias map for Tailscale whois.
+ * @param {string | Record<string, string | string[]> | undefined} raw
+ */
+export function parseApprovalUsers(raw) {
+  /** @type {Map<string, Set<string>>} */
+  const map = new Map();
+  const add = (name, alias) => {
+    const cleanName = normalizePromptAuthor(name).toLowerCase();
+    const cleanAlias = String(alias || "")
+      .trim()
+      .toLowerCase();
+    if (!cleanName || !cleanAlias) return;
+    let set = map.get(cleanName);
+    if (!set) {
+      set = new Set();
+      map.set(cleanName, set);
+    }
+    set.add(cleanAlias);
+  };
+  if (!raw) return map;
+  if (typeof raw === "object") {
+    for (const [name, val] of Object.entries(raw)) {
+      for (const item of Array.isArray(val) ? val : [val]) add(name, item);
+    }
+    return map;
+  }
+  for (const part of String(raw).split(",")) {
+    const entry = part.trim();
+    const eq = entry.indexOf("=");
+    if (eq <= 0) continue;
+    for (const item of entry
+      .slice(eq + 1)
+      .split("|")
+      .map((s) => s.trim())) {
+      add(entry.slice(0, eq), item);
+    }
+  }
+  return map;
+}
+
+function reviewerMatchesName(suppliedAuthor, expectedReviewer) {
+  const sup = normalizePromptAuthor(suppliedAuthor).toLowerCase();
+  const exp = normalizePromptAuthor(expectedReviewer).toLowerCase();
+  if (!sup || !exp) return false;
+  if (sup === exp) return true;
+  const supFirst = sup.split(/\s+/)[0];
+  const expFirst = exp.split(/\s+/)[0];
+  return Boolean(supFirst && supFirst === expFirst && (sup === supFirst || exp === expFirst));
+}
+
+function doesAuthorMatchTailscaleWhois(suppliedAuthor, whois, aliasMap) {
+  const sup = normalizePromptAuthor(suppliedAuthor).toLowerCase();
+  if (!sup || !whois) return false;
+  const display = String(whois.displayName || "")
+    .trim()
+    .toLowerCase();
+  const login = String(whois.loginName || "")
+    .trim()
+    .toLowerCase();
+  const loginLocal = login.split("@")[0] || "";
+  const aliases = aliasMap?.get(sup) || aliasMap?.get(sup.split(/\s+/)[0]);
+  if (aliases) {
+    if ((login && aliases.has(login)) || (loginLocal && aliases.has(loginLocal)) || (display && aliases.has(display))) {
+      return true;
+    }
+  }
+  if (display && (sup === display || display.split(/[^a-z0-9]+/).includes(sup))) return true;
+  const supFirst = sup.split(/\s+/)[0];
+  if (display && supFirst.length >= 2 && display.split(/[^a-z0-9]+/)[0] === supFirst) return true;
+  if (loginLocal && (sup === loginLocal || loginLocal.split(/[^a-z0-9]+/).includes(supFirst))) return true;
+  if (supFirst.length >= 3 && loginLocal.startsWith(supFirst)) return true;
+  return false;
+}
+
 /**
  * @param {{ [key: string]: any }} [options]
  */
@@ -333,6 +442,9 @@ export async function serve({
   publicUrl = publicBaseUrl(env),
   allowedHosts,
   detectTailscale: detectTailscaleFn,
+  whoisPeer: whoisPeerFn,
+  approvalTokens = env.LAVISH_AXI_APPROVAL_TOKENS,
+  approvalUsers = env.LAVISH_AXI_APPROVAL_USERS,
   lookupHost,
   extraListenHosts = [],
   bindRecoveryDelaysMs = BIND_RECOVERY_DELAYS_MS,
@@ -343,6 +455,9 @@ export async function serve({
   actionLabel = env.LAVISH_AXI_ACTION_LABEL,
   onEvent = null,
 } = {}) {
+  const whoisPeer = whoisPeerFn === undefined ? whoisTailscalePeer : whoisPeerFn;
+  const resolvedApprovalTokens = parseApprovalTokens(approvalTokens);
+  const resolvedApprovalUsers = parseApprovalUsers(approvalUsers);
   const resolvedActionLabel =
     String(actionLabel || "Send")
       .trim()
@@ -475,30 +590,61 @@ export async function serve({
     };
   }
 
-  function compactEventPayload(payload) {
+  const MAX_HOOK_ARG_BYTES = 65_536;
+
+  function compactEventPayload(payload, { promptMax = 16_384, chatMax = 8_192 } = {}) {
     const out = { ...payload };
     if (typeof out.search_text === "string" && out.search_text.length > 16_384) {
       out.search_text = out.search_text.slice(0, 16_384);
     }
     if (Array.isArray(out.prompts)) {
       out.prompts = out.prompts.slice(0, 32).map((prompt) => ({
-        prompt: String(prompt?.prompt || "").slice(0, 4_096),
+        prompt: String(prompt?.prompt || "").slice(0, promptMax),
         tag: String(prompt?.tag || "").slice(0, 64),
         selector: String(prompt?.selector || "").slice(0, 512),
         text: String(prompt?.text || "").slice(0, 256),
         ...(prompt?.prompt_id ? { prompt_id: String(prompt.prompt_id).slice(0, 128) } : {}),
         ...(prompt?.author ? { author: String(prompt.author).slice(0, 80) } : {}),
         ...(prompt?.via === "cli" || prompt?.via === "chrome_approval" ? { via: prompt.via } : {}),
-        ...(prompt?.user_gesture === true ? { user_gesture: true } : {}),
+        ...(prompt?.approval_auth && typeof prompt.approval_auth === "object"
+          ? { approval_auth: prompt.approval_auth }
+          : {}),
         ...(prompt?.target ? { target: prompt.target } : {}),
+        ...(Array.isArray(prompt?.attachments) && prompt.attachments.length > 0
+          ? {
+              attachments: prompt.attachments
+                .slice(0, 16)
+                .filter((att) => att && typeof att === "object" && att.id)
+                .map((att) => ({
+                  id: String(att.id).slice(0, 128),
+                  ...(att.name ? { name: String(att.name).slice(0, 200) } : {}),
+                  ...(att.path ? { path: String(att.path).slice(0, 1024) } : {}),
+                  ...(att.mime ? { mime: String(att.mime).slice(0, 64) } : {}),
+                  ...(Number.isFinite(att.bytes) ? { bytes: Number(att.bytes) } : {}),
+                  ...(Number.isFinite(att.width) ? { width: Number(att.width) } : {}),
+                  ...(Number.isFinite(att.height) ? { height: Number(att.height) } : {}),
+                })),
+            }
+          : {}),
       }));
     }
     if (Array.isArray(out.chat)) {
       out.chat = out.chat.slice(-40).map((entry) => ({
         role: entry?.role === "agent" ? "agent" : "user",
-        text: String(entry?.text || "").slice(0, 4_096),
+        text: String(entry?.text || "").slice(0, chatMax),
         ...(entry?.author ? { author: String(entry.author).slice(0, 80) } : {}),
         ...(entry?.at ? { at: String(entry.at).slice(0, 40) } : {}),
+        ...(Array.isArray(entry?.attachments) && entry.attachments.length > 0
+          ? {
+              attachments: entry.attachments
+                .slice(0, 16)
+                .filter((att) => att && typeof att === "object" && att.id)
+                .map((att) => ({
+                  id: String(att.id).slice(0, 128),
+                  ...(att.name ? { name: String(att.name).slice(0, 200) } : {}),
+                })),
+            }
+          : {}),
       }));
     }
     return out;
@@ -611,7 +757,14 @@ export async function serve({
         .then(() => onEvent(eventPayload))
         .catch((error) => writeLog(`[lavish] onEvent callback failed: ${error?.message || error}`));
     }
-    const serialized = JSON.stringify(eventPayload);
+    let serialized = JSON.stringify(eventPayload);
+    if (Buffer.byteLength(serialized, "utf8") > MAX_HOOK_ARG_BYTES) {
+      const slimmer = compactEventPayload(
+        { ...eventPayload, search_text: String(eventPayload.search_text || "").slice(0, 4_096) },
+        { promptMax: 1_024, chatMax: 512 },
+      );
+      serialized = JSON.stringify(slimmer);
+    }
     const hookEnv = { LAVISH_AXI_EVENT: String(eventPayload.event || "") };
     const eventCommand = String(env.LAVISH_AXI_ON_EVENT || process.env.LAVISH_AXI_ON_EVENT || "").trim();
     runDetachedHookOrdered("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv);
@@ -1073,14 +1226,54 @@ export async function serve({
   const PEER_WS_BACKOFF_MS = [200, 500, 1000, 2000, 5000];
   /** @type {Array<{ close: () => void }>} */
   const peerEventSubscriptions = [];
+  const peerCursorsFile = path.join(path.dirname(stateFile), "peer-cursors.json");
+  /** @type {Record<string, { instance_id: string, seq: number }>} */
+  const peerCursors = {};
+  let peerCursorWriteChain = Promise.resolve();
+
+  async function loadPeerCursors() {
+    try {
+      const raw = await readFile(peerCursorsFile, "utf8");
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return;
+      for (const [k, val] of Object.entries(parsed)) {
+        if (!val || typeof val !== "object") continue;
+        const inst = typeof val.instance_id === "string" ? val.instance_id.trim() : "";
+        const seq = Number(val.seq);
+        if (inst || (Number.isInteger(seq) && seq >= 0)) {
+          peerCursors[k.toLowerCase()] = {
+            instance_id: inst,
+            seq: Number.isInteger(seq) && seq >= 0 ? seq : 0,
+          };
+        }
+      }
+    } catch {
+      // Missing or unreadable sidecar starts fresh.
+    }
+  }
+
+  function persistPeerCursor(peerKey, instanceId, seq) {
+    peerCursors[peerKey] = { instance_id: instanceId, seq };
+    const snapshot = `${JSON.stringify(peerCursors, null, 2)}\n`;
+    peerCursorWriteChain = peerCursorWriteChain
+      .then(async () => {
+        const tmp = `${peerCursorsFile}.${process.pid}.tmp`;
+        await writeFile(tmp, snapshot, { mode: 0o600 });
+        await rename(tmp, peerCursorsFile);
+      })
+      .catch(() => {});
+    return peerCursorWriteChain;
+  }
 
   function startPeerEventSubscribers() {
     for (const peer of parsedPeers.peers) {
       const peerKey = peer.name.toLowerCase();
-      let peerInstanceId = "";
-      let lastSeq = 0;
+      const savedCursor = peerCursors[peerKey];
+      let peerInstanceId = savedCursor?.instance_id || "";
+      let lastSeq = savedCursor?.seq || 0;
       let attempt = 0;
       let closed = false;
+      let peerFrameQueue = Promise.resolve();
       /** @type {import("ws").WebSocket | null} */
       let socket = null;
       /** @type {ReturnType<typeof setTimeout> | null} */
@@ -1112,41 +1305,51 @@ export async function serve({
             notifyHubViewers();
           });
           ws.on("message", (raw) => {
-            try {
-              const msg = JSON.parse(String(raw));
-              if (!msg || typeof msg !== "object") return;
-              if (msg.type === "hub-hello") {
-                const nextInstance = typeof msg.instance_id === "string" ? msg.instance_id.trim() : "";
-                if (nextInstance && nextInstance !== peerInstanceId) {
-                  peerInstanceId = nextInstance;
-                  lastSeq = 0;
+            peerFrameQueue = peerFrameQueue
+              .then(async () => {
+                if (closed || shuttingDown) return;
+                const msg = JSON.parse(String(raw));
+                if (!msg || typeof msg !== "object") return;
+                if (msg.type === "hub-hello") {
+                  const nextInstance = typeof msg.instance_id === "string" ? msg.instance_id.trim() : "";
+                  if (nextInstance && nextInstance !== peerInstanceId) {
+                    peerInstanceId = nextInstance;
+                    lastSeq = 0;
+                    await persistPeerCursor(peerKey, peerInstanceId, lastSeq);
+                    collectPeerBoards?.invalidate(peer.name);
+                    notifyHubViewers();
+                  }
+                  return;
+                }
+                if (msg.type === "hub-invalidate") {
                   collectPeerBoards?.invalidate(peer.name);
                   notifyHubViewers();
+                  return;
                 }
-                return;
-              }
-              if (msg.type === "hub-invalidate") {
+                if (msg.type !== "hub-event") return;
+                let cursorChanged = false;
+                const eventInstance = typeof msg.instance_id === "string" ? msg.instance_id.trim() : "";
+                if (eventInstance && eventInstance !== peerInstanceId) {
+                  peerInstanceId = eventInstance;
+                  lastSeq = 0;
+                  cursorChanged = true;
+                }
+                const seq = Number(msg.seq);
+                if (Number.isInteger(seq) && seq > 0) {
+                  if (seq <= lastSeq) return;
+                  lastSeq = seq;
+                  cursorChanged = true;
+                }
+                if (cursorChanged) {
+                  await persistPeerCursor(peerKey, peerInstanceId, lastSeq);
+                }
                 collectPeerBoards?.invalidate(peer.name);
-                notifyHubViewers();
-                return;
-              }
-              if (msg.type !== "hub-event") return;
-              const eventInstance = typeof msg.instance_id === "string" ? msg.instance_id.trim() : "";
-              if (eventInstance && eventInstance !== peerInstanceId) {
-                peerInstanceId = eventInstance;
-                lastSeq = 0;
-              }
-              const seq = Number(msg.seq);
-              if (Number.isInteger(seq) && seq > 0) {
-                if (seq <= lastSeq) return;
-                lastSeq = seq;
-              }
-              collectPeerBoards?.invalidate(peer.name);
-              const sanitized = sanitizePeerHubEvent(peer, msg.event);
-              if (sanitized) emitHubEvent(sanitized);
-            } catch {
-              // ignore malformed peer frame
-            }
+                const sanitized = sanitizePeerHubEvent(peer, msg.event);
+                if (sanitized) emitHubEvent(sanitized);
+              })
+              .catch(() => {
+                // ignore malformed peer frame
+              });
           });
           ws.on("error", () => {});
           ws.on("close", () => {
@@ -1181,6 +1384,7 @@ export async function serve({
         },
       });
     }
+    refreshIdleTimer();
   }
 
   function closePeerEventSubscribers() {
@@ -2143,10 +2347,97 @@ export async function serve({
     }
   });
 
+  function isOwnServerIp(ip) {
+    if (!ip || isLoopbackIp(ip)) return true;
+    if (tailscale?.ipv4 && normalizeRemoteIp(tailscale.ipv4) === ip) return true;
+    for (const bound of boundHosts) {
+      if (normalizeRemoteIp(bound) === ip) return true;
+    }
+    try {
+      for (const entries of Object.values(networkInterfaces() || {})) {
+        for (const entry of entries || []) {
+          if (entry?.address && normalizeRemoteIp(entry.address) === ip) return true;
+        }
+      }
+    } catch {
+      // ignore interface enumeration failure
+    }
+    return false;
+  }
+
+  async function resolveRemoteViewerName(req) {
+    const socketIp = normalizeRemoteIp(req.socket?.remoteAddress);
+    if (!socketIp || isOwnServerIp(socketIp) || typeof whoisPeer !== "function") return "";
+    try {
+      const whois = await whoisPeer(socketIp, req.socket?.remotePort);
+      return whois?.displayName ? normalizePromptAuthor(whois.displayName) : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function verifyApprovalReviewer(req, suppliedAuthor) {
+    const authHeader = String(req.headers.authorization || "").trim();
+    const bearer = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
+    const providedToken =
+      typeof req.body?.approval_token === "string" && req.body.approval_token.trim()
+        ? req.body.approval_token.trim()
+        : bearer;
+    if (providedToken && resolvedApprovalTokens.length > 0) {
+      const matched = resolvedApprovalTokens.find((entry) => timingSafeEqualString(providedToken, entry.token));
+      if (!matched) {
+        return { ok: false, status: 403, error: "invalid approval token" };
+      }
+      if (suppliedAuthor && !reviewerMatchesName(suppliedAuthor, matched.reviewer)) {
+        return { ok: false, status: 403, error: "supplied reviewer name does not match approval token" };
+      }
+      return { ok: true, auth: { method: "token", reviewer: matched.reviewer } };
+    }
+    if (resolvedApprovalTokens.length > 0) {
+      return { ok: false, status: 403, error: "an approval token is required to confirm this action" };
+    }
+    const socketIp = normalizeRemoteIp(req.socket?.remoteAddress);
+    if (!socketIp || isOwnServerIp(socketIp)) {
+      return {
+        ok: false,
+        status: 403,
+        error:
+          "reviewer identity could not be verified from loopback; open this board from your personal Tailscale device or configure LAVISH_AXI_APPROVAL_TOKENS",
+      };
+    }
+    const whois = typeof whoisPeer === "function" ? await whoisPeer(socketIp, req.socket?.remotePort) : null;
+    if (!whois) {
+      return {
+        ok: false,
+        status: 403,
+        error: "reviewer identity could not be verified via Tailscale whois",
+      };
+    }
+    if (!doesAuthorMatchTailscaleWhois(suppliedAuthor, whois, resolvedApprovalUsers)) {
+      return {
+        ok: false,
+        status: 403,
+        error: "supplied reviewer name does not match authenticated Tailscale user",
+      };
+    }
+    return {
+      ok: true,
+      auth: {
+        method: "tailscale",
+        reviewer: suppliedAuthor,
+        ...(whois.loginName ? { login: whois.loginName } : {}),
+        ...(whois.displayName ? { display_name: whois.displayName } : {}),
+        ...(whois.nodeName ? { node: whois.nodeName } : {}),
+        ip: whois.ip || socketIp,
+      },
+    };
+  }
+
   // Human-confirmed approval from the outer review chrome (`chrome-client.js`), never from the
   // sandboxed artifact iframe or CLI/bot callers. Requires same-origin, the active reviewer
   // handoff capability (`chrome_load_token`), an open `/events/:key` browser WebSocket on this
-  // session, and a non-empty reviewer name.
+  // session, and a server-verified reviewer identity (either a configured approval token or a
+  // personal Tailscale peer verified via `tailscale whois`).
   app.post("/api/:key/approval", async (req, res, next) => {
     try {
       if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
@@ -2175,6 +2466,11 @@ export async function serve({
         res.status(409).json({ error: "review tab is superseded or expired; reload to confirm" });
         return;
       }
+      const verified = await verifyApprovalReviewer(req, author);
+      if (!verified.ok) {
+        res.status(verified.status).json({ error: verified.error });
+        return;
+      }
       const activeHolder = activePolls.get(req.params.key);
       const result = await store.queuePrompts(
         req.params.key,
@@ -2187,12 +2483,12 @@ export async function serve({
               tag: "send_approval",
               text: typeof req.body?.text === "string" ? req.body.text.slice(0, 240) : "Approval",
               prompt_id: `approval-${crypto.randomUUID()}`,
-              author,
+              author: verified.auth.reviewer,
             },
           ],
         },
         {
-          trustedApproval: true,
+          trustedApproval: verified.auth,
           resolveAttachment: (sessionKeyValue, id) => resolveAttachment(attachmentStateRoot, sessionKeyValue, id),
           maxPerPrompt: attachmentConfig.maxPerPrompt,
           maxPromptBytes: attachmentConfig.maxPromptBytes,
@@ -2607,6 +2903,7 @@ export async function serve({
       // `frame-src 'self'` keeps the artifact iframe on this server: a board script that
       // navigates its own frame to another site (`location.href = "https://x/?data"`) is refused
       // by the browser before any request leaves. Links meant for elsewhere open a new tab.
+      const viewerName = await resolveRemoteViewerName(req);
       res.setHeader("content-security-policy", "frame-ancestors 'none'; frame-src 'self'");
       res.type("html").send(
         createChromeHtml(session, {
@@ -2620,6 +2917,8 @@ export async function serve({
           attachmentMaxBytes: attachmentConfig.maxBytes,
           attachmentMaxCount: attachmentConfig.maxPerPrompt,
           actionLabel: resolvedActionLabel,
+          initialViewerName: viewerName,
+          requiresApprovalToken: resolvedApprovalTokens.length > 0,
           theme,
         }),
       );
@@ -3177,7 +3476,11 @@ export async function serve({
           }
         }
         targetSet.add(webSocket);
-        webSocket.once("close", () => targetSet.delete(webSocket));
+        refreshIdleTimer();
+        webSocket.once("close", () => {
+          targetSet.delete(webSocket);
+          refreshIdleTimer();
+        });
       });
       return;
     }
@@ -3441,6 +3744,7 @@ export async function serve({
     writeLog(`[lavish] WARNING: ${describeBindFailure(listenHost, error)}`);
   }
   serverReady = true;
+  if (parsedPeers.peers.length > 0) await loadPeerCursors();
   startPeerEventSubscribers();
   scheduleBindRecovery();
 
@@ -3513,18 +3817,29 @@ export async function serve({
     }
   }
 
-  // Idle self-shutdown: the timer only runs while nothing is connected. Any live event chrome or
-  // active long-poll cancels it; losing the last connection (re)arms it.
+  function hasActiveHubOrSessionConnections() {
+    return (
+      liveEventClients.size > 0 ||
+      activePolls.size > 0 ||
+      hubViewStreamClients.size > 0 ||
+      hubPeerStreamClients.size > 0 ||
+      peerEventSubscriptions.length > 0
+    );
+  }
+
+  // Idle self-shutdown: the timer only runs while nothing is connected. Any live event chrome,
+  // hub viewer, peer hub stream/subscription, or active long-poll cancels it; losing the last
+  // connection (re)arms it.
   function refreshIdleTimer() {
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = null;
     }
     if (shuttingDown || idleTimeoutMs == null) return;
-    if (liveEventClients.size > 0 || activePolls.size > 0) return;
+    if (hasActiveHubOrSessionConnections()) return;
     idleTimer = setTimeout(() => {
       idleTimer = null;
-      if (!shuttingDown && liveEventClients.size === 0 && activePolls.size === 0) {
+      if (!shuttingDown && !hasActiveHubOrSessionConnections()) {
         shutdown("", "", `idle-timeout after ${idleTimeoutMs}ms with no connections`);
       }
     }, idleTimeoutMs);
@@ -3532,12 +3847,12 @@ export async function serve({
   }
 
   // When the final open session ends with nothing connected, there is nothing left to serve,
-  // so step down immediately rather than waiting out the idle timeout. If a browser chrome or
-  // poll is still attached (e.g. the user is about to reopen), leave the server up and let the
-  // idle timer reap it once those connections drop. Best-effort: never let a read failure
-  // block the end response.
+  // so step down immediately rather than waiting out the idle timeout. If a browser chrome, hub
+  // viewer, peer subscription, or poll is still attached (e.g. the user is about to reopen), leave
+  // the server up and let the idle timer reap it once those connections drop. Best-effort: never
+  // let a read failure block the end response.
   async function shutdownIfNoLiveSessions() {
-    if (liveEventClients.size > 0 || activePolls.size > 0) return;
+    if (hasActiveHubOrSessionConnections()) return;
     try {
       const sessions = await store.listSessions();
       if (sessions.every((session) => session.status === "ended")) {
@@ -4272,6 +4587,8 @@ export function createChromeHtml(
     attachmentMaxCount = 0,
     attachmentAcceptedMime = ACCEPTED_IMAGE_MIME,
     actionLabel = "Send",
+    initialViewerName = "",
+    requiresApprovalToken = false,
     theme = "",
   } = {},
 ) {
@@ -4302,6 +4619,8 @@ export function createChromeHtml(
     initialArtifactLoadToken: artifactLoadToken,
     initialArtifactLoadSequence: artifactLoadSequence,
     chromeLoadToken,
+    initialViewerName: initialViewerName || "",
+    requiresApprovalToken: requiresApprovalToken === true,
     layoutGateEnabled,
     modeToggleHotkeyKey: MODE_TOGGLE_HOTKEY_KEY,
     attachmentMaxBytes,
@@ -4332,7 +4651,7 @@ ${themed.style}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><span class="presence-pill" id="presencePill" role="status" aria-live="polite" data-tone="off"><span class="presence-dot" aria-hidden="true"></span><span class="presence-text" id="presencePillText">Connecting…</span></span><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="panel" aria-expanded="true" aria-label="Hide conversation" title="Hide conversation">${chromeIcons.sidebar}<span class="sidebar-toggle-count" id="sidebarToggleCount" aria-hidden="true" hidden></span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="layoutToggle" type="button" title="Switch between the phone and desktop layouts. Remembered on this device.">${chromeIcons.phone}<span id="layoutToggleText">Layout: Auto</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><label class="approval-author-wrap" id="approvalTokenWrap" for="approvalTokenInput" hidden><span>Token</span><input id="approvalTokenInput" type="password" maxlength="200" placeholder="Approval token"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p><button type="button" class="button ended-action" data-reactivate data-key="${session.key}" data-file="${escapeHtml(session.file)}">Reactivate board</button><p><a href="/">Fusion Hub</a></p></div></div>

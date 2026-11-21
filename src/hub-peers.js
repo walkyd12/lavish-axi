@@ -177,7 +177,17 @@ export function sanitizePeerHubEvent(peer, rawEvent) {
       ...(prompt?.prompt_id ? { prompt_id: text(prompt.prompt_id, 128) } : {}),
       ...(prompt?.author ? { author: text(prompt.author, 80) } : {}),
       ...(prompt?.via === "cli" || prompt?.via === "chrome_approval" ? { via: prompt.via } : {}),
-      ...(prompt?.user_gesture === true ? { user_gesture: true } : {}),
+      ...(Array.isArray(prompt?.attachments)
+        ? {
+            attachments: prompt.attachments
+              .slice(0, 16)
+              .filter((att) => att && typeof att === "object" && text(att.id, 128))
+              .map((att) => ({
+                id: text(att.id, 128),
+                ...(att.name ? { name: text(att.name, 200) } : {}),
+              })),
+          }
+        : {}),
     }));
   }
   if (event === "board_action") {

@@ -397,20 +397,21 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
   await writeFile(localFile, "<title>Local approval board</title><p id='draft-body'>Exact draft text</p>");
 
   let peerFetchCount = 0;
+  const countingFetch = async (url, init) => {
+    if (String(url).includes("/api/hub?peers=0")) peerFetchCount += 1;
+    return fetch(url, init);
+  };
   let peer = await serve({ port: 0, stateFile: path.join(dir, "peer-restart.json"), version: "0.1.96" });
   const peerPort = peer.port;
   const peerBase = `http://127.0.0.1:${peerPort}`;
   const events = [];
-  const server = await serve({
+  let server = await serve({
     port: 0,
     stateFile: path.join(dir, "central.json"),
     version: "0.1.96",
     hubPeers: `walker=${peerBase}`,
     hubPeerOptions: {
-      fetchImpl: async (url, init) => {
-        if (String(url).includes("/api/hub?peers=0")) peerFetchCount += 1;
-        return fetch(url, init);
-      },
+      fetchImpl: countingFetch,
     },
     onEvent: (payload) => events.push(payload),
   });
@@ -482,18 +483,56 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
     assert.equal(postRestartClose.peer_seq, 1);
     assert.ok(postRestartClose.peer_instance, "restarted peer stamps its fresh instance_id");
 
-    // 4. P1 #1: /api/:key/prompts strips send_approval even with empty author, and /api/:key/approval
-    // requires active browser WebSocket + valid chrome_load_token + non-empty author.
-    const localReg = await fetch(`${base}/api/sessions`, {
+    // 4. Round 3 P1 #4: Restarting the CENTRAL hub on the same stateFile preserves `peer-cursors.json`
+    // and replays ZERO already-processed peer close events, while delivering a fresh post-restart close!
+    await fetch(`${base}/api/hub/${encodeURIComponent(`peer:walker:${peerKeys[0]}`)}/reopen`, {
       method: "POST",
-      headers: { "content-type": "application/json", origin: base },
+      headers: { origin: base },
+    });
+    await fetch(`${base}/api/hub/${encodeURIComponent(`peer:walker:${peerKeys[0]}`)}/close`, {
+      method: "POST",
+      headers: { origin: base },
+    });
+    const secondCloseDeadline = Date.now() + 4_000;
+    while (
+      Date.now() < secondCloseDeadline &&
+      events.filter((e) => e.source === "walker" && e.event === "board_closed" && e.peer_key === peerKeys[0]).length < 2
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    const centralStateFile = path.join(dir, "central.json");
+    await server.close();
+    events.length = 0;
+    server = await serve({
+      port: 0,
+      hosts: ["127.0.0.1"],
+      stateFile: centralStateFile,
+      version: "0.1.96",
+      hubPeers: `walker=http://127.0.0.1:${peer.port}`,
+      hubPeerOptions: { fetchImpl: countingFetch },
+      approvalTokens: "Walker=tok-walker-secret,Alice=tok-alice-secret",
+      onEvent: (ev) => events.push(ev),
+    });
+    const restartedBase = `http://127.0.0.1:${server.port}`;
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(
+      events.filter((e) => e.source === "walker" && e.event === "board_closed").length,
+      0,
+      "central hub restart must not replay historical peer close events",
+    );
+
+    // 5. Round 3 P1 #1: Programmatic loopback callers without a verified reviewer credential are REFUSED (403),
+    // server never fabricates `user_gesture: true`, and mismatched reviewer names are rejected!
+    const localReg = await fetch(`${restartedBase}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: restartedBase },
       body: JSON.stringify({ file: localFile, creator: "Alice" }),
     }).then((r) => r.json());
     const localKey = localReg.key;
 
-    await fetch(`${base}/api/${localKey}/prompts`, {
+    await fetch(`${restartedBase}/api/${localKey}/prompts`, {
       method: "POST",
-      headers: { "content-type": "application/json", origin: base },
+      headers: { "content-type": "application/json", origin: restartedBase },
       body: JSON.stringify({
         prompts: [
           {
@@ -501,22 +540,23 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
             tag: "send_approval",
             author: "",
             via: "chrome_approval",
-            user_gesture: true,
+            approval_auth: { method: "token", reviewer: "Walker" },
           },
         ],
       }),
     });
-    const forgedPoll = await fetch(`${base}/api/poll?file=${encodeURIComponent(localFile)}&timeoutMs=300`).then((r) =>
-      r.json(),
-    );
+    const forgedPoll = await fetch(
+      `${restartedBase}/api/poll?file=${encodeURIComponent(localFile)}&timeoutMs=300`,
+    ).then((r) => r.json());
     assert.equal(forgedPoll.prompts[0].tag, "message");
     assert.equal(forgedPoll.prompts[0].via, undefined);
+    assert.equal(forgedPoll.prompts[0].approval_auth, undefined);
     assert.equal(forgedPoll.prompts[0].user_gesture, undefined);
 
-    // Without live browser WebSocket or chrome_load_token, /api/:key/approval is rejected (403/409).
-    const noWsRes = await fetch(`${base}/api/${localKey}/approval`, {
+    // Without live browser WebSocket or chrome_load_token, /api/:key/approval is rejected (403).
+    const noWsRes = await fetch(`${restartedBase}/api/${localKey}/approval`, {
       method: "POST",
-      headers: { "content-type": "application/json", origin: base },
+      headers: { "content-type": "application/json", origin: restartedBase },
       body: JSON.stringify({
         prompt: "Send approved draft from Walker [ref r123456 sha256 " + "a".repeat(64) + "]: ok",
         author: "Walker",
@@ -525,49 +565,168 @@ test("Peer restart resets /events/hub cursor cleanly, 20x64KiB peer boards stay 
     });
     assert.equal(noWsRes.status, 403);
 
-    // Load chrome page to obtain chromeLoadToken and open /events/:key WebSocket like a real browser tab.
-    const chromeHtml = await fetch(`${base}/session/${localKey}`).then((r) => r.text());
+    const chromeHtml = await fetch(`${restartedBase}/session/${localKey}`).then((r) => r.text());
     const sessionMatch = chromeHtml.match(/<script id="lavish-session" type="application\/json">([\s\S]*?)<\/script>/);
     const chromeToken = JSON.parse(sessionMatch[1]).chromeLoadToken;
-    const liveWs = new WebSocket(`ws://127.0.0.1:${server.port}/events/${localKey}`, { headers: { origin: base } });
+    const liveWs = new WebSocket(`ws://127.0.0.1:${server.port}/events/${localKey}`, {
+      headers: { origin: restartedBase },
+    });
     await new Promise((resolve, reject) => {
       liveWs.once("open", resolve);
       liveWs.once("error", reject);
     });
     try {
-      // Empty author is rejected (400).
-      const emptyAuthorRes = await fetch(`${base}/api/${localKey}/approval`, {
+      // Unauthenticated programmatic client with NO reviewer credential -> 403 Forbidden!
+      const unauthBotRes = await fetch(`${restartedBase}/api/${localKey}/approval`, {
         method: "POST",
-        headers: { "content-type": "application/json", origin: base },
-        body: JSON.stringify({ prompt: "Approve", author: "   ", chrome_load_token: chromeToken }),
-      });
-      assert.equal(emptyAuthorRes.status, 400);
-
-      // Valid chrome handoff + live WebSocket + non-empty author stamps chrome_approval + user_gesture.
-      const okRes = await fetch(`${base}/api/${localKey}/approval`, {
-        method: "POST",
-        headers: { "content-type": "application/json", origin: base },
+        headers: { "content-type": "application/json", origin: restartedBase },
         body: JSON.stringify({
-          prompt: "Send approved draft from Walker [ref r999999 sha256 " + "b".repeat(64) + "]: ship it",
+          prompt: "Send approved draft from Walker [ref r999999 sha256 " + "b".repeat(64) + "]: bot spoof",
           selector: "#send-approved-email",
           author: "Walker",
           chrome_load_token: chromeToken,
         }),
       });
+      assert.equal(unauthBotRes.status, 403, "programmatic client without reviewer credential must be refused");
+
+      // Alice's token trying to claim author "Walker" -> 403 Forbidden!
+      const mismatchRes = await fetch(`${restartedBase}/api/${localKey}/approval`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: restartedBase },
+        body: JSON.stringify({
+          prompt: "Send approved draft from Walker [ref r999999 sha256 " + "b".repeat(64) + "]: impersonation",
+          selector: "#send-approved-email",
+          author: "Walker",
+          approval_token: "tok-alice-secret",
+          chrome_load_token: chromeToken,
+        }),
+      });
+      assert.equal(mismatchRes.status, 403, "impersonating another reviewer must be refused");
+
+      // Verified reviewer credential stamps `approval_auth` and never fabricates `user_gesture`.
+      const okRes = await fetch(`${restartedBase}/api/${localKey}/approval`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: restartedBase },
+        body: JSON.stringify({
+          prompt: "Send approved draft from Walker [ref r999999 sha256 " + "b".repeat(64) + "]: ship it",
+          selector: "#send-approved-email",
+          author: "Walker",
+          approval_token: "tok-walker-secret",
+          chrome_load_token: chromeToken,
+        }),
+      });
       assert.equal(okRes.status, 200);
-      const validPoll = await fetch(`${base}/api/poll?file=${encodeURIComponent(localFile)}&timeoutMs=300`).then((r) =>
-        r.json(),
-      );
+      const validPoll = await fetch(
+        `${restartedBase}/api/poll?file=${encodeURIComponent(localFile)}&timeoutMs=300`,
+      ).then((r) => r.json());
       assert.equal(validPoll.prompts[0].tag, "send_approval");
       assert.equal(validPoll.prompts[0].via, "chrome_approval");
-      assert.equal(validPoll.prompts[0].user_gesture, true);
+      assert.equal(validPoll.prompts[0].user_gesture, undefined);
       assert.equal(validPoll.prompts[0].author, "Walker");
+      assert.deepEqual(validPoll.prompts[0].approval_auth, { method: "token", reviewer: "Walker" });
+
+      // Round 3 P1 #2: Uploading an image + >5,000-char instruction preserves full prompt text & resolved
+      // attachment path on `/api/poll`, AND carries attachment metadata on `message` + `board_action` events!
+      const png1x1 = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        "base64",
+      );
+      const uploaded = await fetch(`${restartedBase}/api/${localKey}/attachments`, {
+        method: "POST",
+        headers: { "content-type": "image/png", origin: restartedBase },
+        body: png1x1,
+      }).then((r) => r.json());
+      assert.equal(uploaded.status, "stored");
+      const longInstruction = "See the attached screenshot: " + "detail-row-check ".repeat(350);
+      assert.ok(longInstruction.length > 5_500);
+      events.length = 0;
+      await fetch(`${restartedBase}/api/${localKey}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: restartedBase },
+        body: JSON.stringify({
+          prompts: [
+            {
+              prompt: longInstruction,
+              tag: "message",
+              author: "Walker",
+              prompt_id: "long-with-shot-1",
+              attachments: [{ id: uploaded.attachment.id, name: "screen.png" }],
+            },
+          ],
+        }),
+      });
+      const msgEv = events.find((e) => e.event === "message" && e.key === localKey);
+      assert.ok(msgEv, "message event emitted");
+      assert.equal(msgEv.prompts[0].attachments?.[0]?.id, uploaded.attachment.id);
+      assert.equal(msgEv.prompts[0].attachments?.[0]?.name, "screen.png");
+      assert.ok(msgEv.prompts[0].attachments?.[0]?.path, "resolved attachment path included in event");
+      const fullPolled = await fetch(
+        `${restartedBase}/api/poll?file=${encodeURIComponent(localFile)}&timeoutMs=300`,
+      ).then((r) => r.json());
+      assert.equal(fullPolled.prompts[0].prompt, longInstruction, "full >4096-char instruction preserved verbatim");
+      assert.equal(fullPolled.prompts[0].attachments[0].id, uploaded.attachment.id);
     } finally {
       liveWs.close();
     }
   } finally {
     await server.close();
     await peer.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hub viewer WebSockets and peer subscriptions prevent premature idle shutdown", async () => {
+  const { WebSocket } = await import("ws");
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-hub-idle-"));
+  const boardFile = path.join(dir, "idle-board.html");
+  await writeFile(boardFile, "<!doctype html><title>Idle Check</title><h1>Board</h1>");
+  let hub = null;
+  let peer = null;
+  try {
+    // 1. Open hub viewer on `/events/hub` keeps server alive past `idleTimeoutMs` with zero board tabs/polls,
+    // and closing the hub viewer allows idle shutdown cleanly.
+    hub = await serve({
+      port: 0,
+      hosts: ["127.0.0.1"],
+      stateFile: path.join(dir, "hub-only.json"),
+      idleTimeoutMs: 120,
+      version: "0.1.96",
+    });
+    const hubBase = `http://127.0.0.1:${hub.port}`;
+    const hubWs = new WebSocket(`ws://127.0.0.1:${hub.port}/events/hub`, { headers: { origin: hubBase } });
+    await new Promise((resolve, reject) => {
+      hubWs.once("open", resolve);
+      hubWs.once("error", reject);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 260));
+    const healthWhileViewing = await fetch(`${hubBase}/health`).then((r) => r.json());
+    assert.equal(healthWhileViewing.ok, true, "hub must stay running while a viewer holds /events/hub open");
+    hubWs.close();
+    await hub.done;
+    hub = null;
+
+    // 2. Central hub configured with `hubPeers` stays alive past `idleTimeoutMs` even with zero browser viewers
+    // so background peer event collection is never dropped.
+    peer = await serve({
+      port: 0,
+      hosts: ["127.0.0.1"],
+      stateFile: path.join(dir, "peer-idle.json"),
+      version: "0.1.96",
+    });
+    hub = await serve({
+      port: 0,
+      hosts: ["127.0.0.1"],
+      stateFile: path.join(dir, "central-idle.json"),
+      idleTimeoutMs: 120,
+      hubPeers: `walker=http://127.0.0.1:${peer.port}`,
+      version: "0.1.96",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 260));
+    const centralHealth = await fetch(`http://127.0.0.1:${hub.port}/health`).then((r) => r.json());
+    assert.equal(centralHealth.ok, true, "central hub with peer subscriptions must not idle-shutdown");
+  } finally {
+    if (hub) await hub.close();
+    if (peer) await peer.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

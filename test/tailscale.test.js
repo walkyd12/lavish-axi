@@ -3,7 +3,7 @@ import test from "node:test";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { detectTailscale, parseTailscaleStatus } from "../src/tailscale.js";
+import { detectTailscale, parseTailscaleStatus, parseTailscaleWhois, whoisTailscalePeer } from "../src/tailscale.js";
 
 test("Tailscale detection skips unresolved candidates and probes executable files", async (t) => {
   const dir = await mkdtemp(path.join(process.cwd(), ".tailscale-test-"));
@@ -207,4 +207,66 @@ test("parseTailscaleStatus ignores malformed or non-running status", () => {
     parseTailscaleStatus(JSON.stringify({ BackendState: "Running", Self: { TailscaleIPs: ["999.1.1.1"] } })),
     null,
   );
+});
+
+test("parseTailscaleWhois accepts personal user peers and rejects self or tagged server nodes", () => {
+  assert.equal(
+    parseTailscaleWhois(
+      JSON.stringify({
+        Node: { SelfNode: true, ComputedName: "self-box", Addresses: ["100.64.0.1/32"] },
+        UserProfile: { LoginName: "alice@example.com", DisplayName: "Alice" },
+      }),
+    ),
+    null,
+  );
+  assert.equal(
+    parseTailscaleWhois(
+      JSON.stringify({
+        Node: { ComputedName: "ci-runner", Tags: ["tag:server"], Addresses: ["100.64.0.2/32"] },
+        UserProfile: { LoginName: "tagged-devices", DisplayName: "Tagged Devices" },
+      }),
+    ),
+    null,
+  );
+  assert.deepEqual(
+    parseTailscaleWhois(
+      JSON.stringify({
+        Node: { ComputedName: "walkers-macbook.", Addresses: ["100.88.1.9/32"] },
+        UserProfile: { LoginName: "walker@example.com", DisplayName: "Walker" },
+      }),
+    ),
+    {
+      loginName: "walker@example.com",
+      displayName: "Walker",
+      nodeName: "walkers-macbook",
+      ip: "100.88.1.9",
+    },
+  );
+});
+
+test("whoisTailscalePeer skips loopback and resolves remote Tailscale peers", async () => {
+  let calls = 0;
+  const execFile = /** @type {any} */ (
+    async (_cmd, args) => {
+      calls += 1;
+      assert.deepEqual(args, ["whois", "--json", "100.88.1.9:51234"]);
+      return {
+        stdout: JSON.stringify({
+          Node: { ComputedName: "walkers-macbook", Addresses: ["100.88.1.9/32"] },
+          UserProfile: { LoginName: "walker@example.com", DisplayName: "Walker" },
+        }),
+      };
+    }
+  );
+  assert.equal(await whoisTailscalePeer("127.0.0.1", 51234, { resolveCommand: async (c) => c, execFile }), null);
+  assert.equal(await whoisTailscalePeer("::ffff:127.0.0.1", 51234, { resolveCommand: async (c) => c, execFile }), null);
+  assert.equal(calls, 0);
+  const remote = await whoisTailscalePeer("::ffff:100.88.1.9", 51234, { resolveCommand: async (c) => c, execFile });
+  assert.equal(calls, 1);
+  assert.deepEqual(remote, {
+    loginName: "walker@example.com",
+    displayName: "Walker",
+    nodeName: "walkers-macbook",
+    ip: "100.88.1.9",
+  });
 });

@@ -176,8 +176,14 @@ const outdatedDismissButton = /** @type {HTMLButtonElement} */ (document.getElem
 const approvalBanner = /** @type {HTMLDivElement | null} */ (document.getElementById("approvalBanner"));
 const approvalBannerText = /** @type {HTMLSpanElement | null} */ (document.getElementById("approvalBannerText"));
 const approvalAuthorInput = /** @type {HTMLInputElement | null} */ (document.getElementById("approvalAuthorInput"));
+const approvalTokenWrap = /** @type {HTMLLabelElement | null} */ (document.getElementById("approvalTokenWrap"));
+const approvalTokenInput = /** @type {HTMLInputElement | null} */ (document.getElementById("approvalTokenInput"));
 const approvalConfirmButton = /** @type {HTMLButtonElement | null} */ (document.getElementById("approvalConfirm"));
 const approvalCancelButton = /** @type {HTMLButtonElement | null} */ (document.getElementById("approvalCancel"));
+const initialViewerName = String(sessionData.initialViewerName || "").trim();
+const requiresApprovalToken = sessionData.requiresApprovalToken === true;
+const approvalAuthorStorageKey = "lavish-axi:reviewer-name";
+const approvalTokenStorageKey = "lavish-axi:approval-token";
 const endedOverlay = /** @type {HTMLDivElement} */ (document.getElementById("endedOverlay"));
 const layoutGateOverlay = /** @type {HTMLDivElement} */ (document.getElementById("layoutGateOverlay"));
 const layoutGateTitle = /** @type {HTMLDivElement} */ (document.getElementById("layoutGateTitle"));
@@ -5223,7 +5229,20 @@ function openApprovalConfirmation(msg) {
     text: String(msg?.text || label).slice(0, 240),
     initialAuthor: author,
   };
-  if (approvalAuthorInput && author) approvalAuthorInput.value = author;
+  let savedAuthor = "";
+  let savedToken = "";
+  try {
+    savedAuthor = String(localStorage.getItem(approvalAuthorStorageKey) || "").trim();
+    savedToken = String(localStorage.getItem(approvalTokenStorageKey) || "").trim();
+  } catch {
+    // Storage unavailable in restricted browser mode.
+  }
+  const preferredAuthor = initialViewerName || savedAuthor || author;
+  if (approvalAuthorInput && preferredAuthor) approvalAuthorInput.value = preferredAuthor;
+  if (approvalTokenWrap) approvalTokenWrap.hidden = !requiresApprovalToken;
+  if (approvalTokenInput && requiresApprovalToken && !approvalTokenInput.value && savedToken) {
+    approvalTokenInput.value = savedToken;
+  }
   approvalBannerText.textContent = summary ? label + ": " + summary : label;
   approvalBanner.hidden = false;
   if (isMobileSheet() && !sheetOpen) setSheetOpen(true);
@@ -5246,6 +5265,14 @@ async function submitApprovalConfirmation(event) {
     approvalAuthorInput?.focus?.();
     return;
   }
+  const approvalToken = String(approvalTokenInput?.value || "").trim();
+  if (requiresApprovalToken && !approvalToken) {
+    if (approvalBannerText && pendingChromeApproval) {
+      approvalBannerText.textContent = pendingChromeApproval.label + ": enter your approval token before confirming.";
+    }
+    approvalTokenInput?.focus?.();
+    return;
+  }
   let promptText = pendingChromeApproval.prompt;
   if (pendingChromeApproval.initialAuthor && pendingChromeApproval.initialAuthor !== author) {
     promptText = promptText.replace(" from " + pendingChromeApproval.initialAuthor + " [", " from " + author + " [");
@@ -5261,11 +5288,18 @@ async function submitApprovalConfirmation(event) {
         selector: pendingChromeApproval.selector,
         text: pendingChromeApproval.text,
         author,
+        ...(approvalToken ? { approval_token: approvalToken } : {}),
         chrome_load_token: chromeLoadToken,
       }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || "Could not confirm approval");
+    try {
+      localStorage.setItem(approvalAuthorStorageKey, author);
+      if (approvalToken) localStorage.setItem(approvalTokenStorageKey, approvalToken);
+    } catch {
+      // Ignore storage failures.
+    }
     if (Array.isArray(data.ack_ids)) for (const id of data.ack_ids) chatAckIds.add(id);
     if (Array.isArray(data.chat)) syncChat(data.chat, data.chat_revision);
     closeApprovalConfirmation();

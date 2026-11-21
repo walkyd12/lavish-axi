@@ -19,7 +19,7 @@ const servedChromeIds = new Set(
 
 const SERVED_TAB_ICON = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>";
 
-/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, initialOwnerStatus?: any, initialDrafts?: any[], revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialViewerName?: string, requiresApprovalToken?: boolean, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, initialOwnerStatus?: any, initialDrafts?: any[], revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = {
   key: "abc",
@@ -9976,6 +9976,8 @@ test("lavish:requestApproval never auto-submits and requires a trusted human cli
     sessionData: {
       ...defaultSessionData,
       chromeLoadToken: "chrome-cap-token-1",
+      initialViewerName: "Walker",
+      requiresApprovalToken: true,
     },
     fetchImpl: async (url, init) => {
       if (String(url).endsWith("/approval")) {
@@ -10007,12 +10009,20 @@ test("lavish:requestApproval never auto-submits and requires a trusted human cli
   await flushPromises();
   assert.equal(approvalCalls.length, 0, "untrusted synthetic clicks never submit /approval");
 
-  // Reviewer edits their name in the outer chrome and clicks Confirm with a real user gesture (`isTrusted: true`).
-  chrome.element("approvalAuthorInput").value = "Walker";
+  // Server-verified Tailscale viewer name overrides the untrusted iframe's `author`, and missing token is blocked.
+  assert.equal(chrome.element("approvalAuthorInput").value, "Walker");
+  assert.equal(chrome.element("approvalTokenWrap").hidden, false);
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(approvalCalls.length, 0, "missing required approval token blocks submit");
+
+  // Supplying the reviewer's token and clicking Confirm with a trusted user gesture (`isTrusted: true`) submits.
+  chrome.element("approvalTokenInput").value = "tok-walker-secret";
   chrome.element("approvalConfirm").click({ isTrusted: true });
   await flushPromises();
   assert.equal(approvalCalls.length, 1);
   assert.equal(approvalCalls[0].author, "Walker");
+  assert.equal(approvalCalls[0].approval_token, "tok-walker-secret");
   assert.equal(approvalCalls[0].chrome_load_token, "chrome-cap-token-1");
   assert.match(approvalCalls[0].prompt, /^Send approved draft from Walker \[/);
   assert.equal(chrome.element("approvalBanner").hidden, true);
