@@ -964,6 +964,10 @@ function normalizePrompt(prompt) {
   if (promptId) normalized.prompt_id = promptId;
   const author = normalizePromptAuthor(prompt.author);
   if (author) normalized.author = author;
+  if (prompt.via === "cli") normalized.via = "cli";
+  if ((normalized.via === "cli" || normalized.author) && normalized.tag === "send_approval") {
+    normalized.tag = "message";
+  }
   const target = normalizeTarget(prompt.target);
   if (target) normalized.target = target;
   const { refs, malformed } = normalizeAttachmentRefs(prompt.attachments);

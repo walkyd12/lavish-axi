@@ -23,6 +23,16 @@ const BOARD_KEY = /^[A-Za-z0-9_-]{1,128}$/;
 const STATES = new Set(["taking-input", "unread", "nobody", "handed-off", "closed-user", "closed-agent", "file-gone"]);
 const TONES = new Set(["good", "warn", "bad", "muted"]);
 const OWNER_STATES = new Set(["live", "working", "finished", "gone"]);
+const PEER_ACTIONS = new Set(["close", "cancel", "reopen"]);
+const PEER_EVENT_TYPES = new Set([
+  "board_created",
+  "board_reopened",
+  "message",
+  "board_action",
+  "tag_change",
+  "board_closed",
+  "board_cancelled",
+]);
 
 /** @typedef {{ name: string, origin: string }} HubPeer */
 
@@ -80,6 +90,173 @@ export function parseHubPeers(raw) {
 /** @param {string} key */
 export function isPeerKey(key) {
   return String(key || "").startsWith(PEER_KEY_PREFIX);
+}
+
+/**
+ * Resolve a namespaced `peer:<name>:<key>` back to its configured `HubPeer` and validated peer session key.
+ * Returns null for malformed keys or peers not configured on this server.
+ *
+ * @param {string} key
+ * @param {HubPeer[]} peers
+ * @returns {{ peer: HubPeer, peerKey: string } | null}
+ */
+export function resolvePeerBoardTarget(key, peers) {
+  const raw = String(key || "");
+  if (!raw.startsWith(PEER_KEY_PREFIX)) return null;
+  const rest = raw.slice(PEER_KEY_PREFIX.length);
+  const colon = rest.indexOf(":");
+  if (colon <= 0) return null;
+  const peerName = rest.slice(0, colon);
+  const peerKey = rest.slice(colon + 1);
+  if (!PEER_NAME.test(peerName) || !BOARD_KEY.test(peerKey)) return null;
+  const peer = (Array.isArray(peers) ? peers : []).find(
+    (candidate) => candidate && candidate.name.toLowerCase() === peerName.toLowerCase(),
+  );
+  if (!peer) return null;
+  return { peer, peerKey };
+}
+
+function sanitizeTagList(rawTags) {
+  if (!Array.isArray(rawTags)) return [];
+  return [
+    ...new Set(
+      rawTags
+        .slice(0, 32)
+        .map((tag) => text(tag, 64).trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+/**
+ * Rebuild an untrusted live event received over a peer's `/events/hub` WebSocket into the central
+ * hub's namespaced peer event shape, or null when malformed or already relayed from another peer.
+ *
+ * @param {HubPeer} peer
+ * @param {any} rawEvent
+ */
+export function sanitizePeerHubEvent(peer, rawEvent) {
+  if (!rawEvent || typeof rawEvent !== "object" || rawEvent.source) return null;
+  const event = String(rawEvent.event || "");
+  const rawKey = String(rawEvent.key || "");
+  if (!PEER_EVENT_TYPES.has(event) || !BOARD_KEY.test(rawKey)) return null;
+  const tags = sanitizeTagList(rawEvent.tags);
+  const cancelled = rawEvent.cancelled === true;
+  /** @type {Record<string, any>} */
+  const out = {
+    event,
+    key: `${PEER_KEY_PREFIX}${peer.name}:${rawKey}`,
+    peer_key: rawKey,
+    peer_origin: peer.origin,
+    source: peer.name,
+    url: `${peer.origin}/session/${rawKey}`,
+    title: text(rawEvent.title, 200) || "Untitled board",
+    creator: text(rawEvent.creator, 120),
+    tags,
+    cancelled,
+    ended_by: rawEvent.ended_by === "user" ? "user" : rawEvent.ended_by === "agent" ? "agent" : null,
+    last_activity: isoOrEmpty(rawEvent.last_activity || rawEvent.at),
+    search_text: text(rawEvent.search_text, 16 * 1024),
+  };
+  const seq = Number(rawEvent.seq);
+  if (Number.isInteger(seq) && seq > 0) out.peer_seq = seq;
+  if (event === "tag_change") {
+    out.added = sanitizeTagList(rawEvent.added);
+    out.removed = sanitizeTagList(rawEvent.removed);
+  }
+  if (Array.isArray(rawEvent.prompts)) {
+    out.prompts = rawEvent.prompts.slice(0, 32).map((prompt) => ({
+      prompt: text(prompt?.prompt, 4_096),
+      tag: text(prompt?.tag, 64),
+      selector: text(prompt?.selector, 512),
+      text: text(prompt?.text, 256),
+      ...(prompt?.author ? { author: text(prompt.author, 80) } : {}),
+    }));
+  }
+  if (event === "board_action") {
+    out.action = text(rawEvent.action, 40) || "send";
+    out.action_label = text(rawEvent.action_label, 64) || "Send";
+    if (rawEvent.author) out.author = text(rawEvent.author, 80);
+  }
+  return out;
+}
+
+/**
+ * Relay one lifecycle action (`close` | `cancel` | `reopen`) to a configured peer's hub endpoint,
+ * forwarding nothing from the viewer and rebuilding the response field by field.
+ *
+ * @param {HubPeer} peer
+ * @param {string} peerKey
+ * @param {"close" | "cancel" | "reopen"} action
+ * @param {{ timeoutMs?: number, maxBytes?: number, fetchImpl?: typeof fetch }} [options]
+ */
+export async function relayPeerHubAction(
+  peer,
+  peerKey,
+  action,
+  { timeoutMs = PEER_TIMEOUT_MS, maxBytes = PEER_MAX_BYTES, fetchImpl = fetch } = {},
+) {
+  if (!PEER_ACTIONS.has(action) || !BOARD_KEY.test(peerKey)) {
+    return { ok: false, status: 400, payload: { error: "invalid peer lifecycle action" } };
+  }
+  try {
+    const response = await fetchImpl(`${peer.origin}/api/hub/${encodeURIComponent(peerKey)}/${action}`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        origin: peer.origin,
+      },
+      body: "{}",
+      redirect: "error",
+      credentials: "omit",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const rawBody = await readCapped(response, maxBytes).catch(() => "");
+    let parsed = null;
+    try {
+      parsed = rawBody ? JSON.parse(rawBody) : {};
+    } catch {
+      parsed = {};
+    }
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status >= 400 && response.status < 600 ? response.status : 502,
+        payload: { error: text(parsed?.error, 200) || `peer answered ${response.status}` },
+      };
+    }
+    const closed = action === "reopen" ? false : true;
+    const cancelled = action === "cancel" ? true : false;
+    const tags = sanitizeTagList(parsed?.tags);
+    const workflow = boardWorkflowState({
+      status: closed ? "ended" : "open",
+      tags,
+      cancelled,
+    });
+    return {
+      ok: true,
+      status: 200,
+      payload: {
+        key: `${PEER_KEY_PREFIX}${peer.name}:${peerKey}`,
+        peer_key: peerKey,
+        source: peer.name,
+        url: `${peer.origin}/session/${peerKey}`,
+        status: closed ? "ended" : "opened",
+        ...(closed ? { ended_by: parsed?.ended_by === "agent" ? "agent" : "user" } : {}),
+        tags,
+        creator: text(parsed?.creator, 120),
+        created_version: text(parsed?.created_version, 40),
+        served_version: text(parsed?.served_version, 40),
+        closed,
+        ...workflow,
+      },
+    };
+  } catch (error) {
+    const name = /** @type {any} */ (error)?.name;
+    const reason = name === "TimeoutError" || name === "AbortError" ? "peer timed out" : "peer not answering";
+    return { ok: false, status: 502, payload: { error: reason } };
+  }
 }
 
 function text(value, max) {

@@ -272,26 +272,53 @@ test("LAVISH_AXI_ON_EVENT emits board lifecycle, message attribution, tag diffs 
     assert.equal((await fetch(`${base}/api/hub?state=closed`).then((r) => r.json())).boards.length, 1);
     await cli("open", "--reopen", file);
 
-    // Peer board lifecycle: open -> closed -> reopened -> closed again.
+    // Peer board lifecycle WITHOUT polling /api/hub between transitions:
+    // Walker creates, closes, reopens, and recloses on peerBase with zero visits to central /api/hub,
+    // plus central hub one-tap reopen -> cancel -> reopen -> close on the peer board!
     await fetch(`${peerBase}/api/sessions`, {
       method: "POST",
       headers: { "content-type": "application/json", origin: peerBase },
       body: JSON.stringify({ file: peerFile, creator: "Walker" }),
     });
     const peerKey = (await fetch(`${peerBase}/api/hub?peers=0`).then((r) => r.json())).boards[0].key;
-    await fetch(`${base}/api/hub`);
     await fetch(`${peerBase}/api/hub/${peerKey}/close`, { method: "POST", headers: { origin: peerBase } });
-    await fetch(`${base}/api/hub`);
     await fetch(`${peerBase}/api/sessions`, {
       method: "POST",
       headers: { "content-type": "application/json", origin: peerBase },
       body: JSON.stringify({ file: peerFile, reopen: true }),
     });
-    await fetch(`${base}/api/hub`);
     await fetch(`${peerBase}/api/hub/${peerKey}/close`, { method: "POST", headers: { origin: peerBase } });
-    await fetch(`${base}/api/hub`);
 
-    // Allow async onEvent / detached hook writes to flush.
+    // Central hub can also reopen, cancel, and close the peer board in one tap (while cross-origin is 403).
+    const namespacedPeerKey = `peer:walker:${peerKey}`;
+    assert.equal(
+      (
+        await fetch(`${base}/api/hub/${encodeURIComponent(namespacedPeerKey)}/close`, {
+          method: "POST",
+          headers: { origin: "https://evil.example" },
+        })
+      ).status,
+      403,
+    );
+    const reopenedPeerRes = await fetch(`${base}/api/hub/${encodeURIComponent(namespacedPeerKey)}/reopen`, {
+      method: "POST",
+      headers: { origin: base },
+    });
+    assert.equal(reopenedPeerRes.status, 200);
+    assert.equal((await reopenedPeerRes.json()).closed, false);
+
+    const cancelledPeerRes = await fetch(`${base}/api/hub/${encodeURIComponent(namespacedPeerKey)}/cancel`, {
+      method: "POST",
+      headers: { origin: base },
+    });
+    assert.equal(cancelledPeerRes.status, 200);
+    assert.equal((await cancelledPeerRes.json()).cancelled, true);
+
+    // Wait for ordered detached hook writes and WebSocket events to flush.
+    const deadline = Date.now() + 4_000;
+    while (Date.now() < deadline && events.length < 18) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
 
     const kinds = events.map((entry) => `${entry.source || "local"}:${entry.event}`);
@@ -312,10 +339,13 @@ test("LAVISH_AXI_ON_EVENT emits board lifecycle, message attribution, tag diffs 
       "walker:board_closed",
       "walker:board_reopened",
       "walker:board_closed",
+      "walker:board_reopened",
+      "walker:board_cancelled",
     ]);
     const msgEvent = events.find((entry) => entry.event === "message");
     assert.equal(msgEvent.had_listener, false);
     assert.equal(msgEvent.prompts[0].author, "Zach via runner2");
+    assert.equal(msgEvent.prompts[0].via, "cli");
     const actionEvent = events.find((entry) => entry.event === "board_action");
     assert.equal(actionEvent.action, "send");
     assert.equal(actionEvent.action_label, "Dispatch workflow");
@@ -325,15 +355,33 @@ test("LAVISH_AXI_ON_EVENT emits board lifecycle, message attribution, tag diffs 
     const autoClearTagEvent = events.filter((entry) => entry.event === "tag_change")[1];
     assert.deepEqual(autoClearTagEvent.removed, ["needs-input"]);
     const peerCloseEvents = events.filter((entry) => entry.source === "walker" && entry.event === "board_closed");
-    assert.equal(peerCloseEvents.length, 2, "reactivate + reclose emits a second board_closed for new brain revision");
+    assert.equal(
+      peerCloseEvents.length,
+      2,
+      "reactivate + reclose between hub visits emits both board_closed events over /events/hub",
+    );
     assert.equal(peerCloseEvents[0].peer_origin, peerBase);
     assert.equal(peerCloseEvents[0].peer_key, peerKey);
 
-    const diskLines = (await readFile(hookLog, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+    // Wait briefly for sequential hook invocations to finish appending to hookLog.
+    const hookDeadline = Date.now() + 4_000;
+    let diskLines = [];
+    while (Date.now() < hookDeadline) {
+      try {
+        const raw = (await readFile(hookLog, "utf8")).trim();
+        diskLines = raw ? raw.split("\n").map((line) => JSON.parse(line)) : [];
+        if (diskLines.length === events.length) break;
+      } catch {
+        // file not written yet
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
     assert.equal(diskLines.length, events.length);
+    assert.deepEqual(
+      diskLines.map((entry) => `${entry.source || "local"}:${entry.event}`),
+      kinds,
+      "LAVISH_AXI_ON_EVENT runs in strict FIFO order",
+    );
   } finally {
     await server.close();
     await peer.close();

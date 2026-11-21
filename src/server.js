@@ -67,7 +67,15 @@ import { hostRejectedShareWrite, publishedDespiteError, publishToHtmlApp } from 
 import { serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-messages.js";
 import { OwnerStatusError, serializeOwnerStatus } from "./owner-status.js";
 import { boardTitle, conversationMarkdown, createHubHtml, serializeHubBoard, sortHubBoards } from "./hub.js";
-import { createPeerBoardSource, HUB_PEERS_ENV, isPeerKey, parseHubPeers } from "./hub-peers.js";
+import {
+  createPeerBoardSource,
+  HUB_PEERS_ENV,
+  isPeerKey,
+  parseHubPeers,
+  relayPeerHubAction,
+  resolvePeerBoardTarget,
+  sanitizePeerHubEvent,
+} from "./hub-peers.js";
 import { DraftTooLargeError, normalizeDraftTabId, serializeDrafts } from "./review-drafts.js";
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { injectLavishSdk } from "./html-transform.js";
@@ -470,6 +478,7 @@ export async function serve({
         selector: String(prompt?.selector || "").slice(0, 512),
         text: String(prompt?.text || "").slice(0, 256),
         ...(prompt?.author ? { author: String(prompt.author).slice(0, 80) } : {}),
+        ...(prompt?.via === "cli" ? { via: "cli" } : {}),
         ...(prompt?.target ? { target: prompt.target } : {}),
       }));
     }
@@ -484,23 +493,53 @@ export async function serve({
     return out;
   }
 
-  function spawnHookExecutable(envVar, command, args, extraEnv = {}) {
+  const MAX_HUB_EVENT_HISTORY = 256;
+  const HOOK_STEP_TIMEOUT_MS = 10_000;
+  let hubEventSeq = 0;
+  /** @type {Array<{ seq: number, event: Record<string, any> }>} */
+  const hubEventHistory = [];
+  /** @type {Set<import("ws").WebSocket>} */
+  const hubStreamClients = new Set();
+  let hookQueue = Promise.resolve();
+
+  function runDetachedHookOrdered(envVar, command, args, extraEnv = {}) {
     if (!command) return;
     if (!path.isAbsolute(command)) {
       writeLog(`[lavish] ${envVar} must be an absolute path to an executable; skipped`);
       return;
     }
-    try {
-      const child = spawn(command, args, {
-        detached: true,
-        stdio: "ignore",
-        env: { ...process.env, ...env, ...extraEnv },
-      });
-      child.on("error", (error) => writeLog(`[lavish] event hook ${command} failed to start: ${error.message}`));
-      child.unref();
-    } catch (error) {
-      writeLog(`[lavish] event hook ${command} failed: ${error?.message || error}`);
-    }
+    hookQueue = hookQueue
+      .then(
+        () =>
+          new Promise((resolve) => {
+            let settled = false;
+            const finish = () => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              resolve();
+            };
+            const timer = setTimeout(finish, HOOK_STEP_TIMEOUT_MS);
+            timer.unref?.();
+            try {
+              const child = spawn(command, args, {
+                detached: true,
+                stdio: "ignore",
+                env: { ...process.env, ...env, ...extraEnv },
+              });
+              child.on("error", (error) => {
+                writeLog(`[lavish] event hook ${command} failed to start: ${error.message}`);
+                finish();
+              });
+              child.once("close", finish);
+              child.unref();
+            } catch (error) {
+              writeLog(`[lavish] event hook ${command} failed: ${error?.message || error}`);
+              finish();
+            }
+          }),
+      )
+      .catch(() => {});
   }
 
   // LAVISH_AXI_ON_EVENT (and optional LAVISH_AXI_ON_ACTION for board_action) names an executable run
@@ -509,7 +548,30 @@ export async function serve({
   // compact JSON payload argument so external workflows stay event-driven without polling.
   function emitHubEvent(payload) {
     const base = `http://${hostForUrl(LOOPBACK_HOST)}:${publicPort}`;
-    const eventPayload = compactEventPayload({ ...payload, base, at: new Date().toISOString() });
+    const isLocal = !payload.source;
+    const seq = isLocal ? (hubEventSeq += 1) : undefined;
+    const eventPayload = compactEventPayload({
+      ...payload,
+      ...(seq ? { seq } : {}),
+      base,
+      at: new Date().toISOString(),
+    });
+    if (isLocal && seq) {
+      hubEventHistory.push({ seq, event: eventPayload });
+      if (hubEventHistory.length > MAX_HUB_EVENT_HISTORY) {
+        hubEventHistory.splice(0, hubEventHistory.length - MAX_HUB_EVENT_HISTORY);
+      }
+      const wire = JSON.stringify({ type: "hub-event", seq, event: eventPayload });
+      for (const subscriber of hubStreamClients) {
+        if (subscriber.readyState === WebSocket.OPEN) {
+          try {
+            subscriber.send(wire);
+          } catch {
+            // closed subscriber cleans up via close/heartbeat
+          }
+        }
+      }
+    }
     if (typeof onEvent === "function") {
       Promise.resolve()
         .then(() => onEvent(eventPayload))
@@ -518,11 +580,11 @@ export async function serve({
     const serialized = JSON.stringify(eventPayload);
     const hookEnv = { LAVISH_AXI_EVENT: String(eventPayload.event || "") };
     const eventCommand = String(env.LAVISH_AXI_ON_EVENT || process.env.LAVISH_AXI_ON_EVENT || "").trim();
-    spawnHookExecutable("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv);
+    runDetachedHookOrdered("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv);
     if (eventPayload.event === "board_action") {
       const actionCommand = String(env.LAVISH_AXI_ON_ACTION || process.env.LAVISH_AXI_ON_ACTION || "").trim();
       if (actionCommand && actionCommand !== eventCommand) {
-        spawnHookExecutable("LAVISH_AXI_ON_ACTION", actionCommand, [serialized], hookEnv);
+        runDetachedHookOrdered("LAVISH_AXI_ON_ACTION", actionCommand, [serialized], hookEnv);
       }
     }
   }
@@ -960,63 +1022,93 @@ export async function serve({
   }
 
   // LAVISH_AXI_HUB_PEERS (src/hub-peers.js): other Lavish servers whose boards this hub also
-  // lists, read from their /api/hub. A bad entry is logged and dropped, never fatal.
+  // lists, read from their /api/hub, with real-time lifecycle events pushed over their /events/hub
+  // WebSocket stream (never inferred by snapshot polling).
   const parsedPeers = parseHubPeers(hubPeers);
   for (const error of parsedPeers.errors) writeLog(`[lavish] ${error}; skipped`);
   const collectPeerBoards = parsedPeers.peers.length ? createPeerBoardSource(parsedPeers.peers, hubPeerOptions) : null;
-  /** @type {Map<string, { closed: boolean, cancelled: boolean, tags: string[], notes: number, last_activity: string }>} */
-  const observedPeerBoards = new Map();
+  const PEER_WS_BACKOFF_MS = [200, 500, 1000, 2000, 5000];
+  /** @type {Array<{ close: () => void }>} */
+  const peerEventSubscriptions = [];
 
-  function observePeerBoards(remoteBoards) {
-    for (const board of Array.isArray(remoteBoards) ? remoteBoards : []) {
-      if (!board || typeof board.key !== "string") continue;
-      const prev = observedPeerBoards.get(board.key);
-      const currentTags = Array.isArray(board.tags) ? board.tags : [];
-      const currentClosed = Boolean(board.closed);
-      const currentCancelled = Boolean(board.cancelled);
-      const currentNotes = Number(board.notes) || 0;
-      observedPeerBoards.set(board.key, {
-        closed: currentClosed,
-        cancelled: currentCancelled,
-        tags: currentTags,
-        notes: currentNotes,
-        last_activity: String(board.last_activity || ""),
-      });
-      const peerCommon = {
-        key: board.key,
-        peer_key: board.peer_key || "",
-        peer_origin: board.peer_origin || "",
-        source: board.source || "",
-        url: board.url || "",
-        title: board.title || "",
-        creator: board.creator || "",
-        tags: currentTags,
-        cancelled: currentCancelled,
-        ended_by: board.ended_by || null,
-        last_activity: board.last_activity || "",
-        search_text: board.search_text || "",
+  function startPeerEventSubscribers() {
+    for (const peer of parsedPeers.peers) {
+      let lastSeq = 0;
+      let attempt = 0;
+      let closed = false;
+      /** @type {import("ws").WebSocket | null} */
+      let socket = null;
+      /** @type {ReturnType<typeof setTimeout> | null} */
+      let retryTimer = null;
+      const wsOrigin = peer.origin.replace(/^http/i, "ws");
+
+      const scheduleReconnect = () => {
+        if (closed || shuttingDown || retryTimer) return;
+        const delay = PEER_WS_BACKOFF_MS[Math.min(attempt, PEER_WS_BACKOFF_MS.length - 1)];
+        attempt += 1;
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          connect();
+        }, delay);
+        retryTimer.unref?.();
       };
-      if (!prev) {
-        emitHubEvent({
-          event: currentCancelled ? "board_cancelled" : currentClosed ? "board_closed" : "board_created",
-          ...peerCommon,
-        });
-        continue;
-      }
-      if (prev.closed && !currentClosed) {
-        emitHubEvent({ event: "board_reopened", ...peerCommon });
-      }
-      const { added, removed } = tagDiff(prev.tags, currentTags);
-      if (added.length || removed.length) {
-        emitHubEvent({ event: "tag_change", ...peerCommon, added, removed });
-      }
-      if (currentNotes > prev.notes) {
-        emitHubEvent({ event: "message", ...peerCommon, notes_delta: currentNotes - prev.notes });
-      }
-      if (!prev.closed && currentClosed) {
-        emitHubEvent({ event: currentCancelled ? "board_cancelled" : "board_closed", ...peerCommon });
-      }
+
+      const connect = () => {
+        if (closed || shuttingDown) return;
+        try {
+          const ws = new WebSocket(`${wsOrigin}/events/hub?since=${lastSeq}`);
+          socket = ws;
+          ws.on("open", () => {
+            attempt = 0;
+          });
+          ws.on("message", (raw) => {
+            try {
+              const msg = JSON.parse(String(raw));
+              if (!msg || msg.type !== "hub-event") return;
+              const seq = Number(msg.seq);
+              if (Number.isInteger(seq) && seq > 0) {
+                if (seq <= lastSeq) return;
+                lastSeq = seq;
+              }
+              const sanitized = sanitizePeerHubEvent(peer, msg.event);
+              if (sanitized) emitHubEvent(sanitized);
+            } catch {
+              // ignore malformed peer frame
+            }
+          });
+          ws.on("error", () => {});
+          ws.on("close", () => {
+            if (socket === ws) socket = null;
+            scheduleReconnect();
+          });
+        } catch {
+          scheduleReconnect();
+        }
+      };
+
+      connect();
+      peerEventSubscriptions.push({
+        close() {
+          closed = true;
+          if (retryTimer) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+          }
+          if (socket) {
+            try {
+              socket.terminate();
+            } catch {
+              // ignore
+            }
+            socket = null;
+          }
+        },
+      });
     }
+  }
+
+  function closePeerEventSubscribers() {
+    for (const sub of peerEventSubscriptions.splice(0)) sub.close();
   }
 
   /** @param {{ includePeers?: boolean }} [options] */
@@ -1026,7 +1118,6 @@ export async function serve({
       includePeers && collectPeerBoards ? collectPeerBoards() : null,
     ]);
     if (!remote) return { boards: local, peers: [] };
-    observePeerBoards(remote.boards);
     return {
       boards: sortHubBoards([
         ...local,
@@ -1091,15 +1182,21 @@ export async function serve({
 
   // Close from the hub. Same-origin like /prompts: only the hub page may close a board this way.
   // Unlike the board's own End, it never shuts the server down - the reviewer is still on the hub.
+  // Configured peer boards relay to that peer's own hub endpoint with zero viewer headers forwarded.
   app.post("/api/hub/:key/close", async (req, res, next) => {
     try {
       if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
         res.status(403).json({ error: "cross-origin close rejected" });
         return;
       }
-      // A peer's board belongs to the peer: this hub only links to it and never ends it.
       if (isPeerKey(req.params.key)) {
-        res.status(400).json({ error: "a peer's board is closed on its own server" });
+        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        if (!target) {
+          res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        const relayed = await relayPeerHubAction(target.peer, target.peerKey, "close", hubPeerOptions);
+        res.status(relayed.status).json(relayed.payload);
         return;
       }
       const session = await store.endSession(req.params.key, "user");
@@ -1124,7 +1221,13 @@ export async function serve({
         return;
       }
       if (isPeerKey(req.params.key)) {
-        res.status(400).json({ error: "a peer's board is cancelled on its own server" });
+        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        if (!target) {
+          res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        const relayed = await relayPeerHubAction(target.peer, target.peerKey, "cancel", hubPeerOptions);
+        res.status(relayed.status).json(relayed.payload);
         return;
       }
       const session = await store.endSession(req.params.key, "user", { cancelled: true });
@@ -1136,6 +1239,74 @@ export async function serve({
       events.emit("ended", req.params.key, session.ended_by);
       res.json({ status: "ended", ended_by: session.ended_by, ...serializeBoardMetadata(session) });
     } catch (error) {
+      next(error);
+    }
+  });
+
+  // Reactivate a closed or cancelled board from the hub in one tap (local or configured peer).
+  app.post("/api/hub/:key/reopen", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin reopen rejected" });
+        return;
+      }
+      if (isPeerKey(req.params.key)) {
+        const target = resolvePeerBoardTarget(req.params.key, parsedPeers.peers);
+        if (!target) {
+          res.status(404).json({ error: "peer board not found" });
+          return;
+        }
+        const relayed = await relayPeerHubAction(target.peer, target.peerKey, "reopen", hubPeerOptions);
+        res.status(relayed.status).json(relayed.payload);
+        return;
+      }
+      const existing = await store.findByKey(req.params.key);
+      if (!existing) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const file = await resolveAllowedArtifactFile(existing.file);
+      const key = sessionKey(file);
+      const sessionUrl = `${linkOrigin()}/session/${key}`;
+      const wasReopened = existing.status === "ended";
+      const session = await store.upsertSession(file, sessionUrl, { version });
+      if (wasReopened) {
+        clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+      }
+      logEvent?.(`session reopened from hub key=${key} file=${file}`);
+      await syncOutstandingRepairs(key);
+      await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
+      if (wasReopened) {
+        const { title } = await readBoardHead(session.file);
+        emitHubEvent({
+          event: "board_reopened",
+          key,
+          file: session.file,
+          url: session.url,
+          title: boardTitle(session, title),
+          creator: session.creator || "",
+          tags: session.tags || [],
+          created_version: session.created_version || "",
+          served_version: session.served_version || "",
+        });
+      }
+      res.json({
+        key,
+        file,
+        url: sessionUrl,
+        status: "opened",
+        ...serializeBoardMetadata(session),
+        ...networkWarningField(),
+      });
+    } catch (error) {
+      if (isArtifactPathError(error)) {
+        res.status(error.statusCode).json({
+          status: "error",
+          code: error.code,
+          error: error.message,
+        });
+        return;
+      }
       next(error);
     }
   });
@@ -2712,6 +2883,7 @@ export async function serve({
   });
 
   const eventWebSocketServer = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+  const hubEventWebSocketServer = new WebSocketServer({ noServer: true, maxPayload: 4096 });
 
   function rejectEventUpgrade(socket, status, message) {
     const body = `${message}\n`;
@@ -2721,18 +2893,14 @@ export async function serve({
   }
 
   function handleEventUpgrade(req, socket, head) {
-    let pathname;
+    let parsedUrl;
     try {
-      pathname = new URL(String(req.url || ""), "http://lavish.local").pathname;
+      parsedUrl = new URL(String(req.url || ""), "http://lavish.local");
     } catch {
       rejectEventUpgrade(socket, 400, "Bad Request");
       return;
     }
-    const match = pathname.match(/^\/events\/([^/]+)$/);
-    if (!match) {
-      rejectEventUpgrade(socket, 404, "Not Found");
-      return;
-    }
+    const pathname = parsedUrl.pathname;
 
     const hostAllowed = allowAnyHostname
       ? parseHostAuthority(req.headers.host) !== null
@@ -2740,6 +2908,62 @@ export async function serve({
           { host: req.headers.host, forwardedHost: req.headers["x-forwarded-host"] },
           allowedHostnames,
         );
+
+    if (pathname === "/events/hub") {
+      // Server-to-server peer hubs connect header-less (like /api/poll); any present browser
+      // Origin/Referer must match this server's own origin.
+      if (
+        !hostAllowed ||
+        (hasPresentOriginOrReferer(req) && !isSameOriginRequest(req, allowedHostnames, allowAnyHostname))
+      ) {
+        rejectEventUpgrade(socket, 403, "Forbidden");
+        return;
+      }
+      const sinceRaw = Number(parsedUrl.searchParams.get("since") || "0");
+      const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? Math.floor(sinceRaw) : 0;
+      hubEventWebSocketServer.handleUpgrade(req, socket, head, (webSocket) => {
+        webSocket.on("error", () => {});
+        if (liveEventHeartbeatMs != null && liveEventHeartbeatMs > 0) {
+          let awaitingPong = false;
+          const heartbeat = setInterval(() => {
+            if (awaitingPong) {
+              webSocket.terminate();
+              return;
+            }
+            awaitingPong = true;
+            try {
+              webSocket.ping();
+            } catch {
+              webSocket.terminate();
+            }
+          }, liveEventHeartbeatMs);
+          heartbeat.unref?.();
+          webSocket.on("pong", () => {
+            awaitingPong = false;
+          });
+          webSocket.once("close", () => clearInterval(heartbeat));
+        }
+        for (const entry of hubEventHistory) {
+          if (entry.seq > since && webSocket.readyState === WebSocket.OPEN) {
+            try {
+              webSocket.send(JSON.stringify({ type: "hub-event", seq: entry.seq, event: entry.event }));
+            } catch {
+              break;
+            }
+          }
+        }
+        hubStreamClients.add(webSocket);
+        webSocket.once("close", () => hubStreamClients.delete(webSocket));
+      });
+      return;
+    }
+
+    const match = pathname.match(/^\/events\/([^/]+)$/);
+    if (!match) {
+      rejectEventUpgrade(socket, 404, "Not Found");
+      return;
+    }
+
     // WebSocket reads are not protected by CORS. Require the chrome page's exact Origin as well
     // as the normal Host allowlist so a foreign site cannot read a known session's live events.
     if (!hostAllowed || !req.headers.origin || !isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
@@ -2993,6 +3217,7 @@ export async function serve({
     writeLog(`[lavish] WARNING: ${describeBindFailure(listenHost, error)}`);
   }
   serverReady = true;
+  startPeerEventSubscribers();
   scheduleBindRecovery();
 
   // `cause` is log-only and never reaches a chrome: `reason` is the user-facing SHUTDOWN_REASONS
@@ -3034,6 +3259,15 @@ export async function serve({
       }
     }
     liveEventClients.clear();
+    closePeerEventSubscribers();
+    for (const subscriber of hubStreamClients) {
+      try {
+        subscriber.terminate();
+      } catch {
+        // best effort
+      }
+    }
+    hubStreamClients.clear();
     for (const timer of browserDisconnectTimers.values()) clearTimeout(timer);
     browserDisconnectTimers.clear();
     for (const w of watchers.values()) {
@@ -3379,7 +3613,7 @@ export function isAllowedRequestHost({ host, forwardedHost }, allowedHostnames) 
 }
 
 function hasPresentOriginOrReferer(req) {
-  return Boolean(req.get("origin") || req.get("referer"));
+  return Boolean(req.headers?.origin || req.headers?.referer);
 }
 
 // Guard state-changing, outward-facing routes (publishing to a third-party host) against CSRF: a

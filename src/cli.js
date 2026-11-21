@@ -633,6 +633,7 @@ async function messageCommand(args) {
             tag: "message",
             text: "Board message",
             prompt_id: `cli-${crypto.randomUUID()}`,
+            via: "cli",
             ...(author ? { author } : {}),
           },
         ],

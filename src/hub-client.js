@@ -133,12 +133,33 @@ function safeHref(url) {
   }
 }
 
-// A peer's board lives on the peer's server: this hub only links to it. Close, Reopen and History
-// are the peer's to offer, so a peer card has Open and nothing else.
+// A peer's board lives on the peer's server: Open links to that peer, and Close/Cancel/Reopen relay
+// through this hub's same-origin lifecycle routes without forwarding viewer headers.
 function peerActionsHtml(board) {
+  const key = escapeHtml(board.key);
+  const disabled = busy.has(board.key) ? " disabled" : "";
   const href = safeHref(board.url);
-  if (board.status === "ended" || board.state === "file-gone" || !href) return "";
-  return `<a class="act primary" href="${escapeHtml(href)}">Open on ${escapeHtml(board.source)} →</a>`;
+  const actions = [];
+  if (board.state === "file-gone") {
+    if (board.status !== "ended") {
+      actions.push(`<button type="button" class="act" data-act="close" data-key="${key}"${disabled}>Close</button>`);
+      actions.push(`<button type="button" class="act" data-act="cancel" data-key="${key}"${disabled}>Cancel</button>`);
+    }
+    return actions.join("");
+  }
+  if (board.status === "ended") {
+    actions.push(`<button type="button" class="act" data-act="reopen" data-key="${key}"${disabled}>Reopen</button>`);
+    if (href) {
+      actions.push(`<a class="act" href="${escapeHtml(href)}">Open on ${escapeHtml(board.source)} →</a>`);
+    }
+    return actions.join("");
+  }
+  if (href) {
+    actions.push(`<a class="act primary" href="${escapeHtml(href)}">Open on ${escapeHtml(board.source)} →</a>`);
+  }
+  actions.push(`<button type="button" class="act" data-act="close" data-key="${key}"${disabled}>Close</button>`);
+  actions.push(`<button type="button" class="act" data-act="cancel" data-key="${key}"${disabled}>Cancel</button>`);
+  return actions.join("");
 }
 
 function actionsHtml(board) {
@@ -324,10 +345,10 @@ async function reopenBoard(board) {
   busy.add(board.key);
   render();
   try {
-    const response = await fetch("/api/sessions", {
+    const response = await fetch("/api/hub/" + encodeURIComponent(board.key) + "/reopen", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ file: board.file, reopen: true }),
+      body: "{}",
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || result.status !== "opened") throw new Error(result.error || String(response.status));
@@ -398,11 +419,11 @@ list.addEventListener("click", (event) => {
   const button = /** @type {HTMLButtonElement | null} */ (target.closest?.("button[data-act]") || null);
   if (!button || button.disabled) return;
   const board = boards.find((candidate) => candidate.key === button.dataset.key);
-  if (!board || board.source) return;
+  if (!board) return;
   if (button.dataset.act === "close") closeBoard(board);
   else if (button.dataset.act === "cancel") cancelBoard(board);
   else if (button.dataset.act === "reopen") reopenBoard(board);
-  else if (button.dataset.act === "history") showHistory(board);
+  else if (button.dataset.act === "history" && !board.source) showHistory(board);
 });
 tabOpen.addEventListener("click", () => {
   showing = "open";

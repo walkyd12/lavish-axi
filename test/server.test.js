@@ -7299,12 +7299,24 @@ test("the hub lists a peer's boards beside its own and never closes them", async
     assert.match(html, /peer:walkmate:/);
     assert.doesNotMatch(html, /Theirs <b>/, "peer strings are JSON-escaped in the bootstrap");
 
-    // Closing a peer's board from this hub is refused, even from the hub page itself.
+    // Closing and reopening a configured peer's board from this hub relays cleanly; unknown peer keys fail closed.
+    const unknownClose = await fetch(`${base}/api/hub/${encodeURIComponent("peer:unknown:" + theirsKey)}/close`, {
+      method: "POST",
+      headers: { origin: base },
+    });
+    assert.equal(unknownClose.status, 404);
     const closePeer = await fetch(`${base}/api/hub/${encodeURIComponent(peerBoard.key)}/close`, {
       method: "POST",
       headers: { origin: base },
     });
-    assert.equal(closePeer.status, 400);
+    assert.equal(closePeer.status, 200);
+    const afterClose = await fetch(`${peerBase}/api/hub`).then((response) => response.json());
+    assert.equal(afterClose.boards.find((board) => board.key === theirsKey).status, "ended");
+    const reopenPeer = await fetch(`${base}/api/hub/${encodeURIComponent(peerBoard.key)}/reopen`, {
+      method: "POST",
+      headers: { origin: base },
+    });
+    assert.equal(reopenPeer.status, 200);
     const still = await fetch(`${peerBase}/api/hub`).then((response) => response.json());
     assert.equal(still.boards.find((board) => board.key === theirsKey).status, "open");
   } finally {
