@@ -3150,6 +3150,34 @@ export async function serve({
     }
   });
 
+  // Append external context to the conversation without delivering or answering work.
+  app.post("/api/:key/note", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin note rejected" });
+        return;
+      }
+      const text = String(req.body?.text || "").trim();
+      if (!text) {
+        res.status(400).json({ error: "note text required" });
+        return;
+      }
+      const session = await store.addNote(req.params.key, { ...req.body, text });
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (session.status === "ended") {
+        res.status(409).json({ status: "ended", ended_by: session.ended_by });
+        return;
+      }
+      events.emit("chat-sync", req.params.key, session);
+      res.json({ status: "sent" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/:key/agent-reply", async (req, res, next) => {
     try {
       const session = await publishAgentReply(req.params.key, String(req.body?.text || ""), {

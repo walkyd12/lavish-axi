@@ -80,6 +80,13 @@ Board tags and provenance live on the existing session record (`tags`, `creator`
 
 Hub search reads at most 1 MiB of the current artifact when a text search (`q`) or peer scrape (`?peers=0`) runs, and retains up to 64 KiB of parsed text excluding script/style/template/noscript content. It does not crawl resources or run JavaScript. Normal hub page (`GET /`) and browser `/api/hub` responses never ship `search_text`: `/api/hub?q=&state=&tag=&limit=&offset=` filters and paginates server-side, reads only the first 64 KiB `<title>` slice for the returned page when `q` is empty, and computes cheap tab counts across all boards, while `GET /` bootstraps only the initial Open slice and caps cold/invalidated peer waits at a short budget so a slow or timing-out peer never holds first local paint (notifying viewers once the background scrape settles). Peer scrapes (`/api/hub?peers=0`) keep bounded `search_text` so central hubs can search across relays. Per-person notification checkboxes (`src/notify-settings.js`, `<stateDir>/notify-settings.json`, bounded to 32 KiB) seed once from `LAVISH_AXI_NOTIFY_PEOPLE` only when no settings file exists yet, default all checkboxes off, accept scoped per-person/per-field updates (`add`/`remove`/`patch`) via same-origin `POST /api/hub/notifications` so concurrent edits never undo another person's opt-out, and pass `notify_settings` on `LAVISH_AXI_ON_EVENT` payloads under a strict 64 KiB serialized argument cap (never over untrusted `/events/hub` peer streams).
 
+`POST /api/:key/note {text, author, source}` is a same-origin guarded, chat-only
+append for external context. It uses escaped user chat with the supplied author,
+retains source, and broadcasts `chat-sync`. It queues no prompts, emits no feedback
+or lifecycle/workflow hook, and never settles delivered feedback, clears Working,
+changes tags, or reopens ended sessions. Notes have `receipt: "none"` because they
+are context, not work delivered to an agent.
+
 ### Passive layout-warning inbox
 
 `src/layout-warnings.js` is the whole lifecycle, as pure functions over stored records, so it is unit-testable without a browser or a server; `SessionStore` and the routes only persist and serve what it returns.

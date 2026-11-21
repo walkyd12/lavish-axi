@@ -867,6 +867,33 @@ export class SessionStore {
     });
   }
 
+  // Context-only chat: no prompt delivery, receipt settlement, or lifecycle change.
+  async addNote(key, { text, author, source }) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session || session.status === "ended") return session || null;
+      const at = new Date().toISOString();
+      session.chat = [
+        ...(session.chat || []),
+        {
+          role: "user",
+          kind: "message",
+          receipt: "none",
+          text,
+          at,
+          author: normalizePromptAuthor(author),
+          source: String(source || "").slice(0, 200),
+        },
+      ];
+      applyTranscriptBound(session);
+      session.chat_revision = normalizeRevision(session.chat_revision) + 1;
+      session.updated_at = at;
+      await this.writeState(state);
+      return session;
+    });
+  }
+
   async addAgentReply(key, text, { requireOpen = false } = {}) {
     return this.runExclusive(async () => {
       const state = await this.readState();
