@@ -408,6 +408,14 @@ async function openCommand(args) {
     forceRestart: shouldForceRestartForLocalBuild(process.argv[1] || ""),
     reloadKey: sessionKey(absolute),
   });
+  const seedNotifyPeople = String(process.env.LAVISH_AXI_NOTIFY_PEOPLE || "").trim();
+  if (seedNotifyPeople) {
+    await fetchJson(`${baseUrl}/api/hub/notifications`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: baseUrl },
+      body: JSON.stringify({ seed: seedNotifyPeople }),
+    }).catch(() => {});
+  }
   const response = await postJson(`${baseUrl}/api/sessions`, { file: absolute, noGate, reopen, creator });
   if (response.status === "user-ended") {
     return createUserEndedOpenOutput({

@@ -435,10 +435,18 @@ export async function fetchPeerBoards(
 }
 
 /**
- * The hub's view of every peer, with a short back-off for a peer that just failed.
+ * The hub's view of every peer, with a short back-off for a peer that just failed and an optional
+ * `maxWaitMs` budget so `/` never blocks first local paint behind a slow or timing-out peer.
  *
  * @param {HubPeer[]} peers
- * @param {{ timeoutMs?: number, retryAfterMs?: number, fetchImpl?: typeof fetch, now?: () => number, isStreamLive?: (peerName: string) => boolean }} [options]
+ * @param {{
+ *   timeoutMs?: number,
+ *   retryAfterMs?: number,
+ *   fetchImpl?: typeof fetch,
+ *   now?: () => number,
+ *   isStreamLive?: (peerName: string) => boolean,
+ *   onSettled?: () => void,
+ * }} [options]
  */
 export function createPeerBoardSource(
   peers,
@@ -448,31 +456,83 @@ export function createPeerBoardSource(
     fetchImpl = fetch,
     now = Date.now,
     isStreamLive = undefined,
+    onSettled = undefined,
   } = {},
 ) {
   /** @type {Map<string, { until: number, error: string }>} */
   const failed = new Map();
   /** @type {Map<string, { boards: any[], dirty: boolean }>} */
   const cached = new Map();
-  const collect = async function collect() {
+  /** @type {Map<string, Promise<{ peer: HubPeer, ok: boolean, boards: any[], error: string }>>} */
+  const inFlight = new Map();
+  /** @type {Map<string, number>} */
+  const invalidateSeq = new Map();
+
+  /** @param {HubPeer} peer */
+  function startOrJoinScrape(peer) {
+    const key = peer.name.toLowerCase();
+    const existing = inFlight.get(key);
+    if (existing) return existing;
+    const seqAtStart = invalidateSeq.get(key) || 0;
+    const task = fetchPeerBoards(peer, { timeoutMs, fetchImpl }).then((result) => {
+      inFlight.delete(key);
+      const invalidatedDuringFetch = (invalidateSeq.get(key) || 0) !== seqAtStart;
+      if (result.ok) {
+        failed.delete(peer.name);
+        cached.set(key, { boards: result.boards, dirty: invalidatedDuringFetch });
+      } else {
+        cached.delete(key);
+        failed.set(peer.name, { until: now() + retryAfterMs, error: result.error });
+      }
+      if (typeof onSettled === "function") {
+        try {
+          onSettled();
+        } catch {
+          // ignore viewer notification error
+        }
+      }
+      return { peer, ...result };
+    });
+    inFlight.set(key, task);
+    return task;
+  }
+
+  /** @param {{ maxWaitMs?: number }} [collectOptions] */
+  const collect = async function collect({ maxWaitMs = undefined } = {}) {
+    const hasWaitBudget = typeof maxWaitMs === "number" && Number.isFinite(maxWaitMs) && maxWaitMs >= 0;
     const results = await Promise.all(
       peers.map(async (peer) => {
         const key = peer.name.toLowerCase();
         const entry = cached.get(key);
         if (entry && !entry.dirty && typeof isStreamLive === "function" && isStreamLive(peer.name)) {
-          return { peer, ok: true, boards: entry.boards, error: "" };
+          return { peer, ok: true, boards: entry.boards, error: "", pending: false };
         }
         const backoff = failed.get(peer.name);
-        if (backoff && now() < backoff.until) return { peer, ok: false, boards: [], error: backoff.error };
-        const result = await fetchPeerBoards(peer, { timeoutMs, fetchImpl });
-        if (result.ok) {
-          failed.delete(peer.name);
-          cached.set(key, { boards: result.boards, dirty: false });
-        } else {
-          cached.delete(key);
-          failed.set(peer.name, { until: now() + retryAfterMs, error: result.error });
+        if (backoff && now() < backoff.until) {
+          return { peer, ok: false, boards: [], error: backoff.error, pending: false };
         }
-        return { peer, ...result };
+        const scrape = startOrJoinScrape(peer);
+        if (!hasWaitBudget) {
+          const settled = await scrape;
+          return { ...settled, pending: false };
+        }
+        if (maxWaitMs === 0) {
+          return { peer, ok: true, boards: entry ? entry.boards : [], error: "", pending: true };
+        }
+        /** @type {ReturnType<typeof setTimeout> | undefined} */
+        let timer;
+        const raced = await Promise.race([
+          scrape.then((settled) => ({ ...settled, pending: false })),
+          new Promise((resolve) => {
+            timer = setTimeout(
+              () => resolve({ peer, ok: true, boards: entry ? entry.boards : [], error: "", pending: true }),
+              maxWaitMs,
+            );
+            timer.unref?.();
+          }),
+        ]);
+        clearTimeout(timer);
+        return raced;
       }),
     );
     return {
@@ -481,6 +541,7 @@ export function createPeerBoardSource(
         name: result.peer.name,
         url: result.peer.origin,
         ok: result.ok,
+        ...(result.pending ? { pending: true } : {}),
         error: result.error || null,
       })),
     };
@@ -488,11 +549,19 @@ export function createPeerBoardSource(
   /** @param {string} [peerName] */
   collect.invalidate = (peerName) => {
     if (!peerName) {
-      for (const entry of cached.values()) entry.dirty = true;
+      for (const [k, entry] of cached.entries()) {
+        entry.dirty = true;
+        invalidateSeq.set(k, (invalidateSeq.get(k) || 0) + 1);
+      }
+      for (const peer of peers) {
+        const k = peer.name.toLowerCase();
+        invalidateSeq.set(k, (invalidateSeq.get(k) || 0) + 1);
+      }
       failed.clear();
       return;
     }
     const key = String(peerName).toLowerCase();
+    invalidateSeq.set(key, (invalidateSeq.get(key) || 0) + 1);
     const entry = cached.get(key);
     if (entry) entry.dirty = true;
     for (const candidate of failed.keys()) {

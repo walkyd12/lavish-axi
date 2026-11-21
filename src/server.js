@@ -589,62 +589,153 @@ export async function serve({
 
   const MAX_HOOK_ARG_BYTES = 65_536;
 
-  function compactEventPayload(payload, { promptMax = 16_384, chatMax = 8_192 } = {}) {
+  function compactEventPayload(
+    payload,
+    { promptMax = 16_384, chatMax = 8_192, promptLimit = 32, chatLimit = 40, minimalAttachments = false } = {},
+  ) {
     const out = { ...payload };
     if (typeof out.search_text === "string" && out.search_text.length > 16_384) {
       out.search_text = out.search_text.slice(0, 16_384);
     }
     if (Array.isArray(out.prompts)) {
-      out.prompts = out.prompts.slice(0, 32).map((prompt) => ({
-        prompt: String(prompt?.prompt || "").slice(0, promptMax),
-        tag: String(prompt?.tag || "").slice(0, 64),
-        selector: String(prompt?.selector || "").slice(0, 512),
-        text: String(prompt?.text || "").slice(0, 256),
-        ...(prompt?.prompt_id ? { prompt_id: String(prompt.prompt_id).slice(0, 128) } : {}),
-        ...(prompt?.author ? { author: String(prompt.author).slice(0, 80) } : {}),
-        ...(prompt?.via === "cli" || prompt?.via === "chrome_approval" ? { via: prompt.via } : {}),
-        ...(prompt?.approval_auth && typeof prompt.approval_auth === "object"
-          ? { approval_auth: prompt.approval_auth }
-          : {}),
-        ...(prompt?.target ? { target: prompt.target } : {}),
-        ...(Array.isArray(prompt?.attachments) && prompt.attachments.length > 0
-          ? {
-              attachments: prompt.attachments
-                .slice(0, 16)
-                .filter((att) => att && typeof att === "object" && att.id)
-                .map((att) => ({
-                  id: String(att.id).slice(0, 128),
-                  ...(att.name ? { name: String(att.name).slice(0, 200) } : {}),
-                  ...(att.path ? { path: String(att.path).slice(0, 1024) } : {}),
-                  ...(att.mime ? { mime: String(att.mime).slice(0, 64) } : {}),
-                  ...(Number.isFinite(att.bytes) ? { bytes: Number(att.bytes) } : {}),
-                  ...(Number.isFinite(att.width) ? { width: Number(att.width) } : {}),
-                  ...(Number.isFinite(att.height) ? { height: Number(att.height) } : {}),
-                })),
-            }
-          : {}),
-      }));
+      out.prompts =
+        promptLimit <= 0
+          ? []
+          : out.prompts.slice(-promptLimit).map((prompt) => ({
+              prompt: String(prompt?.prompt || "").slice(0, promptMax),
+              tag: String(prompt?.tag || "").slice(0, 64),
+              selector: String(prompt?.selector || "").slice(0, minimalAttachments ? 128 : 512),
+              text: String(prompt?.text || "").slice(0, minimalAttachments ? 64 : 256),
+              ...(prompt?.prompt_id ? { prompt_id: String(prompt.prompt_id).slice(0, 128) } : {}),
+              ...(prompt?.author ? { author: String(prompt.author).slice(0, 80) } : {}),
+              ...(prompt?.via === "cli" || prompt?.via === "chrome_approval" ? { via: prompt.via } : {}),
+              ...(prompt?.approval_auth && typeof prompt.approval_auth === "object"
+                ? { approval_auth: prompt.approval_auth }
+                : {}),
+              ...(!minimalAttachments && prompt?.target ? { target: prompt.target } : {}),
+              ...(Array.isArray(prompt?.attachments) && prompt.attachments.length > 0
+                ? {
+                    attachments: prompt.attachments
+                      .slice(0, 16)
+                      .filter((att) => att && typeof att === "object" && att.id)
+                      .map((att) => ({
+                        id: String(att.id).slice(0, 128),
+                        ...(att.name ? { name: String(att.name).slice(0, 200) } : {}),
+                        ...(!minimalAttachments && att.path ? { path: String(att.path).slice(0, 1024) } : {}),
+                        ...(!minimalAttachments && att.mime ? { mime: String(att.mime).slice(0, 64) } : {}),
+                        ...(!minimalAttachments && Number.isFinite(att.bytes) ? { bytes: Number(att.bytes) } : {}),
+                        ...(!minimalAttachments && Number.isFinite(att.width) ? { width: Number(att.width) } : {}),
+                        ...(!minimalAttachments && Number.isFinite(att.height) ? { height: Number(att.height) } : {}),
+                      })),
+                  }
+                : {}),
+            }));
     }
     if (Array.isArray(out.chat)) {
-      out.chat = out.chat.slice(-40).map((entry) => ({
-        role: entry?.role === "agent" ? "agent" : "user",
-        text: String(entry?.text || "").slice(0, chatMax),
-        ...(entry?.author ? { author: String(entry.author).slice(0, 80) } : {}),
-        ...(entry?.at ? { at: String(entry.at).slice(0, 40) } : {}),
-        ...(Array.isArray(entry?.attachments) && entry.attachments.length > 0
-          ? {
-              attachments: entry.attachments
-                .slice(0, 16)
-                .filter((att) => att && typeof att === "object" && att.id)
-                .map((att) => ({
-                  id: String(att.id).slice(0, 128),
-                  ...(att.name ? { name: String(att.name).slice(0, 200) } : {}),
-                })),
-            }
-          : {}),
-      }));
+      out.chat =
+        chatLimit <= 0
+          ? []
+          : out.chat.slice(-chatLimit).map((entry) => ({
+              role: entry?.role === "agent" ? "agent" : "user",
+              text: String(entry?.text || "").slice(0, chatMax),
+              ...(entry?.author ? { author: String(entry.author).slice(0, 80) } : {}),
+              ...(entry?.at ? { at: String(entry.at).slice(0, 40) } : {}),
+              ...(Array.isArray(entry?.attachments) && entry.attachments.length > 0
+                ? {
+                    attachments: entry.attachments
+                      .slice(0, 16)
+                      .filter((att) => att && typeof att === "object" && att.id)
+                      .map((att) => ({
+                        id: String(att.id).slice(0, 128),
+                        ...(att.name ? { name: String(att.name).slice(0, 200) } : {}),
+                      })),
+                  }
+                : {}),
+            }));
     }
     return out;
+  }
+
+  function fitNotifySettingsToBudget(notifySettings, maxBytes) {
+    if (!notifySettings || typeof notifySettings !== "object") return {};
+    if (Buffer.byteLength(JSON.stringify(notifySettings), "utf8") <= maxBytes) return notifySettings;
+    /** @type {Record<string, any>} */
+    const fitted = {};
+    // Prioritize rows with active notifications (`tagged || done`) first if an oversized disk file ever appears.
+    const entries = Object.entries(notifySettings).sort(
+      ([, a], [, b]) => Number(Boolean(b?.tagged || b?.done)) - Number(Boolean(a?.tagged || a?.done)),
+    );
+    for (const [name, cfg] of entries) {
+      const next = { ...fitted, [name]: cfg };
+      if (Buffer.byteLength(JSON.stringify(next), "utf8") > maxBytes) continue;
+      fitted[name] = cfg;
+    }
+    return fitted;
+  }
+
+  function serializeBoundedHookPayload(eventPayload, notifySettings, maxBytes = MAX_HOOK_ARG_BYTES) {
+    const boundedSettings = fitNotifySettingsToBudget(notifySettings, Math.floor(maxBytes / 2));
+    const tiers = [
+      () => ({ ...eventPayload, notify_settings: boundedSettings }),
+      () => ({
+        ...compactEventPayload(
+          { ...eventPayload, search_text: String(eventPayload.search_text || "").slice(0, 4_096) },
+          { promptMax: 1_024, chatMax: 512, promptLimit: 16, chatLimit: 20 },
+        ),
+        notify_settings: boundedSettings,
+      }),
+      () => ({
+        ...compactEventPayload(
+          { ...eventPayload, search_text: String(eventPayload.search_text || "").slice(0, 512) },
+          { promptMax: 256, chatMax: 128, promptLimit: 8, chatLimit: 8, minimalAttachments: true },
+        ),
+        notify_settings: boundedSettings,
+      }),
+      () => ({
+        ...compactEventPayload(
+          { ...eventPayload, search_text: "", chat: [] },
+          { promptMax: 128, chatMax: 0, promptLimit: 4, chatLimit: 0, minimalAttachments: true },
+        ),
+        notify_settings: boundedSettings,
+      }),
+      () => {
+        const minimal = compactEventPayload(
+          {
+            ...eventPayload,
+            title: String(eventPayload.title || "").slice(0, 200),
+            search_text: "",
+            chat: [],
+            prompts: [],
+          },
+          { promptLimit: 0, chatLimit: 0 },
+        );
+        delete minimal.search_text;
+        delete minimal.chat;
+        return { ...minimal, notify_settings: boundedSettings };
+      },
+    ];
+    for (const buildTier of tiers) {
+      const serialized = JSON.stringify(buildTier());
+      if (Buffer.byteLength(serialized, "utf8") <= maxBytes) return serialized;
+    }
+    const bareWithoutSettings = {
+      event: eventPayload.event,
+      key: eventPayload.key,
+      ...(eventPayload.file ? { file: eventPayload.file } : {}),
+      ...(eventPayload.url ? { url: eventPayload.url } : {}),
+      ...(eventPayload.base ? { base: eventPayload.base } : {}),
+      ...(eventPayload.action ? { action: eventPayload.action } : {}),
+      ...(eventPayload.action_label ? { action_label: eventPayload.action_label } : {}),
+      ...(Array.isArray(eventPayload.tags) ? { tags: eventPayload.tags.slice(0, 32) } : {}),
+      ...(Array.isArray(eventPayload.added) ? { added: eventPayload.added.slice(0, 32) } : {}),
+      ...(Array.isArray(eventPayload.removed) ? { removed: eventPayload.removed.slice(0, 32) } : {}),
+    };
+    const bareOverhead = Buffer.byteLength(JSON.stringify({ ...bareWithoutSettings, notify_settings: {} }), "utf8");
+    const bare = {
+      ...bareWithoutSettings,
+      notify_settings: fitNotifySettingsToBudget(boundedSettings, Math.max(0, maxBytes - bareOverhead - 32)),
+    };
+    return JSON.stringify(bare);
   }
 
   const MAX_HUB_EVENT_HISTORY = 256;
@@ -684,11 +775,25 @@ export async function serve({
   }
 
   function runDetachedHookOrdered(envVar, command, args, extraEnv = {}) {
-    if (!command) return;
-    if (!path.isAbsolute(command)) {
-      writeLog(`[lavish] ${envVar} must be an absolute path to an executable; skipped`);
-      return;
+    if (!command) {
+      return { configured: false, launched: Promise.resolve({ ok: true, error: "" }) };
     }
+    if (!path.isAbsolute(command)) {
+      const msg = `${envVar} must be an absolute path to an executable; skipped`;
+      writeLog(`[lavish] ${msg}`);
+      return { configured: true, launched: Promise.resolve({ ok: false, error: msg }) };
+    }
+    /** @type {(res: { ok: boolean, error: string }) => void} */
+    let resolveLaunched;
+    const launched = new Promise((resolve) => {
+      resolveLaunched = resolve;
+    });
+    let launchSettled = false;
+    const settleLaunch = (ok, error = "") => {
+      if (launchSettled) return;
+      launchSettled = true;
+      resolveLaunched({ ok, error });
+    };
     hookQueue = hookQueue
       .then(
         () =>
@@ -700,7 +805,10 @@ export async function serve({
               clearTimeout(timer);
               resolve();
             };
-            const timer = setTimeout(finish, HOOK_STEP_TIMEOUT_MS);
+            const timer = setTimeout(() => {
+              settleLaunch(false, `event hook ${command} timed out`);
+              finish();
+            }, HOOK_STEP_TIMEOUT_MS);
             timer.unref?.();
             try {
               const child = spawn(command, args, {
@@ -708,19 +816,29 @@ export async function serve({
                 stdio: "ignore",
                 env: { ...process.env, ...env, ...extraEnv },
               });
+              child.once("spawn", () => settleLaunch(true));
               child.on("error", (error) => {
                 writeLog(`[lavish] event hook ${command} failed to start: ${error.message}`);
+                settleLaunch(false, error.message);
                 finish();
               });
-              child.once("close", finish);
+              child.once("close", () => {
+                settleLaunch(true);
+                finish();
+              });
               child.unref();
             } catch (error) {
-              writeLog(`[lavish] event hook ${command} failed: ${error?.message || error}`);
+              const message = String(error?.message || error);
+              writeLog(`[lavish] event hook ${command} failed: ${message}`);
+              settleLaunch(false, message);
               finish();
             }
           }),
       )
-      .catch(() => {});
+      .catch(() => {
+        settleLaunch(false, "event hook queue failed");
+      });
+    return { configured: true, launched };
   }
 
   // LAVISH_AXI_ON_EVENT (and optional LAVISH_AXI_ON_ACTION for board_action) names an executable run
@@ -749,32 +867,34 @@ export async function serve({
     } else {
       notifyHubViewers();
     }
-    const hookPayload = { ...eventPayload, notify_settings: notifySettingsStore.getSync() };
+    const notifySnapshot = notifySettingsStore.getSync();
+    const hookPayload = { ...eventPayload, notify_settings: notifySnapshot };
     if (typeof onEvent === "function") {
       Promise.resolve()
         .then(() => onEvent(hookPayload))
         .catch((error) => writeLog(`[lavish] onEvent callback failed: ${error?.message || error}`));
     }
-    let serialized = JSON.stringify(hookPayload);
-    if (Buffer.byteLength(serialized, "utf8") > MAX_HOOK_ARG_BYTES) {
-      const slimmer = {
-        ...compactEventPayload(
-          { ...eventPayload, search_text: String(eventPayload.search_text || "").slice(0, 4_096) },
-          { promptMax: 1_024, chatMax: 512 },
-        ),
-        notify_settings: hookPayload.notify_settings,
-      };
-      serialized = JSON.stringify(slimmer);
-    }
+    const serialized = serializeBoundedHookPayload(eventPayload, notifySnapshot, MAX_HOOK_ARG_BYTES);
     const hookEnv = { LAVISH_AXI_EVENT: String(eventPayload.event || "") };
     const eventCommand = String(env.LAVISH_AXI_ON_EVENT || process.env.LAVISH_AXI_ON_EVENT || "").trim();
-    runDetachedHookOrdered("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv);
+    const launchResults = [runDetachedHookOrdered("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv)];
     if (eventPayload.event === "board_action") {
       const actionCommand = String(env.LAVISH_AXI_ON_ACTION || process.env.LAVISH_AXI_ON_ACTION || "").trim();
       if (actionCommand && actionCommand !== eventCommand) {
-        runDetachedHookOrdered("LAVISH_AXI_ON_ACTION", actionCommand, [serialized], hookEnv);
+        launchResults.push(runDetachedHookOrdered("LAVISH_AXI_ON_ACTION", actionCommand, [serialized], hookEnv));
       }
     }
+    const configuredLaunches = launchResults.filter((item) => item.configured).map((item) => item.launched);
+    return {
+      configured: configuredLaunches.length > 0,
+      launched:
+        configuredLaunches.length === 0
+          ? Promise.resolve({ ok: true, error: "" })
+          : Promise.all(configuredLaunches).then((outcomes) => {
+              const failedOutcome = outcomes.find((item) => !item.ok);
+              return failedOutcome || { ok: true, error: "" };
+            }),
+    };
   }
 
   async function emitLocalBoardEnded(key, endedBy) {
@@ -1290,6 +1410,7 @@ export async function serve({
     ? createPeerBoardSource(parsedPeers.peers, {
         ...hubPeerOptions,
         isStreamLive: (peerName) => livePeerStreams.has(String(peerName).toLowerCase()),
+        onSettled: () => notifyHubViewers(),
       })
     : null;
   const PEER_WS_BACKOFF_MS = [200, 500, 1000, 2000, 5000];
@@ -1483,9 +1604,12 @@ export async function serve({
     return Math.min(Math.floor(parsed), 1_000_000);
   }
 
+  const HUB_INITIAL_PEER_WAIT_MS = 80;
+
   /**
    * @param {{
    *   includePeers?: boolean,
+   *   maxPeerWaitMs?: number,
    *   peersOnly?: boolean,
    *   query?: string,
    *   tag?: string,
@@ -1496,6 +1620,7 @@ export async function serve({
    */
   async function queryHub({
     includePeers = true,
+    maxPeerWaitMs = undefined,
     peersOnly = false,
     query = "",
     tag = "",
@@ -1505,7 +1630,7 @@ export async function serve({
   } = {}) {
     const [sessions, remote] = await Promise.all([
       store.listSessions(),
-      includePeers && collectPeerBoards ? collectPeerBoards() : null,
+      includePeers && collectPeerBoards ? collectPeerBoards({ maxWaitMs: maxPeerWaitMs }) : null,
     ]);
     const now = Date.now();
     /** @type {Map<string, any>} */
@@ -1637,7 +1762,13 @@ export async function serve({
     try {
       res.setHeader("x-frame-options", "DENY");
       res.setHeader("content-security-policy", "frame-ancestors 'none'");
-      const view = await queryHub({ includePeers: true, state: "open", limit: DEFAULT_HUB_LIMIT, offset: 0 });
+      const view = await queryHub({
+        includePeers: true,
+        maxPeerWaitMs: HUB_INITIAL_PEER_WAIT_MS,
+        state: "open",
+        limit: DEFAULT_HUB_LIMIT,
+        offset: 0,
+      });
       res.type("html").send(
         createHubHtml({
           boards: view.boards,
@@ -1661,7 +1792,8 @@ export async function serve({
 
   app.get("/api/hub/notifications", async (_req, res, next) => {
     try {
-      res.json({ notify_settings: await notifySettingsStore.get() });
+      const current = await notifySettingsStore.get();
+      res.json({ notify_settings: current, revision: notifySettingsStore.revision() });
     } catch (error) {
       next(error);
     }
@@ -1673,19 +1805,30 @@ export async function serve({
         res.status(403).json({ error: "cross-origin notification settings write rejected" });
         return;
       }
-      const rawSettings =
-        req.body &&
-        typeof req.body === "object" &&
-        !Array.isArray(req.body) &&
-        Object.hasOwn(req.body, "notify_settings")
-          ? req.body.notify_settings
-          : req.body;
-      const saved = await notifySettingsStore.save(rawSettings);
+      const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : null;
+      let saved;
+      if (body && Object.hasOwn(body, "seed")) {
+        saved = await notifySettingsStore.seedIfMissing(typeof body.seed === "string" ? body.seed : "");
+      } else if (body && Object.hasOwn(body, "add")) {
+        saved = await notifySettingsStore.addPerson(body.add);
+      } else if (body && Object.hasOwn(body, "remove")) {
+        saved = await notifySettingsStore.removePerson(body.remove);
+      } else if (body && Object.hasOwn(body, "patch")) {
+        saved = await notifySettingsStore.patchPerson(body.patch);
+      } else {
+        const rawSettings = body && Object.hasOwn(body, "notify_settings") ? body.notify_settings : req.body;
+        const expectedRevision = body && typeof body.revision === "string" ? body.revision.trim() : "";
+        saved = await notifySettingsStore.save(rawSettings, { expectedRevision });
+      }
       notifyHubViewers();
-      res.json({ notify_settings: saved });
+      res.json({ notify_settings: saved, revision: notifySettingsStore.revision() });
     } catch (error) {
       if (error instanceof NotifySettingsError) {
-        res.status(400).json({ error: error.message });
+        res.status(error.statusCode || 400).json({
+          error: error.message,
+          notify_settings: notifySettingsStore.getSync(),
+          revision: notifySettingsStore.revision(),
+        });
         return;
       }
       next(error);
@@ -1954,7 +2097,7 @@ export async function serve({
         String(req.body?.action || "send")
           .trim()
           .slice(0, 40) || "send";
-      emitHubEvent({
+      const actionHook = emitHubEvent({
         event: "board_action",
         action: actionName,
         action_label: resolvedActionLabel,
@@ -1970,6 +2113,16 @@ export async function serve({
         prompts: acceptedPrompts.length ? acceptedPrompts : current.prompts || [],
         chat: current.chat || [],
       });
+      if (actionHook.configured) {
+        const launchOutcome = await actionHook.launched;
+        if (!launchOutcome.ok) {
+          res.status(502).json({
+            status: "error",
+            error: `Workflow hook failed to launch: ${launchOutcome.error || "spawn failed"}`,
+          });
+          return;
+        }
+      }
       res.json({
         status: "sent",
         action: actionName,
@@ -4901,7 +5054,7 @@ ${themed.style}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><span class="presence-pill" id="presencePill" role="status" aria-live="polite" data-tone="off"><span class="presence-dot" aria-hidden="true"></span><span class="presence-text" id="presencePillText">Connecting…</span></span><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="panel" aria-expanded="true" aria-label="Hide conversation" title="Hide conversation">${chromeIcons.sidebar}<span class="sidebar-toggle-count" id="sidebarToggleCount" aria-hidden="true" hidden></span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="layoutToggle" type="button" title="Switch between the phone and desktop layouts. Remembered on this device.">${chromeIcons.phone}<span id="layoutToggleText">Layout: Auto</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}"${Array.isArray(notifyPeople) && notifyPeople.length ? ` data-people="${escapeHtml(JSON.stringify(notifyPeople))}"` : ""} data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><label class="approval-author-wrap" id="approvalTokenWrap" for="approvalTokenInput" hidden><span>Token</span><input id="approvalTokenInput" type="password" maxlength="200" placeholder="Approval token"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}" data-people="${escapeHtml(JSON.stringify(Array.isArray(notifyPeople) ? notifyPeople : []))}" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><label class="approval-author-wrap" id="approvalTokenWrap" for="approvalTokenInput" hidden><span>Token</span><input id="approvalTokenInput" type="password" maxlength="200" placeholder="Approval token"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p><button type="button" class="button ended-action" data-reactivate data-key="${session.key}" data-file="${escapeHtml(session.file)}">Reactivate board</button><p><a href="/">Fusion Hub</a></p></div></div>

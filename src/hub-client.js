@@ -1,7 +1,7 @@
 /* global document, location, window */
 // The Lavish hub page (src/hub.js renders the shell). It bootstraps from `#hub-data`, stays synced
 // over the `/events/hub` WebSocket (zero polling timers), runs search/tab/tag filtering and
-// pagination on `/api/hub`, and manages per-person notification checkboxes. Served as a raw file.
+// pagination on `/api/hub`, and manages per-person notification checkboxes via scoped patches.
 
 const HUB_WS_BACKOFF_MS = [500, 1000, 2000, 5000];
 const HUB_EVENT_DEBOUNCE_MS = 60;
@@ -19,6 +19,9 @@ let serverTags = Array.isArray(initial.tags) ? initial.tags : null;
 let totalMatching = typeof initial.total === "number" ? initial.total : boards.length;
 let hasMore = Boolean(initial.has_more);
 let loadingMore = false;
+let filterEpoch = 0;
+let filterPending = false;
+let pendingWsRefreshAfterLoadMore = false;
 /** @type {Record<string, { tagged: boolean, done: boolean, send_to: string }>} */
 let notifySettings =
   initial.notify_settings && typeof initial.notify_settings === "object" && !Array.isArray(initial.notify_settings)
@@ -32,10 +35,12 @@ const busy = new Set();
 let eventRefreshTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let searchDebounceTimer;
-/** @type {ReturnType<typeof setTimeout> | undefined} */
-let sendToSaveTimer;
+/** @type {Map<string, ReturnType<typeof setTimeout>>} */
+const sendToSaveTimers = new Map();
 /** @type {AbortController | null} */
 let activeFetchController = null;
+/** @type {AbortController | null} */
+let loadMoreController = null;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let wsReconnectTimer;
 let wsReconnectAttempt = 0;
@@ -239,34 +244,69 @@ function boardHtml(board) {
   );
 }
 
+function notifyRowHtml(person, cfg) {
+  const safeName = escapeHtml(person);
+  return (
+    `<div class="notify-row" data-notify-row="${safeName}">` +
+    `<div class="notify-person-head"><strong class="notify-person-name">${safeName}</strong>` +
+    `<button type="button" class="notify-remove" data-notify-remove="${safeName}" aria-label="Remove ${safeName}" title="Remove ${safeName}">×</button></div>` +
+    `<div class="notify-checks">` +
+    `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="tagged"${cfg.tagged ? " checked" : ""}><span>When tagged</span></label>` +
+    `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="done"${cfg.done ? " checked" : ""}><span>When board is done</span></label>` +
+    `</div>` +
+    `<label class="notify-sendto"><span>Send to</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Optional destination" maxlength="256"></label>` +
+    `</div>`
+  );
+}
+
 function renderNotificationsPanel() {
   if (!notifyRows || !notifyEmpty) return;
-  if (
-    notifyPanel &&
-    notifyPanel.contains(document.activeElement) &&
-    document.activeElement?.matches('input[type="text"]')
-  ) {
-    return;
-  }
   const people = Object.keys(notifySettings);
   notifyEmpty.hidden = people.length > 0;
-  notifyRows.innerHTML = people
-    .map((person) => {
-      const cfg = notifySettings[person] || { tagged: false, done: false, send_to: "" };
-      const safeName = escapeHtml(person);
-      return (
-        `<div class="notify-row" data-notify-row="${safeName}">` +
-        `<div class="notify-person-head"><strong class="notify-person-name">${safeName}</strong>` +
-        `<button type="button" class="notify-remove" data-notify-remove="${safeName}" aria-label="Remove ${safeName}" title="Remove ${safeName}">×</button></div>` +
-        `<div class="notify-checks">` +
-        `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="tagged"${cfg.tagged ? " checked" : ""}><span>When tagged</span></label>` +
-        `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="done"${cfg.done ? " checked" : ""}><span>When board is done</span></label>` +
-        `</div>` +
-        `<label class="notify-sendto"><span>Send to</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(cfg.send_to || "")}" placeholder="Optional destination" maxlength="256"></label>` +
-        `</div>`
-      );
-    })
-    .join("");
+  const activeEl = /** @type {HTMLElement | null} */ (document.activeElement);
+  const focusedSendTo =
+    activeEl && notifyRows.contains(activeEl) && activeEl.matches?.('input[type="text"][data-notify-field="send_to"]')
+      ? /** @type {HTMLInputElement} */ (activeEl)
+      : null;
+
+  if (!focusedSendTo) {
+    notifyRows.innerHTML = people
+      .map((person) => notifyRowHtml(person, notifySettings[person] || { tagged: false, done: false, send_to: "" }))
+      .join("");
+    return;
+  }
+
+  // Update rows in place so a focused `send_to` input keeps cursor position while checkboxes and
+  // other people's rows sync immediately across tabs.
+  const existingByPerson = new Map();
+  for (const row of /** @type {NodeListOf<HTMLElement>} */ (notifyRows.querySelectorAll(".notify-row"))) {
+    const key = row.dataset.notifyRow || "";
+    if (!Object.hasOwn(notifySettings, key)) {
+      row.remove();
+    } else {
+      existingByPerson.set(key, row);
+    }
+  }
+  for (const person of people) {
+    const cfg = notifySettings[person] || { tagged: false, done: false, send_to: "" };
+    const existing = existingByPerson.get(person);
+    if (!existing) {
+      const temp = document.createElement("div");
+      temp.innerHTML = notifyRowHtml(person, cfg);
+      if (temp.firstElementChild) notifyRows.appendChild(temp.firstElementChild);
+      continue;
+    }
+    for (const input of /** @type {NodeListOf<HTMLInputElement>} */ (
+      existing.querySelectorAll("input[data-notify-field]")
+    )) {
+      const field = input.dataset.notifyField;
+      if (field === "tagged") input.checked = Boolean(cfg.tagged);
+      else if (field === "done") input.checked = Boolean(cfg.done);
+      else if (field === "send_to" && input !== focusedSendTo && !sendToSaveTimers.has(person)) {
+        input.value = String(cfg.send_to || "");
+      }
+    }
+  }
 }
 
 function setNotifyStatus(text, isError = false) {
@@ -276,23 +316,22 @@ function setNotifyStatus(text, isError = false) {
   notifyStatus.hidden = !text;
 }
 
-function saveNotifySettings(rerender = false) {
-  const snapshot = JSON.parse(JSON.stringify(notifySettings));
+function queueNotifyMutation(payload, { rerender = false } = {}) {
   notifySaveChain = notifySaveChain
     .then(async () => {
       try {
         const response = await fetch("/api/hub/notifications", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ notify_settings: snapshot }),
+          body: JSON.stringify(payload),
         });
         const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(data.error || "Could not save notification settings.");
-        if (data.notify_settings && typeof data.notify_settings === "object") {
+        if (data.notify_settings && typeof data.notify_settings === "object" && !Array.isArray(data.notify_settings)) {
           notifySettings = data.notify_settings;
           syncGlobalNotifyPeople();
-          if (rerender) renderNotificationsPanel();
+          if (rerender || !response.ok) renderNotificationsPanel();
         }
+        if (!response.ok) throw new Error(data.error || "Could not save notification settings.");
         setNotifyStatus("Saved.");
       } catch (error) {
         setNotifyStatus(error?.message || "Could not save notification settings.", true);
@@ -300,6 +339,25 @@ function saveNotifySettings(rerender = false) {
     })
     .catch(() => {});
   return notifySaveChain;
+}
+
+function cancelLoadMore() {
+  if (loadMoreController) {
+    loadMoreController.abort();
+    loadMoreController = null;
+  }
+  loadingMore = false;
+  pendingWsRefreshAfterLoadMore = false;
+}
+
+function beginFilterTransition() {
+  filterEpoch += 1;
+  filterPending = true;
+  hasMore = false;
+  cancelLoadMore();
+  activeFetchController?.abort();
+  activeFetchController = null;
+  render();
 }
 
 function render() {
@@ -346,7 +404,8 @@ function render() {
   window.dispatchEvent(new CustomEvent("lavish:render-metadata"));
 
   if (moreWrap && moreBtn) {
-    moreWrap.hidden = !hasMore;
+    const showMore = hasMore && !filterPending;
+    moreWrap.hidden = !showMore;
     moreBtn.disabled = loadingMore;
     moreBtn.textContent = loadingMore
       ? "Loading…"
@@ -355,7 +414,7 @@ function render() {
         : "Load more";
   }
 
-  empty.hidden = boards.length > 0;
+  empty.hidden = boards.length > 0 || filterPending;
   empty.textContent = searching
     ? "No matching boards."
     : showing === "needs-input"
@@ -388,7 +447,7 @@ function render() {
       : "");
   if (!counts.open) lede.textContent = "No open boards. Closed ones can be reopened below.";
   updated.textContent = generatedAt ? new Date(generatedAt).toLocaleTimeString() : "";
-  const down = peers.filter((peer) => peer && peer.ok === false).map((peer) => String(peer.name));
+  const down = peers.filter((peer) => peer && peer.ok === false && !peer.pending).map((peer) => String(peer.name));
   peerNote.textContent = down.length
     ? (down.length === 1 ? down[0] + " is" : down.join(", ") + " are") +
       " not answering, so " +
@@ -419,9 +478,19 @@ function buildHubQuery({ offset = 0, limit = DEFAULT_PAGE_LIMIT } = {}) {
 async function refresh({ resetLimit = false } = {}) {
   clearTimeout(eventRefreshTimer);
   eventRefreshTimer = undefined;
+  if (!resetLimit) {
+    if (searchDebounceTimer) return;
+    if (loadingMore) {
+      pendingWsRefreshAfterLoadMore = true;
+      return;
+    }
+  } else {
+    cancelLoadMore();
+  }
   activeFetchController?.abort();
   const controller = new AbortController();
   activeFetchController = controller;
+  const reqEpoch = filterEpoch;
   const desiredLimit = resetLimit
     ? DEFAULT_PAGE_LIMIT
     : Math.max(DEFAULT_PAGE_LIMIT, Math.min(boards.length || DEFAULT_PAGE_LIMIT, 200));
@@ -432,7 +501,8 @@ async function refresh({ resetLimit = false } = {}) {
     });
     if (!response.ok) throw new Error("hub request failed: " + response.status);
     const data = await response.json();
-    if (activeFetchController !== controller) return;
+    if (activeFetchController !== controller || reqEpoch !== filterEpoch) return;
+    filterPending = false;
     boards = Array.isArray(data.boards) ? data.boards : [];
     peers = Array.isArray(data.peers) ? data.peers : [];
     if (data.counts && typeof data.counts === "object") serverCounts = data.counts;
@@ -449,21 +519,29 @@ async function refresh({ resetLimit = false } = {}) {
     if (note.dataset.tone === "offline") showNote("");
     if (!list.contains(document.activeElement) || !document.activeElement?.matches("input")) render();
   } catch (error) {
-    if (/** @type {any} */ (error)?.name === "AbortError") return;
+    if (/** @type {any} */ (error)?.name === "AbortError" || reqEpoch !== filterEpoch) return;
+    filterPending = false;
+    render();
     showNote("Lavish is not answering. The list below may be out of date.", "offline");
   }
 }
 
 async function loadMore() {
-  if (loadingMore || !hasMore) return;
+  if (loadingMore || !hasMore || filterPending || searchDebounceTimer) return;
+  const reqEpoch = filterEpoch;
+  const queryUrl = buildHubQuery({ offset: boards.length, limit: DEFAULT_PAGE_LIMIT });
+  const controller = new AbortController();
+  loadMoreController = controller;
   loadingMore = true;
   render();
   try {
-    const response = await fetch(buildHubQuery({ offset: boards.length, limit: DEFAULT_PAGE_LIMIT }), {
+    const response = await fetch(queryUrl, {
       cache: "no-store",
+      signal: controller.signal,
     });
     if (!response.ok) throw new Error("hub request failed: " + response.status);
     const data = await response.json();
+    if (loadMoreController !== controller || reqEpoch !== filterEpoch) return;
     const seen = new Set(boards.map((board) => board.key));
     for (const board of Array.isArray(data.boards) ? data.boards : []) {
       if (board && !seen.has(board.key)) {
@@ -477,11 +555,25 @@ async function loadMore() {
     totalMatching = typeof data.total === "number" ? data.total : boards.length;
     hasMore = Boolean(data.has_more);
     generatedAt = String(data.generated_at || generatedAt);
-  } catch {
+  } catch (error) {
+    if (
+      /** @type {any} */ (error)?.name === "AbortError" ||
+      loadMoreController !== controller ||
+      reqEpoch !== filterEpoch
+    ) {
+      return;
+    }
     showNote("Could not load more boards. Try again.", "error");
   } finally {
-    loadingMore = false;
-    render();
+    if (loadMoreController === controller) {
+      loadMoreController = null;
+      loadingMore = false;
+      render();
+      if (pendingWsRefreshAfterLoadMore) {
+        pendingWsRefreshAfterLoadMore = false;
+        scheduleEventRefresh();
+      }
+    }
   }
 }
 
@@ -575,7 +667,10 @@ async function reopenBoard(board) {
     const result = await response.json().catch(() => ({}));
     if (!response.ok || result.status !== "opened") throw new Error(result.error || String(response.status));
     showNote(`Reopened "${board.title}".`, "done");
-    showing = "open";
+    if (showing !== "open") {
+      showing = "open";
+      beginFilterTransition();
+    }
   } catch {
     showNote(`Could not reopen "${board.title}".`, "error");
   } finally {
@@ -654,13 +749,18 @@ notifyRows?.addEventListener("change", (event) => {
   const field = input?.dataset?.notifyField;
   if (!input || !person || !field || !Object.hasOwn(notifySettings, person)) return;
   if (field === "tagged" || field === "done") {
-    notifySettings[person] = { ...notifySettings[person], [field]: input.checked };
-    void saveNotifySettings(false);
+    const checked = Boolean(input.checked);
+    notifySettings[person] = { ...notifySettings[person], [field]: checked };
+    void queueNotifyMutation({ patch: { person, [field]: checked } });
   } else if (field === "send_to") {
-    clearTimeout(sendToSaveTimer);
-    sendToSaveTimer = undefined;
-    notifySettings[person] = { ...notifySettings[person], send_to: input.value.trim() };
-    void saveNotifySettings(false);
+    const existingTimer = sendToSaveTimers.get(person);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      sendToSaveTimers.delete(person);
+    }
+    const cleaned = input.value.trim();
+    notifySettings[person] = { ...notifySettings[person], send_to: cleaned };
+    void queueNotifyMutation({ patch: { person, send_to: cleaned } });
   }
 });
 notifyRows?.addEventListener("input", (event) => {
@@ -668,12 +768,15 @@ notifyRows?.addEventListener("input", (event) => {
   const person = input?.dataset?.notifyPerson;
   const field = input?.dataset?.notifyField;
   if (!input || !person || field !== "send_to" || !Object.hasOwn(notifySettings, person)) return;
-  notifySettings[person] = { ...notifySettings[person], send_to: input.value.trim() };
-  clearTimeout(sendToSaveTimer);
-  sendToSaveTimer = setTimeout(() => {
-    sendToSaveTimer = undefined;
-    void saveNotifySettings(false);
+  const cleaned = input.value.trim();
+  notifySettings[person] = { ...notifySettings[person], send_to: cleaned };
+  const existingTimer = sendToSaveTimers.get(person);
+  if (existingTimer) clearTimeout(existingTimer);
+  const timer = setTimeout(() => {
+    sendToSaveTimers.delete(person);
+    void queueNotifyMutation({ patch: { person, send_to: cleaned } });
   }, SEND_TO_DEBOUNCE_MS);
+  sendToSaveTimers.set(person, timer);
 });
 notifyRows?.addEventListener("click", (event) => {
   const button = /** @type {HTMLButtonElement | null} */ (
@@ -681,12 +784,17 @@ notifyRows?.addEventListener("click", (event) => {
   );
   const person = button?.dataset?.notifyRemove;
   if (!person || !Object.hasOwn(notifySettings, person)) return;
+  const pendingTimer = sendToSaveTimers.get(person);
+  if (pendingTimer) {
+    clearTimeout(pendingTimer);
+    sendToSaveTimers.delete(person);
+  }
   const next = { ...notifySettings };
   delete next[person];
   notifySettings = next;
   syncGlobalNotifyPeople();
   renderNotificationsPanel();
-  void saveNotifySettings(true);
+  void queueNotifyMutation({ remove: person }, { rerender: true });
 });
 notifyAddForm?.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -704,7 +812,7 @@ notifyAddForm?.addEventListener("submit", (event) => {
   if (notifyAddInput) notifyAddInput.value = "";
   syncGlobalNotifyPeople();
   renderNotificationsPanel();
-  void saveNotifySettings(true);
+  void queueNotifyMutation({ add: rawName }, { rerender: true });
 });
 
 list.addEventListener("click", (event) => {
@@ -724,7 +832,10 @@ moreBtn?.addEventListener("click", () => {
 
 function switchTab(nextTab) {
   if (showing === nextTab && !search.value.trim() && !tagFilter.value) return;
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = undefined;
   showing = nextTab;
+  beginFilterTransition();
   void refresh({ resetLimit: true });
 }
 
@@ -746,12 +857,16 @@ else if (location.hash === "#notifications") setNotifyPanelOpen(true);
 
 search.addEventListener("input", () => {
   clearTimeout(searchDebounceTimer);
+  beginFilterTransition();
   searchDebounceTimer = setTimeout(() => {
     searchDebounceTimer = undefined;
     void refresh({ resetLimit: true });
   }, SEARCH_DEBOUNCE_MS);
 });
 tagFilter.addEventListener("change", () => {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = undefined;
+  beginFilterTransition();
   void refresh({ resetLimit: true });
 });
 window.addEventListener("lavish:metadata-saved", () => {
@@ -762,6 +877,9 @@ syncGlobalNotifyPeople();
 renderNotificationsPanel();
 render();
 if (showing !== "open") {
+  beginFilterTransition();
   void refresh({ resetLimit: true });
+} else if (peers.some((peer) => peer && peer.pending)) {
+  void refresh();
 }
 connectHubEvents();

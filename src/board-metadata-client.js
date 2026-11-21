@@ -2,6 +2,10 @@
 // Shared tag editor for local hub cards and the board chrome. Peer cards are read-only.
 (() => {
   const configuredPeople = (root) => {
+    const globalList = window["lavishNotifyPeople"];
+    if (Array.isArray(globalList)) {
+      return globalList.filter((name) => typeof name === "string" && name.trim());
+    }
     if (root?.dataset.people) {
       try {
         const parsed = JSON.parse(root.dataset.people);
@@ -10,8 +14,7 @@
         // ignore invalid attribute
       }
     }
-    const globalList = window["lavishNotifyPeople"];
-    return Array.isArray(globalList) ? globalList.filter((name) => typeof name === "string" && name.trim()) : [];
+    return [];
   };
   const escape = (value) =>
     String(value).replace(
