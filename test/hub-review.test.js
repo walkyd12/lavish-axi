@@ -16,14 +16,18 @@ async function clientHarness(board) {
   const elements = new Map();
   const listeners = new Map();
   function element() {
+    const handlers = new Map();
     return {
+      handlers,
       value: "",
       dataset: {},
       textContent: "",
       innerHTML: "",
       hidden: false,
       setAttribute() {},
-      addEventListener() {},
+      addEventListener(type, fn) {
+        handlers.set(type, fn);
+      },
       contains: () => false,
       matches: () => false,
       querySelectorAll: () => [],
@@ -66,9 +70,13 @@ async function clientHarness(board) {
   });
   vm.runInContext(await readFile(new URL("../src/hub-client.js", import.meta.url), "utf8"), context);
   return {
+    document,
     elements,
     requests,
     run: (code) => vm.runInContext(code, context),
+    async emit(id, type, target) {
+      await elements.get(id).handlers.get(type)?.({ target, preventDefault() {} });
+    },
     async dispatch(type, target) {
       for (const fn of listeners.get(type) || []) await fn({ target, preventDefault() {} });
     },
@@ -108,6 +116,91 @@ test("client save submits the peer origin captured before a background replaceme
   await h.dispatch("submit", { matches: () => true, dataset: { clientKey: "peer:team:abc" } });
   const request = h.requests.find((r) => r.init?.method === "PUT");
   assert.equal(JSON.parse(request.init.body).peer_origin, "https://original.example");
+});
+
+for (const action of ["close", "cancel", "reopen"]) {
+  test(`${action} uses the rendered card's peer origin after a background replacement`, async () => {
+    const h = await clientHarness({
+      key: "peer:team:abc",
+      title: "Original board",
+      source: "team",
+      peer_origin: "https://original.example",
+      status: action === "reopen" ? "ended" : "open",
+    });
+    await h.edit();
+    h.run(`fetch = async (url, init) => {
+      if (!init?.method) return {ok:true,json:async()=>({boards:[{key:"peer:team:abc",title:"Replacement",source:"team",peer_origin:"https://replacement.example"}]})};
+      return {ok:false,status:409,json:async()=>({})};
+    }`);
+    await h.run("refresh()");
+    assert.match(h.elements.get("boards").innerHTML, /Original board/);
+    h.run(
+      "globalThis.actionBodies = []; const previousFetch = fetch; fetch = async (url, init) => { if (init?.method) actionBodies.push(JSON.parse(init.body)); return previousFetch(url, init); }",
+    );
+    await h.emit("boards", "click", {
+      closest: () => ({ disabled: false, dataset: { act: action, key: "peer:team:abc" } }),
+    });
+    assert.equal(h.run("actionBodies[0].peer_origin"), "https://original.example");
+  });
+}
+
+test("explicit tab selection resets Include closed and keeps the search within the new tab", async () => {
+  const h = await clientHarness({ key: "a", title: "Open board", status: "open" });
+  h.elements.get("hubSearch").value = "spindle";
+  h.elements.get("includeClosed").checked = true;
+  await h.emit("tabCancelled", "click");
+  const query = new URL(h.requests.at(-1).url, "http://localhost").searchParams;
+  assert.equal(query.get("state"), "cancelled");
+  assert.equal(query.get("q"), "spindle");
+  assert.equal(h.elements.get("includeClosed").checked, false);
+});
+
+test("failed tab navigation stays empty with Retry and recovers within the selected tab", async () => {
+  const h = await clientHarness({ key: "a", title: "Open board", status: "open" });
+  h.run('showing = "closed"; beginFilterTransition(); fetch = async () => ({ok:false,status:503})');
+  await h.run("refresh({resetLimit:true})");
+  assert.doesNotMatch(h.elements.get("boards").innerHTML, /Open board|data-act=/);
+  assert.equal(h.elements.get("hubLoadError").hidden, false);
+  assert.equal(h.elements.get("hubEmpty").hidden, true);
+  h.run(
+    'fetch = async (url) => { globalThis.retryUrl = url; return {ok:true,json:async()=>({boards:[{key:"b",title:"Closed board",status:"ended"}]})}; }',
+  );
+  await h.emit("hubRetry", "click");
+  assert.equal(new URL(h.run("retryUrl"), "http://localhost").searchParams.get("state"), "closed");
+  assert.match(h.elements.get("boards").innerHTML, /Closed board/);
+  assert.equal(h.elements.get("hubLoadError").hidden, true);
+});
+
+test("notification picker replaces a focused destination and Send test uses the visible field", async () => {
+  const h = await clientHarness({ key: "a", status: "open" });
+  const field = {
+    value: "Legacy destination",
+    dataset: { notifyPerson: "Reviewer", notifyField: "send_to" },
+    matches: () => true,
+  };
+  const picker = { dataset: { notifyPick: "Reviewer" }, value: "dm" };
+  const status = { setAttribute() {} };
+  const row = {
+    dataset: { notifyRow: "Reviewer" },
+    querySelector: (selector) => (selector.includes("select") ? picker : selector.includes("input") ? field : status),
+    querySelectorAll: () => [field],
+  };
+  picker.closest = () => row;
+  const rows = h.elements.get("notifyRows");
+  rows.contains = () => true;
+  rows.querySelectorAll = () => [row];
+  h.run(
+    'notifySettings = {Reviewer:{tagged:false,done:false,send_to:"Legacy destination"}}; notifyDestinations = [{id:"dm",label:"Reviewer DM",ready:true}]',
+  );
+  // Keep the field focused while the picker changes, as with a delayed provider response.
+  h.document.activeElement = field;
+  await h.emit("notifyRows", "change", picker);
+  assert.equal(field.value, "dm");
+  field.value = "https://hooks.example/visible";
+  const button = { dataset: { notifyTest: "Reviewer" }, closest: () => row };
+  await h.emit("notifyRows", "click", { closest: () => button });
+  const request = h.requests.find((r) => r.url === "/api/hub/notifications/test");
+  assert.equal(JSON.parse(request.init.body).send_to, field.value);
 });
 
 test("compact hub omits decoration and offers a plain theme", () => {

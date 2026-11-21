@@ -381,6 +381,7 @@ ${themed.style}
 <ol class="boards" id="boards" aria-live="polite"></ol>
 <div class="load-more-wrap" id="hubMoreWrap" hidden><button type="button" class="act primary" id="hubMore">Load more</button></div>
 <p class="empty" id="hubEmpty" hidden></p>
+<p class="empty" id="hubLoadError" role="alert" hidden>Could not load boards. <button type="button" class="act" id="hubRetry">Retry</button></p>
 <button type="button" class="act" id="showOlder" hidden>Show older boards</button>
 <datalist id="clientSuggestions"></datalist>
 <p class="foot">Updated <span id="hubUpdated"></span>. Close keeps the board's file and its conversation; Reopen brings it back. Lavish Editor</p>

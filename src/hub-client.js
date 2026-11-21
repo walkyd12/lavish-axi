@@ -21,6 +21,9 @@ let hasMore = Boolean(initial.has_more);
 let loadingMore = false;
 let filterEpoch = 0;
 let filterPending = false;
+let filterFailed = false;
+// Actions must use the board actually shown, even if an editor delays a live repaint.
+const renderedBoards = new Map();
 let pendingWsRefreshAfterLoadMore = false;
 /** @type {Record<string, { tagged: boolean, done: boolean, send_to: string }>} */
 let notifySettings =
@@ -68,6 +71,8 @@ const list = /** @type {HTMLOListElement} */ (document.getElementById("boards"))
 const moreWrap = /** @type {HTMLDivElement | null} */ (document.getElementById("hubMoreWrap"));
 const moreBtn = /** @type {HTMLButtonElement | null} */ (document.getElementById("hubMore"));
 const empty = /** @type {HTMLParagraphElement} */ (document.getElementById("hubEmpty"));
+const loadError = document.getElementById("hubLoadError");
+const retry = document.getElementById("hubRetry");
 const note = /** @type {HTMLParagraphElement} */ (document.getElementById("hubNote"));
 const peerNote = /** @type {HTMLParagraphElement} */ (document.getElementById("peerNote"));
 const pill = /** @type {HTMLSpanElement} */ (document.getElementById("hubPill"));
@@ -413,6 +418,17 @@ function destinationOptions(value) {
   return `<option value="">Choose a destination…</option>${notifyDestinations.map((item) => `<option value="${escapeHtml(item.id)}"${value === item.id ? " selected" : ""}>${escapeHtml(item.label)} · ${item.ready ? "Ready" : "Not connected"}</option>`).join("")}`;
 }
 
+function syncDestinationRow(row, value) {
+  const statusElement = row.querySelector(".destination-status");
+  const status = destinationStatus(value);
+  if (statusElement) {
+    statusElement.textContent = status.label;
+    statusElement.setAttribute("data-ready", String(status.ready));
+  }
+  const picker = row.querySelector("select[data-notify-pick]");
+  if (picker) picker.innerHTML = destinationOptions(value);
+}
+
 function notifyRowHtml(person, cfg) {
   const safeName = escapeHtml(person);
   const index = Object.keys(notifySettings).indexOf(person);
@@ -469,14 +485,6 @@ function renderNotificationsPanel() {
       if (temp.firstElementChild) notifyRows.appendChild(temp.firstElementChild);
       continue;
     }
-    const statusElement = existing.querySelector(".destination-status");
-    const status = destinationStatus(cfg.send_to);
-    if (statusElement) {
-      statusElement.textContent = status.label;
-      statusElement.setAttribute("data-ready", String(status.ready));
-    }
-    const picker = /** @type {HTMLSelectElement | null} */ (existing.querySelector("select[data-notify-pick]"));
-    if (picker) picker.innerHTML = destinationOptions(cfg.send_to);
     for (const input of /** @type {NodeListOf<HTMLInputElement>} */ (
       existing.querySelectorAll("input[data-notify-field]")
     )) {
@@ -487,6 +495,8 @@ function renderNotificationsPanel() {
         input.value = String(cfg.send_to || "");
       }
     }
+    const field = /** @type {HTMLInputElement | null} */ (existing.querySelector('input[data-notify-field="send_to"]'));
+    syncDestinationRow(existing, field?.value.trim() || "");
   }
 }
 
@@ -536,6 +546,7 @@ function beginFilterTransition() {
   clientDraft = "";
   filterEpoch += 1;
   filterPending = true;
+  filterFailed = false;
   hasMore = false;
   cancelLoadMore();
   activeFetchController?.abort();
@@ -591,9 +602,12 @@ function render() {
 
   const query = search.value.trim();
   const searching = Boolean(query || tagFilter.value);
-  const pinned = filterPending ? [] : needsYouBoards;
+  const hideBoards = filterPending || filterFailed;
+  const pinned = hideBoards ? [] : needsYouBoards;
   const pinnedKeys = new Set(pinned.map((board) => board.key));
-  const remaining = (filterPending ? [] : boards).filter((board) => !pinnedKeys.has(board.key));
+  const remaining = (hideBoards ? [] : boards).filter((board) => !pinnedKeys.has(board.key));
+  renderedBoards.clear();
+  for (const board of [...pinned, ...remaining]) renderedBoards.set(board.key, { ...board });
   if (pinnedList) pinnedList.innerHTML = pinned.map(boardHtml).join("");
   if (pinnedSection) pinnedSection.hidden = pinned.length === 0;
   if (pinnedHint) pinnedHint.textContent = `${needsYouTotal} ${needsYouTotal === 1 ? "board" : "boards"}`;
@@ -617,9 +631,13 @@ function render() {
   if (resultCount)
     resultCount.textContent = filterPending
       ? "Searching…"
-      : `${totalMatching} ${totalMatching === 1 ? "board" : "boards"} · ${query && includeClosed?.checked ? "Including closed and cancelled" : showing === "open" ? "Open" : showing === "needs-you" ? "Needs you" : showing === "closed" ? "Closed" : "Cancelled"}${(showing === "closed" || showing === "cancelled") && !showOlderBoards && !query ? " · Last 14 days" : ""}`;
+      : filterFailed
+        ? "Could not load boards."
+        : `${totalMatching} ${totalMatching === 1 ? "board" : "boards"} · ${query && includeClosed?.checked ? "Including closed and cancelled" : showing === "open" ? "Open" : showing === "needs-you" ? "Needs you" : showing === "closed" ? "Closed" : "Cancelled"}${(showing === "closed" || showing === "cancelled") && !showOlderBoards && !query ? " · Last 14 days" : ""}`;
   if (showOlder)
-    showOlder.hidden = !(showing === "closed" || showing === "cancelled") || showOlderBoards || Boolean(query);
+    showOlder.hidden =
+      hideBoards || !(showing === "closed" || showing === "cancelled") || showOlderBoards || Boolean(query);
+  if (loadError) loadError.hidden = !filterFailed;
   renderFilters();
   window.dispatchEvent(new CustomEvent("lavish:render-metadata"));
   for (const details of document.querySelectorAll?.(".board-details") || []) {
@@ -634,7 +652,7 @@ function render() {
   }
 
   if (moreWrap && moreBtn) {
-    const showMore = hasMore && !filterPending;
+    const showMore = hasMore && !hideBoards;
     moreWrap.hidden = !showMore;
     moreBtn.disabled = loadingMore;
     const visibleCount = new Set([...boards, ...pinned].map((board) => board.key)).size;
@@ -645,7 +663,7 @@ function render() {
         : "Load more";
   }
 
-  empty.hidden = boards.length > 0 || pinned.length > 0 || filterPending;
+  empty.hidden = boards.length > 0 || pinned.length > 0 || hideBoards;
   empty.textContent = searching
     ? "No matching boards."
     : showing === "needs-you"
@@ -727,6 +745,7 @@ async function refresh({ resetLimit = false } = {}) {
     const data = await response.json();
     if (activeFetchController !== controller || reqEpoch !== filterEpoch) return;
     filterPending = false;
+    filterFailed = false;
     applyViewData(data);
     boards = Array.isArray(data.boards) ? data.boards : [];
     peers = Array.isArray(data.peers) ? data.peers : [];
@@ -749,10 +768,16 @@ async function refresh({ resetLimit = false } = {}) {
     )
       render();
   } catch (error) {
-    if (/** @type {any} */ (error)?.name === "AbortError" || reqEpoch !== filterEpoch) return;
+    if (
+      /** @type {any} */ (error)?.name === "AbortError" ||
+      activeFetchController !== controller ||
+      reqEpoch !== filterEpoch
+    )
+      return;
+    filterFailed = filterPending || filterFailed;
     filterPending = false;
     render();
-    showNote("Lavish is not answering. The list below may be out of date.", "offline");
+    showNote(filterFailed ? "" : "Lavish is not answering. The list below may be out of date.", "offline");
   }
 }
 
@@ -1015,6 +1040,10 @@ notifyRows?.addEventListener("change", (event) => {
     const timer = sendToSaveTimers.get(pickedPerson);
     if (timer) clearTimeout(timer);
     sendToSaveTimers.delete(pickedPerson);
+    const field = /** @type {HTMLInputElement | null} */ (
+      select.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
+    );
+    if (field) field.value = select.value;
     notifySettings[pickedPerson] = { ...notifySettings[pickedPerson], send_to: select.value };
     void queueNotifyMutation({ patch: { person: pickedPerson, send_to: select.value } }, { rerender: true });
     renderNotificationsPanel();
@@ -1046,6 +1075,8 @@ notifyRows?.addEventListener("input", (event) => {
   if (!input || !person || field !== "send_to" || !Object.hasOwn(notifySettings, person)) return;
   const cleaned = input.value.trim();
   notifySettings[person] = { ...notifySettings[person], send_to: cleaned };
+  const row = input.closest("[data-notify-row]");
+  if (row) syncDestinationRow(row, cleaned);
   const existingTimer = sendToSaveTimers.get(person);
   if (existingTimer) clearTimeout(existingTimer);
   const timer = setTimeout(() => {
@@ -1061,7 +1092,10 @@ notifyRows?.addEventListener("click", async (event) => {
   const testPerson = testButton?.dataset.notifyTest;
   if (testButton && testPerson && !testButton.disabled && Object.hasOwn(notifySettings, testPerson)) {
     testButton.disabled = true;
-    const sendTo = notifySettings[testPerson].send_to;
+    const field = /** @type {HTMLInputElement | null} */ (
+      testButton.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
+    );
+    const sendTo = field?.value.trim() ?? notifySettings[testPerson].send_to;
     try {
       await notifySaveChain;
       const response = await fetch("/api/hub/notifications/test", {
@@ -1119,11 +1153,11 @@ function handleBoardClick(event) {
   const target = /** @type {HTMLElement} */ (event.target);
   const button = /** @type {HTMLButtonElement | null} */ (target.closest?.("button[data-act]") || null);
   if (!button || button.disabled) return;
-  const board = [...boards, ...needsYouBoards].find((candidate) => candidate.key === button.dataset.key);
+  const board = renderedBoards.get(button.dataset.key);
   if (!board) return;
-  if (button.dataset.act === "close") closeBoard(board);
-  else if (button.dataset.act === "cancel") cancelBoard(board);
-  else if (button.dataset.act === "reopen") reopenBoard(board);
+  if (button.dataset.act === "close") return closeBoard(board);
+  else if (button.dataset.act === "cancel") return cancelBoard(board);
+  else if (button.dataset.act === "reopen") return reopenBoard(board);
   else if (button.dataset.act === "history" && !board.source) showHistory(board);
 }
 list.addEventListener("click", handleBoardClick);
@@ -1131,12 +1165,17 @@ pinnedList?.addEventListener("click", handleBoardClick);
 moreBtn?.addEventListener("click", () => {
   void loadMore();
 });
+retry?.addEventListener("click", () => {
+  beginFilterTransition();
+  return refresh({ resetLimit: true });
+});
 
 function switchTab(nextTab) {
   if (showing === nextTab && !search.value.trim() && !tagFilter.value) return;
   clearTimeout(searchDebounceTimer);
   searchDebounceTimer = undefined;
   showing = nextTab;
+  if (includeClosed) includeClosed.checked = false;
   showOlderBoards = false;
   beginFilterTransition();
   void refresh({ resetLimit: true });
