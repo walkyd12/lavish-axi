@@ -1922,7 +1922,8 @@ export async function serve({
           res.status(404).json({ error: "peer board not found" });
           return;
         }
-        if (req.body?.peer_origin !== target.peer.origin) {
+        // peer_origin is optional for older tabs/API callers; when sent, a changed mapping fails closed.
+        if (req.body?.peer_origin !== undefined && req.body?.peer_origin !== target.peer.origin) {
           res.status(409).json({ error: "peer hub changed; refresh before trying again" });
           return;
         }
@@ -1960,7 +1961,8 @@ export async function serve({
           res.status(404).json({ error: "peer board not found" });
           return;
         }
-        if (req.body?.peer_origin !== target.peer.origin) {
+        // peer_origin is optional for older tabs/API callers; when sent, a changed mapping fails closed.
+        if (req.body?.peer_origin !== undefined && req.body?.peer_origin !== target.peer.origin) {
           res.status(409).json({ error: "peer hub changed; refresh before trying again" });
           return;
         }
@@ -1997,7 +1999,8 @@ export async function serve({
           res.status(404).json({ error: "peer board not found" });
           return;
         }
-        if (req.body?.peer_origin !== target.peer.origin) {
+        // peer_origin is optional for older tabs/API callers; when sent, a changed mapping fails closed.
+        if (req.body?.peer_origin !== undefined && req.body?.peer_origin !== target.peer.origin) {
           res.status(409).json({ error: "peer hub changed; refresh before trying again" });
           return;
         }

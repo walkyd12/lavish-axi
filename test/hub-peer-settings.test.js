@@ -187,7 +187,8 @@ test("peer lifecycle actions reject a stale origin after a peer name is reused",
       assert.equal((await post(base, { add: { name: "remote", origin: replacement } })).status, 200);
       const before = await readFile(path.join(dir, "replacement", "state.json"), "utf8");
       const originalBefore = await readFile(path.join(dir, "original", "state.json"), "utf8");
-      for (const body of [{ peer_origin: displayed.peer_origin }, {}, { peer_origin: null }, { peer_origin: {} }]) {
+      // An omitted peer_origin (older tabs/API callers) is allowed; a sent stale or malformed one fails closed.
+      for (const body of [{ peer_origin: displayed.peer_origin }, { peer_origin: null }, { peer_origin: {} }]) {
         assert.equal(
           (await request(base, `${route}/${action}`, body)).status,
           409,
