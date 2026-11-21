@@ -1638,6 +1638,8 @@ body.lavish {
   gap: 10px;
 }
 .approval-banner {
+  min-width: 0;
+  overflow-wrap: anywhere;
   flex-wrap: wrap;
 }
 .approval-author-wrap {
@@ -2179,4 +2181,22 @@ body.layout-gate-active iframe#artifact {
 }
 .whiteboard-error[hidden] {
   display: none;
+}
+
+.approval-preview {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  flex-basis: 100%;
+  margin: 0;
+  max-height: 40vh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
 }

@@ -410,6 +410,7 @@ async function createChromeHarness({
   let clockNow = Date.now();
   const context = {
     AbortController,
+    AbortSignal,
     URLSearchParams,
     clearTimeout: fakeClearTimeout,
     console,
@@ -10050,6 +10051,7 @@ test("confirmation displays the exact submitted action instead of an artifact la
     selector: "#send-approved-email",
   });
   assert.equal(chrome.element("approvalBannerText").textContent, prompt);
+  await flushPromises();
   chrome.element("approvalConfirm").click({ isTrusted: true });
   await flushPromises();
   assert.equal(calls.length, 1);
@@ -10079,4 +10081,73 @@ test("workflow success clears sent composer chips while keeping images added dur
   ]);
   assert.doesNotMatch(chrome.element("chatAttachments").innerHTML, /sent\.png/);
   assert.match(chrome.element("chatAttachments").innerHTML, /new\.png/);
+});
+
+test("approval preview uses server textContent, waits for response, and ignores iframe preview fields", async () => {
+  /** @type {(response: any) => void} */
+  let finishPreview = () => {
+    throw new Error("Preview request did not start");
+  };
+  let approvalCount = 0;
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialViewerName: "Walker" },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/approval-preview"))
+        return new Promise((resolve) => {
+          finishPreview = resolve;
+        });
+      if (String(url).endsWith("/approval")) approvalCount++;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.sendFrameMessage({
+    type: "lavish:requestApproval",
+    artifact_load_token: chrome.artifactLoadToken(),
+    prompt: "Confirm this action",
+    preview: "FAKE BODY",
+    summary: "FAKE BODY",
+    author: "Walker",
+  });
+  assert.equal(chrome.element("approvalPreview").textContent, "Loading preview…");
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(approvalCount, 0);
+  const exact = "To: real@example.com\nSubject: Pinned\n\n<script>Literal body</script>\nExact second line";
+  assert.ok(finishPreview);
+  finishPreview({ ok: true, json: async () => ({ preview: exact }) });
+  await flushPromises();
+  assert.equal(chrome.element("approvalPreview").textContent, exact);
+  assert.equal(chrome.element("approvalConfirm").disabled, false);
+  assert.equal(approvalCount, 0, "preview response never approves");
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(approvalCount, 1);
+});
+
+test("failed approval preview stays explicit and still needs a separate trusted tap", async () => {
+  let approvals = 0;
+  const chrome = await createChromeHarness({
+    sessionData: { ...defaultSessionData, initialViewerName: "Walker" },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/approval-preview")) throw new Error("Preview failed");
+      if (String(url).endsWith("/approval")) approvals++;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.sendFrameMessage({
+    type: "lavish:requestApproval",
+    artifact_load_token: chrome.artifactLoadToken(),
+    prompt: "Confirm this action",
+    preview: "FAKE",
+    author: "Walker",
+  });
+  await flushPromises();
+  assert.equal(chrome.element("approvalPreview").textContent, "Preview unavailable");
+  assert.equal(approvals, 0);
+  chrome.element("approvalConfirm").click({ isTrusted: false });
+  await flushPromises();
+  assert.equal(approvals, 0);
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(approvals, 1);
 });
