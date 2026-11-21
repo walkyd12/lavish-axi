@@ -1,9 +1,10 @@
 /* global document, location, window */
-// The Lavish hub page (src/hub.js renders the shell). It lists every board from /api/hub, refreshes
-// on a short interval, and drives Open, Close, Reopen, and the conversation view. Served as a raw
-// file, like chrome-client.js, so it imports nothing.
+// The Lavish hub page (src/hub.js renders the shell). It bootstraps from `#hub-data`, stays synced
+// over the `/events/hub` WebSocket (zero polling timers), and drives Open, Close, Cancel, Reopen,
+// and the conversation view. Served as a raw file, like chrome-client.js, so it imports nothing.
 
-const REFRESH_MS = 10_000;
+const HUB_WS_BACKOFF_MS = [500, 1000, 2000, 5000];
+const HUB_EVENT_DEBOUNCE_MS = 60;
 const dataElement = document.getElementById("hub-data");
 const initial = JSON.parse(dataElement?.textContent || "{}");
 let boards = Array.isArray(initial.boards) ? initial.boards : [];
@@ -13,7 +14,11 @@ let showing = "open";
 /** @type {Set<string>} */
 const busy = new Set();
 /** @type {ReturnType<typeof setTimeout> | undefined} */
-let refreshTimer;
+let eventRefreshTimer;
+/** @type {ReturnType<typeof setTimeout> | undefined} */
+let wsReconnectTimer;
+let wsReconnectAttempt = 0;
+let sawWsDisconnect = false;
 
 const list = /** @type {HTMLOListElement} */ (document.getElementById("boards"));
 const empty = /** @type {HTMLParagraphElement} */ (document.getElementById("hubEmpty"));
@@ -294,7 +299,8 @@ function showNote(text, tone = "") {
 }
 
 async function refresh() {
-  clearTimeout(refreshTimer);
+  clearTimeout(eventRefreshTimer);
+  eventRefreshTimer = undefined;
   try {
     const response = await fetch("/api/hub", { cache: "no-store" });
     if (!response.ok) throw new Error("hub request failed: " + response.status);
@@ -306,9 +312,55 @@ async function refresh() {
     if (!list.contains(document.activeElement) || !document.activeElement?.matches("input")) render();
   } catch {
     showNote("Lavish is not answering. The list below may be out of date.", "offline");
-  } finally {
-    refreshTimer = setTimeout(refresh, REFRESH_MS);
   }
+}
+
+function scheduleEventRefresh() {
+  if (eventRefreshTimer) return;
+  eventRefreshTimer = setTimeout(() => {
+    eventRefreshTimer = undefined;
+    void refresh();
+  }, HUB_EVENT_DEBOUNCE_MS);
+}
+
+function connectHubEvents() {
+  if (typeof WebSocket !== "function") return;
+  clearTimeout(wsReconnectTimer);
+  wsReconnectTimer = undefined;
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  let socket;
+  try {
+    socket = new WebSocket(protocol + "//" + location.host + "/events/hub");
+  } catch {
+    const delay = HUB_WS_BACKOFF_MS[Math.min(wsReconnectAttempt, HUB_WS_BACKOFF_MS.length - 1)];
+    wsReconnectAttempt += 1;
+    wsReconnectTimer = setTimeout(connectHubEvents, delay);
+    return;
+  }
+  socket.addEventListener("open", () => {
+    wsReconnectAttempt = 0;
+    if (sawWsDisconnect) {
+      sawWsDisconnect = false;
+      void refresh();
+    }
+  });
+  socket.addEventListener("message", (event) => {
+    try {
+      const msg = JSON.parse(String(event.data || ""));
+      if (msg && (msg.type === "hub-event" || msg.type === "hub-refresh")) {
+        scheduleEventRefresh();
+      }
+    } catch {
+      // ignore malformed frames
+    }
+  });
+  socket.addEventListener("error", () => {});
+  socket.addEventListener("close", () => {
+    sawWsDisconnect = true;
+    const delay = HUB_WS_BACKOFF_MS[Math.min(wsReconnectAttempt, HUB_WS_BACKOFF_MS.length - 1)];
+    wsReconnectAttempt += 1;
+    wsReconnectTimer = setTimeout(connectHubEvents, delay);
+  });
 }
 
 async function closeBoard(board) {
@@ -460,4 +512,4 @@ window.addEventListener("lavish:metadata-saved", (event) => {
   render();
 });
 render();
-refreshTimer = setTimeout(refresh, REFRESH_MS);
+connectHubEvents();

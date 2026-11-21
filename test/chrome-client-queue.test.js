@@ -9968,3 +9968,52 @@ test("the layout menu item cycles Auto, Phone, Desktop and is remembered on the 
   });
   assert.equal(later.element("layoutToggleText").textContent, "Layout: Phone");
 });
+
+test("lavish:requestApproval never auto-submits and requires a trusted human click in the outer chrome", async () => {
+  const approvalCalls = [];
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/index.html",
+    sessionData: {
+      ...defaultSessionData,
+      chromeLoadToken: "chrome-cap-token-1",
+    },
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/approval")) {
+        approvalCalls.push(JSON.parse(String(init?.body || "{}")));
+        return {
+          ok: true,
+          json: async () => ({ status: "approved", chat: [], ack_ids: [], chat_revision: 1 }),
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:requestApproval",
+    artifact_load_token: chrome.artifactLoadToken(),
+    prompt: "Send approved draft from Gibson [ref r123456 sha256 " + "c".repeat(64) + "]: ok",
+    label: "Send approved draft",
+    summary: "Approve exact pinned draft",
+    author: "Gibson",
+    selector: "#send-approved-email",
+  });
+  assert.equal(approvalCalls.length, 0, "iframe message alone never submits an approval");
+  assert.equal(chrome.element("approvalBanner").hidden, false);
+
+  // Synthetic untrusted clicks (`isTrusted: false` or omitted) are ignored.
+  chrome.element("approvalConfirm").click({ isTrusted: false });
+  chrome.element("approvalConfirm").click({});
+  await flushPromises();
+  assert.equal(approvalCalls.length, 0, "untrusted synthetic clicks never submit /approval");
+
+  // Reviewer edits their name in the outer chrome and clicks Confirm with a real user gesture (`isTrusted: true`).
+  chrome.element("approvalAuthorInput").value = "Walker";
+  chrome.element("approvalConfirm").click({ isTrusted: true });
+  await flushPromises();
+  assert.equal(approvalCalls.length, 1);
+  assert.equal(approvalCalls[0].author, "Walker");
+  assert.equal(approvalCalls[0].chrome_load_token, "chrome-cap-token-1");
+  assert.match(approvalCalls[0].prompt, /^Send approved draft from Walker \[/);
+  assert.equal(chrome.element("approvalBanner").hidden, true);
+});

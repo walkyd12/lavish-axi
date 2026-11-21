@@ -249,6 +249,7 @@ export class SessionStore {
     // snapshots and failures are preserved. Attachments are still re-derived through the resolver,
     // because restore re-enters the same trust boundary.
     const restoring = options.restore === true;
+    const trustedApproval = options.trustedApproval === true && !restoring;
     const alreadyEnded = session.status === "ended";
     // A session already ended by someone else (an agent's `lavish-axi end`, or the user in
     // another tab) must not accept a further batch as if it were queued for delivery: no agent
@@ -261,7 +262,7 @@ export class SessionStore {
     if (alreadyEnded && !restoring) {
       return { ended: true, ended_by: session.ended_by };
     }
-    let normalized = prompts.map(normalizePrompt);
+    let normalized = prompts.map((item) => normalizePrompt(item, { restoring, trustedApproval }));
     if (!restoring) {
       const acknowledgedIds = new Set(
         [
@@ -464,6 +465,18 @@ export class SessionStore {
         artifact_load_token: activeLoad?.artifactLoadToken || "",
         artifact_load_sequence: activeLoad?.requestSequence || 0,
       };
+    });
+  }
+
+  async verifyReviewerHandoff(key, handoffToken) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return false;
+      this.#activeArtifactLoad(session);
+      const activeHandoffToken = this.chromeLoadContexts.get(key) || "";
+      const provided = typeof handoffToken === "string" ? handoffToken.trim() : "";
+      return Boolean(activeHandoffToken && provided && provided === activeHandoffToken);
     });
   }
 
@@ -952,7 +965,7 @@ function applyTranscriptBound(session) {
 // Returns `{ prompt, malformed }`: `malformed` is non-empty when the payload's
 // `attachments` field exists but cannot be honored as written, which fails the
 // whole batch rather than being normalized away (C4, see queuePrompts).
-function normalizePrompt(prompt) {
+function normalizePrompt(prompt, { restoring = false, trustedApproval = false } = {}) {
   const normalized = {
     uid: String(prompt.uid || ""),
     prompt: String(prompt.prompt || ""),
@@ -964,9 +977,16 @@ function normalizePrompt(prompt) {
   if (promptId) normalized.prompt_id = promptId;
   const author = normalizePromptAuthor(prompt.author);
   if (author) normalized.author = author;
-  if (prompt.via === "cli") normalized.via = "cli";
-  if ((normalized.via === "cli" || normalized.author) && normalized.tag === "send_approval") {
-    normalized.tag = "message";
+  if (trustedApproval) {
+    normalized.tag = "send_approval";
+    normalized.via = "chrome_approval";
+    normalized.user_gesture = true;
+  } else if (restoring && prompt.via === "chrome_approval" && prompt.user_gesture === true && author) {
+    normalized.via = "chrome_approval";
+    normalized.user_gesture = true;
+  } else {
+    if (prompt.via === "cli") normalized.via = "cli";
+    if (normalized.tag === "send_approval") normalized.tag = "message";
   }
   const target = normalizeTarget(prompt.target);
   if (target) normalized.target = target;

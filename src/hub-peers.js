@@ -12,11 +12,12 @@ import { boardWorkflowState } from "./board-metadata.js";
 export const HUB_PEERS_ENV = "LAVISH_AXI_HUB_PEERS";
 export const PEER_KEY_PREFIX = "peer:";
 export const PEER_TIMEOUT_MS = 2000;
-// After a failure, a peer is skipped without a request for this long, so a dead peer costs the
-// hub's 10-second refresh nothing instead of a 2-second wait every time.
+// After a failure, a peer is skipped without a request for this long, so a dead peer costs a hub
+// refresh nothing instead of a 2-second wait every time.
 export const PEER_RETRY_AFTER_MS = 30_000;
-export const PEER_MAX_BYTES = 1024 * 1024;
-const PEER_MAX_BOARDS = 500;
+export const PEER_MAX_BOARDS = 500;
+// Sized for PEER_MAX_BOARDS at the 64 KiB per-board search_text ceiling plus metadata and JSON escaping.
+export const PEER_MAX_BYTES = 64 * 1024 * 1024;
 
 const PEER_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 const BOARD_KEY = /^[A-Za-z0-9_-]{1,128}$/;
@@ -160,6 +161,9 @@ export function sanitizePeerHubEvent(peer, rawEvent) {
   };
   const seq = Number(rawEvent.seq);
   if (Number.isInteger(seq) && seq > 0) out.peer_seq = seq;
+  if (typeof rawEvent.instance_id === "string" && rawEvent.instance_id.trim()) {
+    out.peer_instance = text(rawEvent.instance_id.trim(), 64);
+  }
   if (event === "tag_change") {
     out.added = sanitizeTagList(rawEvent.added);
     out.removed = sanitizeTagList(rawEvent.removed);
@@ -170,7 +174,10 @@ export function sanitizePeerHubEvent(peer, rawEvent) {
       tag: text(prompt?.tag, 64),
       selector: text(prompt?.selector, 512),
       text: text(prompt?.text, 256),
+      ...(prompt?.prompt_id ? { prompt_id: text(prompt.prompt_id, 128) } : {}),
       ...(prompt?.author ? { author: text(prompt.author, 80) } : {}),
+      ...(prompt?.via === "cli" || prompt?.via === "chrome_approval" ? { via: prompt.via } : {}),
+      ...(prompt?.user_gesture === true ? { user_gesture: true } : {}),
     }));
   }
   if (event === "board_action") {
@@ -179,6 +186,17 @@ export function sanitizePeerHubEvent(peer, rawEvent) {
     if (rawEvent.author) out.author = text(rawEvent.author, 80);
   }
   return out;
+}
+
+async function fetchOnceOrRetryStaleSocket(fetchImpl, url, init) {
+  try {
+    return await fetchImpl(url, init);
+  } catch (error) {
+    if (/** @type {any} */ (error)?.cause?.code === "UND_ERR_SOCKET") {
+      return fetchImpl(url, init);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -200,18 +218,22 @@ export async function relayPeerHubAction(
     return { ok: false, status: 400, payload: { error: "invalid peer lifecycle action" } };
   }
   try {
-    const response = await fetchImpl(`${peer.origin}/api/hub/${encodeURIComponent(peerKey)}/${action}`, {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-        origin: peer.origin,
+    const response = await fetchOnceOrRetryStaleSocket(
+      fetchImpl,
+      `${peer.origin}/api/hub/${encodeURIComponent(peerKey)}/${action}`,
+      {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          origin: peer.origin,
+        },
+        body: "{}",
+        redirect: "error",
+        credentials: "omit",
+        signal: AbortSignal.timeout(timeoutMs),
       },
-      body: "{}",
-      redirect: "error",
-      credentials: "omit",
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    );
     const rawBody = await readCapped(response, maxBytes).catch(() => "");
     let parsed = null;
     try {
@@ -377,7 +399,7 @@ export async function fetchPeerBoards(
 ) {
   try {
     // `peers=0` asks the peer for its own boards only, so two hubs that list each other never loop.
-    const response = await fetchImpl(`${peer.origin}/api/hub?peers=0`, {
+    const response = await fetchOnceOrRetryStaleSocket(fetchImpl, `${peer.origin}/api/hub?peers=0`, {
       headers: { accept: "application/json" },
       redirect: "error",
       credentials: "omit",
@@ -406,22 +428,40 @@ export async function fetchPeerBoards(
  * The hub's view of every peer, with a short back-off for a peer that just failed.
  *
  * @param {HubPeer[]} peers
- * @param {{ timeoutMs?: number, retryAfterMs?: number, fetchImpl?: typeof fetch, now?: () => number }} [options]
+ * @param {{ timeoutMs?: number, retryAfterMs?: number, fetchImpl?: typeof fetch, now?: () => number, isStreamLive?: (peerName: string) => boolean }} [options]
  */
 export function createPeerBoardSource(
   peers,
-  { timeoutMs = PEER_TIMEOUT_MS, retryAfterMs = PEER_RETRY_AFTER_MS, fetchImpl = fetch, now = Date.now } = {},
+  {
+    timeoutMs = PEER_TIMEOUT_MS,
+    retryAfterMs = PEER_RETRY_AFTER_MS,
+    fetchImpl = fetch,
+    now = Date.now,
+    isStreamLive = undefined,
+  } = {},
 ) {
   /** @type {Map<string, { until: number, error: string }>} */
   const failed = new Map();
-  return async function collect() {
+  /** @type {Map<string, { boards: any[], dirty: boolean }>} */
+  const cached = new Map();
+  const collect = async function collect() {
     const results = await Promise.all(
       peers.map(async (peer) => {
+        const key = peer.name.toLowerCase();
+        const entry = cached.get(key);
+        if (entry && !entry.dirty && typeof isStreamLive === "function" && isStreamLive(peer.name)) {
+          return { peer, ok: true, boards: entry.boards, error: "" };
+        }
         const backoff = failed.get(peer.name);
         if (backoff && now() < backoff.until) return { peer, ok: false, boards: [], error: backoff.error };
         const result = await fetchPeerBoards(peer, { timeoutMs, fetchImpl });
-        if (result.ok) failed.delete(peer.name);
-        else failed.set(peer.name, { until: now() + retryAfterMs, error: result.error });
+        if (result.ok) {
+          failed.delete(peer.name);
+          cached.set(key, { boards: result.boards, dirty: false });
+        } else {
+          cached.delete(key);
+          failed.set(peer.name, { until: now() + retryAfterMs, error: result.error });
+        }
         return { peer, ...result };
       }),
     );
@@ -435,4 +475,19 @@ export function createPeerBoardSource(
       })),
     };
   };
+  /** @param {string} [peerName] */
+  collect.invalidate = (peerName) => {
+    if (!peerName) {
+      for (const entry of cached.values()) entry.dirty = true;
+      failed.clear();
+      return;
+    }
+    const key = String(peerName).toLowerCase();
+    const entry = cached.get(key);
+    if (entry) entry.dirty = true;
+    for (const candidate of failed.keys()) {
+      if (candidate.toLowerCase() === key) failed.delete(candidate);
+    }
+  };
+  return collect;
 }
