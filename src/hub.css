@@ -1226,3 +1226,8 @@ button.armed {
   overflow-wrap: normal;
   word-break: normal;
 }
+
+/* Whole card opens the board (links and buttons inside keep their own action). */
+li.board:has(a.act.primary[href]) {
+  cursor: pointer;
+}
