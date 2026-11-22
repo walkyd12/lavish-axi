@@ -130,22 +130,14 @@ span.board-tag:not(:has(button)) {
   flex-basis: 100%;
   max-width: 600px;
 }
-/* Details opens as a drop-down under its own toggle; the toggle never moves (Zach 2026-11-22). */
-.chrome-board-metadata .metadata-details {
-  position: relative;
+/* Details opens below the header row while its toggle stays in place (Zach 2026-11-22). The open
+   <details> stops being a box, so its summary keeps its spot and the content wraps to a full row. */
+.chrome-board-metadata .metadata-details[open] {
+  display: contents;
 }
 .chrome-board-metadata .metadata-details[open] > .metadata-dropdown {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  z-index: 20;
-  width: max-content;
-  max-width: min(600px, calc(100vw - 32px));
-  padding: 6px 10px;
-  background: var(--metadata-surface, #fff);
-  border: 1px solid var(--metadata-border, rgba(0, 0, 0, 0.15));
-  border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  flex-basis: 100%;
+  order: 99;
   overflow-wrap: anywhere;
 }
 .chrome-board-metadata .metadata-dropdown .board-provenance {
