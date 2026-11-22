@@ -249,7 +249,8 @@ main.wrap {
   margin: 0;
   letter-spacing: -0.01em;
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .st {
   flex: 0 0 auto;
@@ -292,7 +293,8 @@ main.wrap {
   font: 12px/1.4 var(--mono);
   color: var(--body);
   margin: 6px 0 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .acts {
   display: flex;
@@ -356,7 +358,8 @@ main.wrap {
 .history-head h2 {
   font-size: 24px;
   line-height: 1.1;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .eyebrow {
   font: 700 12px/1.3 var(--sans);
@@ -393,7 +396,8 @@ main.wrap {
   padding: 10px 13px;
   font-size: 15px;
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .msg p {
   margin: 0 0 6px;
@@ -497,7 +501,8 @@ main.wrap {
 .client-chip {
   flex: 0 0 auto;
   max-width: 100%;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
   padding: 8px 12px;
   min-height: 44px;
   border-radius: 10px;
@@ -668,7 +673,8 @@ summary:focus-visible {
   }
   .mark {
     font-size: 26px;
-    overflow-wrap: anywhere;
+    overflow-wrap: normal;
+    word-break: normal;
   }
   .notify-toggle {
     min-height: 44px;
@@ -755,7 +761,8 @@ summary:focus-visible {
 }
 .notify-person-name {
   font: 700 16px/1.25 var(--sans);
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .notify-remove {
   flex: 0 0 auto;
@@ -856,7 +863,8 @@ summary:focus-visible {
   align-items: center;
 }
 .peer-url {
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .peer-status[data-tone="good"] {
   color: var(--good);
@@ -906,8 +914,8 @@ summary:focus-visible {
 .tabs {
   padding: 4px 0;
   gap: 18px;
-  flex-wrap: nowrap;
-  overflow-x: auto;
+  flex-wrap: wrap;
+  overflow-x: visible;
 }
 .tab {
   font-size: 14px;
@@ -935,20 +943,21 @@ main.wrap {
   white-space: nowrap;
 }
 .filter-chips {
-  flex-wrap: nowrap;
-  overflow-x: auto;
+  flex-wrap: wrap;
+  overflow-x: visible;
   margin-top: 6px;
   gap: 8px;
 }
 .filter-group,
 .filter-group[aria-label="People"] {
-  flex: 0 0 auto;
-  max-width: none;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  max-width: 100%;
   overflow: visible;
 }
-/* Groups sit side by side in one scroll row; a thin divider keeps clients and people apart. */
+/* Filters wrap as groups and within each group on narrow screens. */
 .filter-group + .filter-group {
-  border-left: 1px solid var(--line, #d0d0d0);
+  border-left: 1px solid var(--line);
   padding-left: 10px;
 }
 .filter-label {
@@ -1028,7 +1037,7 @@ main.wrap {
   margin-top: 2px;
   gap: 16px;
   justify-content: flex-start;
-  padding-right: 90px;
+  padding-right: 0;
 }
 .act {
   font-size: 12px;
@@ -1065,7 +1074,8 @@ main.wrap {
   flex-wrap: wrap;
 }
 .board-link a {
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
   min-width: 0;
 }
 .notify-sendto select {
@@ -1128,20 +1138,53 @@ main.wrap {
 }
 
 /* Poppins' narrow space plus negative tracking made words run together on phones ("Linkone"). */
-.board-title, h2 { letter-spacing: 0; word-spacing: 0.08em; }
-
-button.armed { color: var(--bad); font-weight: 700; }
-
-/* More info toggle sits at the right end of the action row; the native summary is hidden. */
-.acts .more-toggle {
-  margin-left: auto;
-  font-weight: 400;
-  color: var(--muted, inherit);
-  border-bottom-color: transparent;
+.board-title,
+h2 {
+  letter-spacing: 0;
+  word-spacing: 0.08em;
 }
+
+button.armed {
+  color: var(--bad);
+  font-weight: 700;
+}
+
+/* Keep native Details disclosure state and its arrow together. */
 .board-details > summary,
 .board-details[open] > summary {
-  display: none;
+  display: list-item;
+  position: static;
+  padding: 6px 0;
+  min-height: 28px;
+  width: fit-content;
+}
+.board-head {
+  justify-content: flex-start;
+}
+.board-title {
+  flex: 1;
+}
+.board-created {
+  margin: 4px 0;
+  font-size: 12px;
+  color: var(--body);
+}
+.st {
+  border: 0;
+  border-radius: 0;
+  padding: 3px 0;
+  cursor: default;
+}
+.path,
+.board-link {
+  overflow-wrap: anywhere;
+}
+.more-filters {
+  float: none;
+  margin: 4px 0;
+}
+.filter-select {
+  max-width: 100%;
 }
 
 .notify-remove.armed {
@@ -1164,10 +1207,22 @@ button.armed { color: var(--bad); font-weight: 700; }
   vertical-align: middle;
 }
 .fresh-new {
-  background: var(--accent, #0b6b4f);
-  color: #fff;
+  background: var(--link);
+  color: var(--hero-ink);
 }
 .fresh-updated {
-  border: 1px solid var(--accent, #0b6b4f);
-  color: var(--accent, #0b6b4f);
+  border: 1px solid var(--link);
+  color: var(--link);
+}
+
+.history-body table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.history-body th,
+.history-body td {
+  min-width: 8em;
+  overflow-wrap: normal;
+  word-break: normal;
 }

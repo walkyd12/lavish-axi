@@ -2200,3 +2200,87 @@ body.layout-gate-active iframe#artifact {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
+
+/* Board identity and tag editing remain visible above the phone conversation sheet. */
+body.lavish {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+.bar {
+  flex-shrink: 0;
+}
+.board-context {
+  padding: 8px 16px;
+  background: var(--bg-panel);
+  border-bottom: var(--hairline-subtle);
+  max-height: 42dvh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.board-context h1 {
+  margin: 0 0 4px;
+  font-size: var(--text-base);
+  font-weight: 600;
+}
+body.lavish .layout {
+  height: auto;
+  flex: 1;
+  min-height: 0;
+}
+.composer-label {
+  margin: 8px 0 4px;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+.board-lifecycle-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+.workflow-group,
+.session-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.session-group {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.board-lifecycle-actions span {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
+.board-lifecycle-actions button {
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 7px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+.board-lifecycle-actions .board-workflow-action {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.board-lifecycle-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.composer .actions {
+  flex-wrap: wrap;
+}
+.chat table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.chat th,
+.chat td {
+  min-width: 8em;
+  word-break: normal;
+  overflow-wrap: normal;
+}

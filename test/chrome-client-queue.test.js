@@ -76,6 +76,7 @@ const UNSENT_OWNERSHIP_COPY =
   "Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.";
 
 async function createChromeHarness({
+  initialPresence = "listening",
   fetchImpl = /** @type {(url?: any, init?: any) => Promise<any>} */ (
     async () => ({ ok: true, json: async () => ({}) })
   ),
@@ -577,6 +578,10 @@ async function createChromeHarness({
   vm.runInNewContext(source, context, { filename: "chrome-client.js" });
   await flushPromises();
   if (artifactSrc) frame.dispatch("load");
+  // Message-delivery tests model an available agent; availability tests opt into waiting.
+  if (initialPresence !== "waiting") {
+    webSockets[0].listeners.get("agent-presence")({ data: JSON.stringify({ state: initialPresence }) });
+  }
 
   function frameLoadToken() {
     const match = String(frame.src).match(/[?&]artifact_load_token=([^&]+)/);
@@ -1215,7 +1220,7 @@ test("a failed terminal-only end shows retry guidance", async () => {
   assert.equal(chrome.element("sendAndEnd").disabled, false);
   assert.equal(chrome.element("sendHint").hidden, false);
   assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
-  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+  assert.match(chrome.element("sendHint").textContent, /click Message & end session to retry the same batch/i);
 });
 
 test("a failed in-flight POST preserves and runs a completed later Send & End", async () => {
@@ -1679,8 +1684,8 @@ test("a transient terminal failure names Send & End as the retry action", async 
 
   assert.equal(chrome.element("send").disabled, true);
   assert.equal(chrome.element("sendAndEnd").disabled, false);
-  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
-  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Send to Agent/i);
+  assert.match(chrome.element("sendHint").textContent, /click Message & end session to retry the same batch/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Message agent/i);
 });
 
 test("an older successful send preserves newer terminal retry guidance", async () => {
@@ -1711,14 +1716,14 @@ test("an older successful send preserves newer terminal retry guidance", async (
   await flushPromises();
 
   assert.equal(promptPostCount, 2);
-  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+  assert.match(chrome.element("sendHint").textContent, /click Message & end session to retry the same batch/i);
   releaseFirstPost();
   await flushPromises();
   await flushPromises();
 
   assert.equal(chrome.element("sendHint").hidden, false);
   assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
-  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+  assert.match(chrome.element("sendHint").textContent, /click Message & end session to retry the same batch/i);
 });
 
 test("an older late Send failure preserves newer terminal retry guidance", async () => {
@@ -1747,7 +1752,7 @@ test("an older late Send failure preserves newer terminal retry guidance", async
 
   assert.equal(posts.length, 1);
   assert.equal(posts[0].endSession, true);
-  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+  assert.match(chrome.element("sendHint").textContent, /click Message & end session to retry the same batch/i);
 
   chrome.sendFrameMessage({
     type: "lavish:snapshot",
@@ -1761,8 +1766,8 @@ test("an older late Send failure preserves newer terminal retry guidance", async
   assert.equal(posts[1].endSession, undefined);
   assert.equal(chrome.element("send").disabled, true);
   assert.equal(chrome.element("sendAndEnd").disabled, false);
-  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
-  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Send to Agent to retry/i);
+  assert.match(chrome.element("sendHint").textContent, /click Message & end session to retry the same batch/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Message agent to retry/i);
 });
 
 test("a failed timeout fallback keeps the queue and a timely retry sends it once", async () => {
@@ -1782,7 +1787,7 @@ test("a failed timeout fallback keeps the queue and a timely retry sends it once
 
   assert.equal(chrome.element("sendHint").hidden, false);
   assert.match(chrome.element("sendHint").textContent, /feedback is still queued/i);
-  assert.match(chrome.element("sendHint").textContent, /click Send to Agent to retry/i);
+  assert.match(chrome.element("sendHint").textContent, /click Message agent to retry/i);
   assert.deepEqual(
     chrome.queued().map((prompt) => prompt.prompt),
     ["Retry me"],
@@ -3350,7 +3355,7 @@ test("an older failed send cannot overwrite a newer layout preparation failure",
   assert.equal(chrome.element("sendHint").hidden, false);
   assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
   assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
-  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Send to Agent to retry/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Message agent to retry/i);
 });
 
 test("a successful retry of the failed preparation clears its stale error", async () => {
@@ -7306,6 +7311,7 @@ test("phone chrome restores an open sheet across a chrome reload", async () => {
 
 test("the dock summarizes what the user should know while the sheet is down", async () => {
   const chrome = await createChromeHarness({
+    initialPresence: "waiting",
     mobile: true,
     fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
   });
@@ -7398,7 +7404,7 @@ test("the closed dock shows a failed send and a stopped server, not just the que
 });
 
 test("the closed dock says when the live connection to Lavish is lost", async () => {
-  const chrome = await createChromeHarness({ mobile: true });
+  const chrome = await createChromeHarness({ initialPresence: "waiting", mobile: true });
   for (let failure = 0; failure < 5; failure += 1) {
     const socket = chrome.webSocketAt(chrome.webSocketCount() - 1);
     socket.protocolListeners.get("close")({});
@@ -7422,6 +7428,7 @@ test("the closed dock says when the live connection to Lavish is lost", async ()
 
 test("the closed dock flags sent notes no agent has picked up", async () => {
   const chrome = await createChromeHarness({
+    initialPresence: "waiting",
     mobile: true,
     sessionData: {
       ...defaultSessionData,
@@ -9154,6 +9161,7 @@ function receiptNote(html) {
 
 test("a sent bubble's receipt follows the entry's seen, working, and done stamps", async () => {
   const chrome = await createChromeHarness({
+    initialPresence: "waiting",
     sessionData: {
       ...defaultSessionData,
       initialChat: [
@@ -9582,7 +9590,7 @@ function pill(chrome) {
 // The reviewer asked: "when looking at a board, is there any way to tell if it is online / the
 // worker is online or not?" The pill answers from the owner's own report, else the poll presence.
 test("the presence pill shows Lavish's own poll presence when no owner has reported", async () => {
-  const chrome = await createChromeHarness();
+  const chrome = await createChromeHarness({ initialPresence: "waiting" });
   assert.deepEqual(pill(chrome), {
     tone: "off",
     text: "No agent listening",
@@ -9597,6 +9605,7 @@ test("the presence pill shows Lavish's own poll presence when no owner has repor
 
 test("the presence pill shows the owner's report, and outranks the poll presence", async () => {
   const chrome = await createChromeHarness({
+    initialPresence: "waiting",
     sessionData: {
       ...defaultSessionData,
       initialOwnerStatus: {
@@ -10150,4 +10159,23 @@ test("failed approval preview stays explicit and still needs a separate trusted 
   chrome.element("approvalConfirm").click({ isTrusted: true });
   await flushPromises();
   assert.equal(approvals, 1);
+});
+
+test("chat send is disabled and explained without a listener, then recovers on a live presence event", async () => {
+  const chrome = await createChromeHarness({ initialPresence: "waiting" });
+  chrome.element("chatInput").value = "Draft for later";
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+  assert.equal(chrome.element("presenceBanner").hidden, false);
+  assert.equal(chrome.element("end").disabled, false);
+  assert.equal(chrome.element("chatInput").disabled, false);
+  chrome.element("send").click();
+  assert.equal(
+    chrome.postedToFrame.some((msg) => msg.type === "lavish:requestSnapshot"),
+    false,
+  );
+  chrome.eventSource().listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("presenceBanner").hidden, true);
+  assert.equal(chrome.element("chatInput").value, "Draft for later");
 });

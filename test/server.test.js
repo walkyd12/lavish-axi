@@ -1087,11 +1087,11 @@ test("composer offers two always-visible top-level send actions", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
   const css = await chromeCssSource();
 
-  assert.match(html, /class="button" id="send">Send to Agent</);
-  assert.match(html, /class="button button-danger" id="sendAndEnd"[^<]*>.*Send &amp; End</);
+  assert.match(html, /class="button" id="send">Message agent</);
+  assert.match(html, /class="button button-danger" id="sendAndEnd"[^<]*>.*Message &amp; end session</);
   assert.match(
     html,
-    /<div class="send-hint" id="sendHint" hidden>Nothing queued in this tab\. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back\.<\/div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Send to Agent<\/button><\/div>/,
+    /<div class="send-hint" id="sendHint" hidden>Nothing queued in this tab\. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back\.<\/div><p class="composer-label">Message the agent<\/p><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">.*<button class="button" id="send">Message agent<\/button><\/div>/,
   );
   assert.doesNotMatch(html, /id="sendCaret"/);
   assert.doesNotMatch(html, /id="sendMenu"/);
@@ -1114,7 +1114,7 @@ test("chrome shows a waiting banner when no agent has attached", async () => {
   const css = await chromeCssSource();
 
   assert.match(html, /id="presenceBanner"/);
-  assert.match(html, /Your agent is not listening/);
+  assert.match(html, /Message sending is unavailable while no agent is listening/);
   assert.match(js, /presenceBanner\.hidden = ended \|\| agentPresence !== "waiting"/);
   assert.match(css, /\.presence-banner\{/);
 });
@@ -1577,7 +1577,7 @@ test("Tailscale mode binds concrete listeners, serves the MagicDNS link, and tea
       headers: { accept: "text/html" },
     });
     assert.equal(landing.status, 200);
-    assert.match(landing.body, /Your boards\./);
+    assert.match(landing.body, /aria-label="Boards"/);
 
     const shutdown = await rawRequest(server.port, "/shutdown", {
       method: "POST",
@@ -3674,7 +3674,7 @@ test("the hub lists boards with their state, closes and reopens them, and runs t
     assert.equal(page.status, 200);
     assert.equal(page.headers.get("x-frame-options"), "DENY");
     const html = await page.text();
-    assert.match(html, /Your boards\./);
+    assert.match(html, /aria-label="Boards"/);
     assert.match(html, /<script src="\/hub-client\.js"><\/script>/);
     assert.equal((await fetch(`${base}/hub-client.js`)).status, 200);
     assert.equal((await fetch(`${base}/hub.css`)).status, 200);
@@ -7273,7 +7273,8 @@ test("the hub lists a peer's boards beside its own and never closes them", async
     const byTitle = Object.fromEntries(view.boards.map((board) => [board.title, board]));
     assert.equal(byTitle.Mine.key, mineKey);
     assert.equal(byTitle.Mine.source, undefined);
-    const peerBoard = byTitle["Theirs <b>"];
+    const peerBoard = view.boards.find((board) => board.key === `peer:walkmate:${theirsKey}`);
+    assert.equal(peerBoard.title, "Theirs", "peer titles strip markup");
     assert.equal(peerBoard.key, `peer:walkmate:${theirsKey}`);
     assert.equal(peerBoard.source, "walkmate");
     assert.equal(peerBoard.url, `${peerBase}/session/${theirsKey}`);

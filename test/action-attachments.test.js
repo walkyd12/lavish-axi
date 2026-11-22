@@ -145,7 +145,7 @@ for (const outcome of ["success", "edited", "failure", "uploading", "error"]) {
       },
     });
     assert.ok(click);
-    await click({ target: { closest: (selector) => (selector === "[data-reactivate]" ? null : button) } });
+    await click({ target: { closest: (selector) => (selector === "[data-board-metadata] button" ? button : null) } });
     if (outcome === "uploading" || outcome === "error") {
       assert.equal(requests.length, 0);
     } else {

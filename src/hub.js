@@ -89,6 +89,7 @@ export function serializeHubBoard(session, facts = {}) {
     ...serializeBoardMetadata(session),
     version_behind: boardVersionBehind(session, facts.version),
     ...(includeSearch ? { search_text: facts.searchText || "" } : {}),
+    artifact_revision: Number(session.artifact_revision) || 0,
     key: String(session.key),
     file: String(session.file || ""),
     title: boardTitle(session, facts.title),
@@ -370,9 +371,10 @@ ${themed.style}
 <header class="hero"><div class="wrap inner"><div class="topline">${title ? `<h1 class="mark">${escapeHtml(title)}</h1>` : markHtml(mark)}<button type="button" class="notify-toggle" id="settingsToggle" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="hubSettings">${GEAR_ICON}<span>Settings</span></button></div><p class="lede" id="hubLede" hidden>Open a board to review it or send a message.</p><span class="pill" id="hubPill" role="status" hidden></span></div></header>
 <div class="ctaband"><div class="wrap"><nav class="tabs" aria-label="Boards"><button type="button" class="tab" id="tabOpen" aria-pressed="true">Open <span id="countOpen">0</span></button><button type="button" class="tab" id="tabNeedsInput" aria-pressed="false">Needs you <span id="countNeedsInput">0</span></button><button type="button" class="tab" id="tabClosed" aria-pressed="false">Closed</button><button type="button" class="tab" id="tabCancelled" aria-pressed="false">Cancelled</button></nav></div></div>
 <main class="wrap">
-<div class="hub-search"><label>Search boards<input id="hubSearch" type="search" placeholder="Search titles, clients, tags or text" aria-describedby="searchHint"></label><label class="include-closed"><input id="includeClosed" type="checkbox">Include closed</label></div>
+<div class="hub-search"><label>Search boards<input id="hubSearch" type="search" placeholder="Search titles, clients, tags or text" aria-describedby="searchHint"></label><label class="include-closed"><input id="includeClosed" type="checkbox">Also search closed &amp; cancelled</label></div>
 <div class="filter-chips" id="hubFilters" aria-label="Filter boards"></div>
-<details class="more-filters"><summary>More tags</summary><label>Filter by tag<select id="hubTag"><option value="">All tags</option></select></label></details>
+<details class="more-filters"><summary>More filters</summary><label>Filter by tag<select id="hubTag"><option value="">All tags</option></select></label></details>
+<p class="meta needs-you-explanation">Needs you shows open boards tagged Needs input or with your recognized reviewer name.</p>
 <p class="meta" id="searchHint" role="status" aria-live="polite"></p>
 <p class="note" id="hubNote" role="status" hidden></p>
 <p class="note" id="peerNote" data-tone="offline" role="status" hidden></p>

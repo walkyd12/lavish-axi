@@ -16,7 +16,7 @@ test("hub title is configurable and settings and technical metadata start tucked
   assert.match(html, /Team &lt;Hub&gt;/);
   assert.doesNotMatch(html, /Fusion/);
   assert.match(html, /<dialog[^>]*id="hubSettings"/);
-  assert.match(html, /Include closed/);
+  assert.match(html, /Also search closed &amp; cancelled/);
   assert.doesNotMatch(html, /Closed <span/);
   assert.doesNotMatch(html, /Cancelled <span/);
 });
