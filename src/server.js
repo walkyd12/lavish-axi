@@ -2298,17 +2298,8 @@ export async function serve({
         acceptedPrompts = Array.isArray(queued.accepted_prompts) ? queued.accepted_prompts : [];
         clearedTags = Array.isArray(queued.cleared_tags) ? queued.cleared_tags : [];
         if (queued.fresh_feedback) {
-          emitHubEvent({
-            event: "message",
-            key: req.params.key,
-            file: current.file,
-            url: current.url,
-            creator: current.creator || "",
-            tags: current.tags || [],
-            had_listener: Boolean(activeHolder),
-            listener: activeHolder ? listenerLabel(activeHolder) : null,
-            prompts: acceptedPrompts,
-          });
+          // One tap = one hub event: the board_action below carries this text in its prompts. A
+          // separate "message" hook event raced the action and was handled as plain chat (2026-11-22).
           events.emit("feedback", req.params.key, current.ended_by);
           events.emit("chat-sync", req.params.key, current);
         }
