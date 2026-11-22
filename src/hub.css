@@ -943,7 +943,13 @@ main.wrap {
 .filter-group,
 .filter-group[aria-label="People"] {
   flex: 0 0 auto;
+  max-width: none;
   overflow: visible;
+}
+/* Groups sit side by side in one scroll row; a thin divider keeps clients and people apart. */
+.filter-group + .filter-group {
+  border-left: 1px solid var(--line, #d0d0d0);
+  padding-left: 10px;
 }
 .filter-label {
   min-width: auto;
