@@ -335,10 +335,20 @@ function waitingOn(board) {
   return (board.tags || []).filter((tag) => people.has(tag.toLowerCase())).join(", ");
 }
 
+// Tagged people are always visible on the card (Zach 2026-11-22), not only through the People filter.
+function taggedHtml(board) {
+  const names = waitingOn(board);
+  if (!names) return "";
+  const chips = names
+    .split(", ")
+    .map((name) => `<span class="person-chip">@${escapeHtml(name)}</span>`)
+    .join("");
+  return `<p class="tagged-people"><span class="tagged-label">${isNeedsInput(board) ? "Waiting on" : "Tagged"}</span>${chips}</p>`;
+}
+
 function boardHtml(board) {
   const badge = displayBadge(board);
   const href = safeHref(board.url);
-  const waiting = isNeedsInput(board) ? waitingOn(board) : "";
   return (
     `<li class="board" data-key="${escapeHtml(board.key)}">` +
     `<div class="board-head">${freshnessBadge(board)}<h3 class="board-title" title="${escapeHtml(board.title)}">${escapeHtml(board.title)}</h3></div>` +
@@ -348,7 +358,7 @@ function boardHtml(board) {
         : "Created date unavailable"
     }${board.file ? ` · ${escapeHtml(String(board.file).split("/").filter(Boolean).slice(-2).join("/"))}` : ""}${board.revision_label ? ` · Revision: ${escapeHtml(board.revision_label)}` : ""}</p>` +
     `<div class="board-summary">${clientHtml(board)}<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span><span class="activity">${escapeHtml(relativeTime(board.last_activity))}</span></div>` +
-    (waiting ? `<p class="next-step">Waiting on ${escapeHtml(waiting)}</p>` : "") +
+    taggedHtml(board) +
     (board.next_step
       ? `<p class="next-step" title="${escapeHtml(board.next_step)}">Next: ${escapeHtml(board.next_step)}</p>`
       : "") +
