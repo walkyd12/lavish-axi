@@ -404,6 +404,7 @@ export function serializePeerBoard(peer, board) {
     creator: text(board.creator, 120),
     client: text(board.client, 64),
     created_at: isoOrEmpty(board.created_at),
+    created_at_source: board.created_at_source === "file" ? "file" : "session",
     created_version: text(board.created_version, 40),
     served_version: text(board.served_version, 40),
     opened_at: text(board.opened_at, 40),

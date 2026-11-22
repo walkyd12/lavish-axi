@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -52,6 +53,7 @@ test("hub revision labels come from the declared registry and ignore template an
   const registry =
     '<script type="application/json" data-lavish-revisions>[{"id":"r1","label":"First review"},{"id":"r2","label":"Second review"}]</script>';
   assert.equal(hubArtifactRevision(registry), "Second review");
+  assert.equal(hubArtifactRevision("<p>" + "x".repeat(70000) + "</p>" + registry), "Second review");
   assert.equal(hubArtifactRevision("<template>" + registry + "</template>"), "");
   assert.equal(hubArtifactRevision("<script data-lavish-revisions>invalid</script>"), "");
   assert.equal(hubArtifactRevision("<p>Unchanged board</p>"), "");
@@ -63,7 +65,9 @@ test("hub and peer cards keep declared revision labels when unchanged boards rel
   const file = path.join(dir, "board.html");
   await writeFile(
     file,
-    '<title>Review</title><script type="application/json" data-lavish-revisions>[{"id":"r2","label":"Second review"}]</script>',
+    "<title>Review</title>" +
+      " ".repeat(70000) +
+      '<script type="application/json" data-lavish-revisions>[{"id":"r2","label":"Second review"}]</script>',
   );
   const server = await serve({ port: 0, hosts: ["127.0.0.1"], stateFile: path.join(dir, "state.json"), hubPeers: "" });
   const base = `http://127.0.0.1:${server.port}`;
@@ -468,6 +472,40 @@ test("Send test reports an unconnected hook and launches a configured executable
     assert.equal(rows[0].event, "notify_test");
     assert.equal(rows[0].notify_settings.Reviewer.send_to, "https://example.invalid/hook");
     assert.equal(rows[0].notify_settings.Reviewer.tagged, false, "tests work even when automatic pings are off");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy card creation falls back to mtime without rewriting session history; last board close leaves health up", async () => {
+  const { mkdir, utimes } = await import("node:fs/promises");
+  const dir = await mkdtemp(path.join(tmpdir(), "legacy-cards-"));
+  process.env.LAVISH_AXI_STATE_DIR = dir;
+  const file = path.join(dir, "project-a", "index.html");
+  await mkdir(path.dirname(file));
+  await writeFile(file, "<title>Project review</title>");
+  const modified = new Date("2026-11-20T09:00:00Z");
+  await utimes(file, modified, modified);
+  const stateFile = path.join(dir, "state.json");
+  await writeFile(
+    stateFile,
+    JSON.stringify({ sessions: { legacy: { key: "legacy", file, status: "open", chat: [] } } }),
+  );
+  const server = await serve({ port: 0, hosts: ["127.0.0.1"], stateFile, hubPeers: "" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    for (let i = 0; i < 2; i++) {
+      const { boards } = await fetch(base + "/api/hub").then((r) => r.json());
+      assert.equal(boards[0].created_at, modified.toISOString());
+      assert.equal(boards[0].created_at_source, "file");
+      assert.equal(serializePeerBoard({ name: "remote", origin: base }, boards[0]).created_at_source, "file");
+    }
+    const closed = await fetch(base + "/api/hub/legacy/close", { method: "POST", headers: { origin: base } });
+    assert.equal(closed.status, 200);
+    assert.equal((await fetch(base + "/health")).status, 200);
+    const stored = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal(stored.sessions.legacy.created_at || "", "");
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });

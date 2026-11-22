@@ -4,7 +4,7 @@ import { parseRevisionRegistry } from "./artifact-revisions.js";
 
 // Match the board legend's validated registry, never the layout audit's load sequence.
 export function hubArtifactRevision(html) {
-  const root = parseFragment(String(html).slice(0, 65536));
+  const root = parseFragment(String(html));
   const pending = [...root.childNodes].reverse();
   while (pending.length) {
     const node = pending.pop();

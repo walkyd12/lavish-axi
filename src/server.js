@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { open as openFile, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
 import { homedir, hostname as osHostname, networkInterfaces } from "node:os";
@@ -1344,7 +1344,7 @@ export async function serve({
   const MAX_HUB_LIMIT = 200;
   const BOARD_IO_CONCURRENCY = 32;
   const MAX_BOARD_HEAD_CACHE = 2048;
-  /** @type {Map<string, { stamp: string, title: string, nextStep?: string, revisionLabel?: string, searchText: string | null }>} */
+  /** @type {Map<string, { stamp: string, title: string, nextStep?: string, revisionLabel?: string, fileModifiedAt?: string, searchText: string | null }>} */
   const boardHeadCache = new Map();
 
   /**
@@ -1396,21 +1396,13 @@ export async function serve({
     if (cached && cached.stamp === stamp && (!includeSearchText || cached.searchText !== null)) {
       return { exists: true, title: cached.title, searchText: cached.searchText || "" };
     }
-    const maxBytes = includeSearchText ? 1024 * 1024 : 64 * 1024;
-    const toRead = Math.min(Number(st.size), maxBytes);
-    if (toRead === 0) {
-      boardHeadCache.set(file, { stamp, title: "", searchText: "" });
-      return { exists: true, title: "", searchText: "" };
-    }
-    let handle;
+    const fileModifiedAt = new Date(Number(st.mtimeMs)).toISOString();
     try {
-      handle = await openFile(file, "r");
-      const buffer = Buffer.allocUnsafe(toRead);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      const html = buffer.subarray(0, bytesRead).toString("utf8");
+      // The legend can read a registry anywhere in the artifact; cache it by file stamp.
+      const html = await readFile(file, "utf8");
       const { title, nextStep } = hubArtifactSummary(html);
       const searchText = includeSearchText
-        ? boardSearchText(html).slice(0, 64 * 1024)
+        ? boardSearchText(html.slice(0, 1024 * 1024)).slice(0, 64 * 1024)
         : cached && cached.stamp === stamp
           ? cached.searchText
           : null;
@@ -1418,12 +1410,17 @@ export async function serve({
         const oldestKey = boardHeadCache.keys().next().value;
         if (oldestKey !== undefined) boardHeadCache.delete(oldestKey);
       }
-      boardHeadCache.set(file, { stamp, title, nextStep, revisionLabel: hubArtifactRevision(html), searchText });
+      boardHeadCache.set(file, {
+        stamp,
+        title,
+        nextStep,
+        revisionLabel: hubArtifactRevision(html),
+        fileModifiedAt,
+        searchText,
+      });
       return { exists: true, title, searchText: searchText || "" };
     } catch (error) {
       return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "", searchText: "" };
-    } finally {
-      await handle?.close().catch(() => {});
     }
   }
 
@@ -1744,6 +1741,7 @@ export async function serve({
         title: facts.title !== undefined ? facts.title : cachedHead?.title || "",
         nextStep: cachedHead?.nextStep || "",
         revisionLabel: cachedHead?.revisionLabel || "",
+        fileModifiedAt: cachedHead?.fileModifiedAt || "",
         ...(facts.includeSearchText ? { searchText: facts.searchText || "", includeSearchText: true } : {}),
         version,
         now,

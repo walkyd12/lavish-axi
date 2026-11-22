@@ -68,7 +68,7 @@
     if (root.dataset.chrome === "true" && lifecycle) {
       lifecycle.innerHTML = metadata.closed
         ? `<button type="button" data-lifecycle-close>Reopen</button>`
-        : `<div class="workflow-group"><span>Start work</span><button type="button" class="board-workflow-action" data-lifecycle-work>${escape(actionLabel)}</button></div><div class="session-group"><span>Session</span><button type="button" data-lifecycle-close>End session</button><button type="button" data-lifecycle-cancel>Cancel board</button></div>`;
+        : `<div class="workflow-group"><span>Start work</span><button type="button" class="board-workflow-action" data-lifecycle-work>${escape(actionLabel)}</button></div><div class="session-group"><span>Session</span><button type="button" data-lifecycle-close>Close board</button><button type="button" data-lifecycle-cancel>Cancel board</button></div>`;
       if (!metadata.closed && lifecycle.dataset.endDisabled === "true") {
         for (const button of lifecycle.querySelectorAll("[data-lifecycle-close], [data-lifecycle-cancel]")) {
           /** @type {HTMLButtonElement} */ (button).disabled = true;
@@ -247,10 +247,6 @@
     } else if (button.hasAttribute("data-close") || button.hasAttribute("data-lifecycle-close")) {
       if (metadata.closed) {
         await reactivate(button, root.dataset.boardMetadata, root.dataset.file);
-        return;
-      }
-      if (root.dataset.chrome === "true") {
-        window.dispatchEvent(new CustomEvent("lavish:end-session-request"));
         return;
       }
       button.disabled = true;

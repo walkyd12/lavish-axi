@@ -1,4 +1,4 @@
-/* global CSS, Element, MutationObserver, ResizeObserver, document, getComputedStyle, parent, window */
+/* global CSS, MouseEvent, Element, MutationObserver, ResizeObserver, document, getComputedStyle, parent, window */
 
 import { readArtifactRevisions } from "./artifact-revisions.js";
 import * as mermaidHelpers from "./mermaid-node.js";
@@ -2654,12 +2654,41 @@ export function createArtifactSdk(
     true,
   );
 
+  let evidenceRequestSequence = 0;
+  let evidenceFollowLink = null;
+  function evidenceContentType(url) {
+    return new Promise((resolve) => {
+      const requestId = ++evidenceRequestSequence;
+      const finish = (value) => {
+        clearTimeout(timer);
+        window.removeEventListener("message", receive);
+        resolve(value);
+      };
+      const receive = (event) => {
+        if (
+          event.source !== parent ||
+          event.data?.type !== "lavish:evidenceType" ||
+          event.data.request_id !== requestId
+        )
+          return;
+        finish(String(event.data.content_type || ""));
+      };
+      const timer = setTimeout(() => finish(""), 3500);
+      window.addEventListener("message", receive);
+      postArtifactMessage("lavish:probeEvidenceType", { request_id: requestId, href: url.href });
+    });
+  }
+
   // Evidence previews stay inside a dismissible viewer rather than navigating the board frame.
   function openEvidenceImage(event) {
     if (event.defaultPrevented || event.button !== 0 || event.shiftKey || event.altKey || isLavishAction(event.target))
       return;
     const link = /** @type {HTMLAnchorElement | null} */ (/** @type {Element} */ (event.target)?.closest?.("a[href]"));
     if (!link || link.hasAttribute("download") || isLavishUi(link)) return;
+    if (link === evidenceFollowLink) {
+      evidenceFollowLink = null;
+      return;
+    }
     const followModifier = isApplePlatform() ? event.metaKey : event.ctrlKey;
     if (annotationMode && !followModifier) return;
     let url;
@@ -2668,33 +2697,50 @@ export function createArtifactSdk(
     } catch {
       return;
     }
-    if (!/^https?:$/.test(url.protocol) || !/\.(png|jpe?g|gif|webp|avif|svg)$/i.test(url.pathname)) return;
+    if (
+      !/^https?:$/.test(url.protocol) ||
+      (url.origin === window.location.origin && url.pathname === window.location.pathname && url.hash)
+    )
+      return;
     event.preventDefault();
     event.stopImmediatePropagation();
     ignoreNextClick = false;
-    const viewer = document.createElement("dialog");
-    viewer.className = "lavish-image-viewer";
-    viewer.setAttribute("aria-label", "Evidence image");
-    const close = document.createElement("button");
-    close.type = "button";
-    close.textContent = "Close image · Back to board";
-    const image = document.createElement("img");
-    image.src = url.href;
-    image.alt = link.textContent?.trim() || "Evidence image";
-    const error = document.createElement("p");
-    error.hidden = true;
-    error.textContent = "This image is unavailable. Close the viewer to return to the board.";
-    image.addEventListener("error", () => {
-      error.hidden = false;
+    void evidenceContentType(url).then((contentType) => {
+      if (
+        contentType ? !/^image\//i.test(contentType) : !/\.(png|jpe?g|gif|webp|avif|svg|bmp|ico)$/i.test(url.pathname)
+      ) {
+        // Replay a non-image link once, retaining its native target and follow modifiers.
+        evidenceFollowLink = link;
+        link.dispatchEvent(
+          new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: event.ctrlKey, metaKey: event.metaKey }),
+        );
+        evidenceFollowLink = null;
+        return;
+      }
+      const viewer = document.createElement("dialog");
+      viewer.className = "lavish-image-viewer";
+      viewer.setAttribute("aria-label", "Evidence image");
+      const close = document.createElement("button");
+      close.type = "button";
+      close.textContent = "Close image · Back to board";
+      const image = document.createElement("img");
+      image.src = url.href;
+      image.alt = link.textContent?.trim() || "Evidence image";
+      const error = document.createElement("p");
+      error.hidden = true;
+      error.textContent = "This image is unavailable. Close the viewer to return to the board.";
+      image.addEventListener("error", () => {
+        error.hidden = false;
+      });
+      viewer.append(close, error, image);
+      ensureShadow().appendChild(viewer);
+      close.addEventListener("click", () => viewer.close());
+      viewer.addEventListener("close", () => {
+        viewer.remove();
+        link.focus();
+      });
+      viewer.showModal();
     });
-    viewer.append(close, error, image);
-    ensureShadow().appendChild(viewer);
-    close.addEventListener("click", () => viewer.close());
-    viewer.addEventListener("close", () => {
-      viewer.remove();
-      link.focus();
-    });
-    viewer.showModal();
     return true;
   }
 

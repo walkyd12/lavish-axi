@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import { on, once } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";

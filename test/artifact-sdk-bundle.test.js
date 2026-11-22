@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import vm from "node:vm";
@@ -934,4 +935,63 @@ test("setDocumentMeta forwards null to restore, omits unset fields and drops non
     messages.map((entry) => JSON.parse(JSON.stringify({ title: entry.title, icon: entry.icon }))),
     [{ title: null }, {}, {}],
   );
+});
+
+test("evidence viewer uses response MIME for extensionless and BMP links and replays non-images", async () => {
+  const source = await readFile(new URL("../src/artifact-sdk.js", import.meta.url), "utf8");
+  const start = source.indexOf("function openEvidenceImage(");
+  const end = source.indexOf("\n  document.addEventListener(", start);
+  for (const [href, contentType, isImage] of [
+    ["http://localhost/evidence/123", "image/png", true],
+    ["http://localhost/evidence.bmp", "image/bmp", true],
+    ["http://localhost/not-image.png", "text/html", false],
+  ]) {
+    let shown = false,
+      replayed = false,
+      prevented = false;
+    const viewer = {
+      setAttribute() {},
+      append() {},
+      addEventListener() {},
+      showModal() {
+        shown = true;
+      },
+    };
+    const link = {
+      href,
+      textContent: "Evidence",
+      hasAttribute: () => false,
+      dispatchEvent() {
+        replayed = true;
+      },
+    };
+    const context = vm.createContext({
+      annotationMode: false,
+      evidenceFollowLink: null,
+      ignoreNextClick: true,
+      URL,
+      window: { location: { href: "http://localhost/board" } },
+      document: { createElement: (tag) => (tag === "dialog" ? viewer : { addEventListener() {} }) },
+      isLavishAction: () => false,
+      isLavishUi: () => false,
+      isApplePlatform: () => false,
+      ensureShadow: () => ({ appendChild() {} }),
+      evidenceContentType: async () => contentType,
+      MouseEvent: class {},
+    });
+    vm.runInContext(source.slice(start, end), context);
+    const intercepted = context.openEvidenceImage({
+      target: { closest: () => link },
+      button: 0,
+      preventDefault() {
+        prevented = true;
+      },
+      stopImmediatePropagation() {},
+    });
+    await Promise.resolve();
+    assert.equal(intercepted, true);
+    assert.equal(prevented, true);
+    assert.equal(shown, isImage);
+    assert.equal(replayed, !isImage);
+  }
 });

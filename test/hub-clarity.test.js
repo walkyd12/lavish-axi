@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -79,6 +80,11 @@ test("notification settings show the exact destination with no internal label pi
   assert.match(html, /value="https:\/\/discord.com\/channels\/team\/channel"/);
   assert.match(html, /Paste a Discord webhook or channel link/);
   assert.doesNotMatch(html, /data-notify-pick|Reviewer's bot/);
+  for (const id of ["bot:123", "123456", "dm"]) {
+    const legacy = context.notifyRowHtml("Reviewer", { send_to: id });
+    assert.match(legacy, new RegExp(`Saved destination .*not a URL.*: ${id} — paste a link to replace`));
+    assert.doesNotMatch(legacy, new RegExp(`value="${id}"`));
+  }
 });
 
 test("board tag entry point is outside the conversation sheet, beside its title", () => {
@@ -131,10 +137,10 @@ test("shared editor distinguishes applied tags and people and preserves disclosu
   assert.match(root.innerHTML, /✓ Reviewer/);
 });
 
-test("shared board End session delegates to chrome and rerenders retain terminal reservation state", async () => {
+test("board Close uses the hub route and rerenders retain terminal reservation state", async () => {
   const source = await readFile(new URL("../src/board-metadata-client.js", import.meta.url), "utf8");
   const listeners = {};
-  const events = [];
+  const requests = [];
   const button = { disabled: false, dataset: {}, hasAttribute: (name) => name === "data-lifecycle-close" };
   const lifecycle = { dataset: { endDisabled: "true" }, innerHTML: "", querySelectorAll: () => [button] };
   const root = {
@@ -151,14 +157,15 @@ test("shared board End session delegates to chrome and rerenders retain terminal
         listeners[name] = fn;
       },
     },
-    window: { addEventListener() {}, dispatchEvent: (event) => events.push(event.type) },
+    window: { addEventListener() {}, dispatchEvent() {} },
     CustomEvent: class {
       constructor(type) {
         this.type = type;
       }
     },
-    fetch: () => {
-      throw new Error("End session must use the chrome's guarded operation");
+    fetch: async (url) => {
+      requests.push(url);
+      return { ok: true };
     },
   });
   vm.runInContext(source, context);
@@ -167,7 +174,8 @@ test("shared board End session delegates to chrome and rerenders retain terminal
   assert.equal(button.disabled, true);
   button.disabled = false;
   await listeners.click({ target: { closest: (selector) => (selector === "[data-reactivate]" ? null : button) } });
-  assert.deepEqual(events, ["lavish:end-session-request"]);
+  assert.deepEqual(requests, ["/api/hub/abc/close"]);
+  assert.match(lifecycle.innerHTML, /Reopen/);
 });
 
 test("creation time survives opening and reopening and remains distinct from last viewed time", async () => {

@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -418,6 +419,7 @@ async function createChromeHarness({
     ...(fakeClock ? { Date: { now: () => clockNow, parse: Date.parse } } : {}),
     fetch: harnessFetch,
     location: {
+      href: "http://lavish.test/session/abc",
       protocol: "http:",
       host: "lavish.test",
       reload() {
@@ -433,11 +435,11 @@ async function createChromeHarness({
     },
     setTimeout: fakeSetTimeout,
     crypto: globalThis.crypto,
-    URL: {
-      createObjectURL() {
+    URL: class extends URL {
+      static createObjectURL() {
         return "blob:lavish-test";
-      },
-      revokeObjectURL() {},
+      }
+      static revokeObjectURL() {}
     },
     WebSocket: class FakeWebSocket {
       static OPEN = 1;
@@ -10180,22 +10182,29 @@ test("chat send is disabled and explained without a listener, then recovers on a
   assert.equal(chrome.element("chatInput").value, "Draft for later");
 });
 
-test("annotation send shortcut preserves a disabled composer draft without a listener", async () => {
-  const chrome = await createChromeHarness({ initialPresence: "waiting" });
-  chrome.element("chatInput").value = "Draft for later";
+test("artifact send API delivers queued prompts without a listener, as on main", async () => {
+  const batches = [];
+  const chrome = await createChromeHarness({
+    initialPresence: "waiting",
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) batches.push(JSON.parse(init.body));
+      return { ok: true, json: async () => ({}) };
+    },
+  });
   chrome.sendFrameMessage({
     type: "lavish:queuePrompt",
-    prompt: { prompt: "Annotation", selector: "p", tag: "element" },
+    prompt: { prompt: "Approved draft", selector: "p", tag: "element" },
   });
-  const before = chrome.queued();
-  assert.equal(before.length, 1);
   chrome.sendFrameMessage({ type: "lavish:sendQueuedPrompts" });
-  assert.equal(chrome.element("chatInput").value, "Draft for later");
-  assert.deepEqual(chrome.queued(), before);
   assert.equal(
     chrome.postedToFrame.some((msg) => msg.type === "lavish:requestSnapshot"),
-    false,
+    true,
   );
+  chrome.sendSnapshot("<p>Review</p>");
+  await flushPromises();
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(batches.length, 1);
+  assert.equal(batches[0].prompts[0].prompt, "Approved draft");
 });
 
 test("composer and menu End session share the terminal submission guard and board end route", async () => {
@@ -10231,4 +10240,34 @@ test("composer End session request uses the board end route when no final feedba
   await flushPromises();
   assert.ok(posts.includes("/api/abc/end"));
   assert.equal(chrome.element("endedOverlay").hidden, false);
+});
+
+test("chrome checks evidence MIME with HEAD and returns no response body or foreign-origin headers", async () => {
+  const requests = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      requests.push({ url, init });
+      return { ok: true, headers: { get: () => "image/png; charset=binary" } };
+    },
+  });
+  chrome.sendFrameMessage({ type: "lavish:probeEvidenceType", href: "http://lavish.test/evidence/123", request_id: 1 });
+  await flushPromises();
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].init.method, "HEAD");
+  assert.equal(requests[0].init.credentials, "omit");
+  assert.equal(requests[0].init.redirect, "error");
+  assert.ok(requests[0].init.signal);
+  const result = chrome.postedToFrame.find((msg) => msg.type === "lavish:evidenceType");
+  assert.deepEqual(
+    { ...result },
+    { type: "lavish:evidenceType", request_id: 1, content_type: "image/png; charset=binary" },
+  );
+  chrome.sendFrameMessage({
+    type: "lavish:probeEvidenceType",
+    href: "http://foreign.test/evidence/123",
+    request_id: 2,
+  });
+  await flushPromises();
+  assert.equal(requests.length, 1);
+  assert.equal(chrome.postedToFrame.at(-1).content_type, "");
 });

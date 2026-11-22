@@ -344,13 +344,9 @@ function boardHtml(board) {
     `<div class="board-head">${freshnessBadge(board)}<h3 class="board-title" title="${escapeHtml(board.title)}">${escapeHtml(board.title)}</h3></div>` +
     `<p class="board-created">${
       board.created_at
-        ? `Created ${escapeHtml(new Date(board.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }))}`
-        : `Created date unavailable · ${escapeHtml(
-            String(board.file || board.peer_key || board.key)
-              .split("/")
-              .pop(),
-          )}`
-    }${board.revision_label ? ` · Revision: ${escapeHtml(board.revision_label)}` : ""}</p>` +
+        ? `${board.created_at_source === "file" ? "File modified" : "Created"} ${escapeHtml(new Date(board.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }))}`
+        : "Created date unavailable"
+    }${board.file ? ` · ${escapeHtml(String(board.file).split("/").filter(Boolean).slice(-2).join("/"))}` : ""}${board.revision_label ? ` · Revision: ${escapeHtml(board.revision_label)}` : ""}</p>` +
     `<div class="board-summary">${clientHtml(board)}<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span><span class="activity">${escapeHtml(relativeTime(board.last_activity))}</span></div>` +
     (waiting ? `<p class="next-step">Waiting on ${escapeHtml(waiting)}</p>` : "") +
     (board.next_step
@@ -421,9 +417,9 @@ function applyViewData(data) {
   if (typeof data.needs_you_count === "number") needsYouCount = data.needs_you_count;
 }
 
-// Destination values are shown and saved verbatim; only the configured hook interprets them.
+// Only the adapter converts legacy route IDs. Keep them out of the URL input.
 function displaySendTo(value) {
-  return String(value || "");
+  return /^https?:\/\//i.test(String(value || "")) ? String(value) : "";
 }
 function storedSendTo(text) {
   return String(text || "").trim();
@@ -434,7 +430,7 @@ function destinationStatus(value) {
     label: value
       ? /^https?:\/\//i.test(value)
         ? "URL · use Send test to check"
-        : "Paste a webhook or channel URL to replace this saved destination"
+        : `Saved destination (not a URL): ${value} — paste a link to replace`
       : "Paste a Discord webhook or channel link",
     ready: false,
   };
@@ -516,7 +512,7 @@ function renderNotificationsPanel() {
       }
     }
     const field = /** @type {HTMLInputElement | null} */ (existing.querySelector('input[data-notify-field="send_to"]'));
-    syncDestinationRow(existing, storedSendTo(field?.value || ""));
+    syncDestinationRow(existing, storedSendTo(field?.value || cfg.send_to || ""));
   }
 }
 
@@ -1111,7 +1107,9 @@ notifyRows?.addEventListener("click", async (event) => {
     const field = /** @type {HTMLInputElement | null} */ (
       testButton.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
     );
-    const sendTo = field ? storedSendTo(field.value) : notifySettings[testPerson].send_to;
+    const sendTo = field
+      ? storedSendTo(field.value || notifySettings[testPerson].send_to)
+      : notifySettings[testPerson].send_to;
     try {
       await notifySaveChain;
       const response = await fetch("/api/hub/notifications/test", {

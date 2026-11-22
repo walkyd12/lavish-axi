@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { access, mkdtemp, rm } from "node:fs/promises";

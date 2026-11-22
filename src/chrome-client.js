@@ -2556,7 +2556,6 @@ function sendQueued(endAfter) {
     if (endAfter && !terminalSubmission.inFlight) retryTerminalSubmission();
     return;
   }
-  if (agentPresence === "waiting") return;
   closeMenus();
   // Send delivers what the panel shows, so an open edit is kept rather than sent stale.
   if (commitQueuedEdit()) render();
@@ -4872,6 +4871,27 @@ function setDocumentIcon(href) {
   else document.head.appendChild(link);
 }
 
+// The opaque artifact cannot inspect local response headers. Return only the MIME type.
+async function probeEvidenceType(msg, loadToken) {
+  let contentType = "";
+  try {
+    const url = new URL(msg.href, location.href);
+    if (url.origin !== new URL(location.href).origin || !/^https?:$/.test(url.protocol)) return;
+    const response = await fetch(url.href, {
+      method: "HEAD",
+      credentials: "omit",
+      redirect: "error",
+      signal: AbortSignal.timeout(3000),
+    });
+    if (response.ok) contentType = response.headers.get("content-type") || "";
+  } catch {
+    // An unsupported HEAD falls back to the ordinary link behavior or known image suffix.
+  } finally {
+    if (loadToken === artifactLoadToken)
+      postToFrame({ type: "lavish:evidenceType", request_id: msg.request_id, content_type: contentType });
+  }
+}
+
 window.addEventListener("message", (event) => {
   if (event.source !== frame.contentWindow) return;
 
@@ -4881,6 +4901,10 @@ window.addEventListener("message", (event) => {
     // A pass can be stamped by the load that just lost a token race. Ask the current artifact
     // document to run the audit again instead of consuming the only pass for this cycle.
     if (msg.type === "lavish:layoutDiagnostics") postToFrame({ type: "lavish:requestLayoutDiagnostics" });
+    return;
+  }
+  if (msg.type === "lavish:probeEvidenceType") {
+    void probeEvidenceType(msg, messageToken);
     return;
   }
   const messageSequence = ++artifactMessageSequence;
