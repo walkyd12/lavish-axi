@@ -1427,3 +1427,15 @@ if (initial.identify_viewer) {
     })
     .catch(() => {});
 }
+
+// Tap anywhere on a board card to open it (Zach 2026-11-22). Controls on the card keep their own
+// behavior: links, buttons, form fields and disclosures are never hijacked, and selecting text doesn't navigate.
+document.addEventListener("click", (event) => {
+  const target = /** @type {Element | null} */ (event.target instanceof Element ? event.target : null);
+  const card = target?.closest("li.board");
+  if (!card || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey) return;
+  if (target.closest("a, button, input, select, textarea, label, summary, details, form, [role=button]")) return;
+  if (String(window.getSelection?.() || "").trim()) return;
+  const open = /** @type {HTMLAnchorElement | null} */ (card.querySelector("a.act.primary[href]"));
+  if (open) location.href = open.href;
+});
