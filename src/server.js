@@ -2548,6 +2548,16 @@ export async function serve({
   });
 
   app.post("/shutdown", (req, res) => {
+    // A server run by a supervisor (e.g. a systemd hub with its own hooks and settings) can be pinned:
+    // CLIs then adopt it instead of replacing it with a bare server. Every refused request is logged
+    // so the caller's reason can be traced.
+    if (process.env.LAVISH_AXI_PINNED_SERVER === "1") {
+      console.error(
+        `lavish: refused shutdown request (pinned server) reason=${String(req.body?.reason || "")} reload_key=${String(req.body?.reload_key || "")}`,
+      );
+      res.status(423).json({ status: "pinned", error: "this server is pinned by its supervisor; restart it there" });
+      return;
+    }
     // The caller names the session it is about to reopen, and only that session's chrome is
     // reloaded. A call that names none reloads nothing. It also names why it is shutting this
     // server down, because the banner every other chrome shows has to be true for that reason;
