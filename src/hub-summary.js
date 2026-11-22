@@ -1,6 +1,43 @@
+import { open } from "node:fs/promises";
 import { boardSearchText } from "./board-metadata.js";
 import { parseFragment } from "parse5";
 import { parseRevisionRegistry } from "./artifact-revisions.js";
+
+// Metadata/revisions use 64 KiB windows; only explicit search reads up to 1 MiB.
+// Never let embedded evidence size dictate card memory use, even on cache misses.
+export async function readHubArtifact(file, { includeSearchText = false } = {}) {
+  const windowBytes = 64 * 1024;
+  const handle = await open(file, "r");
+  try {
+    const { size } = await handle.stat();
+    const readWindow = async (position, length) => {
+      const buffer = Buffer.alloc(length);
+      let offset = 0;
+      while (offset < length) {
+        const { bytesRead } = await handle.read(buffer, offset, length - offset, position + offset);
+        if (!bytesRead) break;
+        offset += bytesRead;
+      }
+      return buffer.subarray(0, offset);
+    };
+    const head = await readWindow(0, Math.min(size, includeSearchText ? 1024 * 1024 : windowBytes));
+    const revisionHead = head.subarray(0, windowBytes);
+    const tailStart = Math.max(revisionHead.length, size - windowBytes);
+    const tail =
+      size <= head.length
+        ? head.subarray(tailStart, Math.min(size, head.length))
+        : await readWindow(tailStart, Math.max(0, size - tailStart));
+    // Join contiguous windows so a registry can straddle 64 KiB. Never join a gap:
+    // partial markup from unrelated positions must not fabricate a registry.
+    const revisionLabel =
+      tailStart === revisionHead.length
+        ? hubArtifactRevision(Buffer.concat([revisionHead, tail]).toString("utf8"))
+        : hubArtifactRevision(revisionHead.toString("utf8")) || hubArtifactRevision(tail.toString("utf8"));
+    return { html: head.toString("utf8"), revisionLabel };
+  } finally {
+    await handle.close();
+  }
+}
 
 // Match the board legend's validated registry, never the layout audit's load sequence.
 export function hubArtifactRevision(html) {

@@ -9,7 +9,7 @@ import { homedir, hostname as osHostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { hubArtifactSummary, hubArtifactRevision } from "./hub-summary.js";
+import { hubArtifactSummary, readHubArtifact } from "./hub-summary.js";
 import { runApprovalPreview } from "./approval-preview.js";
 
 import chokidar from "chokidar";
@@ -1398,8 +1398,8 @@ export async function serve({
     }
     const fileModifiedAt = new Date(Number(st.mtimeMs)).toISOString();
     try {
-      // The legend can read a registry anywhere in the artifact; cache it by file stamp.
-      const html = await readFile(file, "utf8");
+      // Cache bounded metadata and revision windows by file stamp.
+      const { html, revisionLabel } = await readHubArtifact(file, { includeSearchText });
       const { title, nextStep } = hubArtifactSummary(html);
       const searchText = includeSearchText
         ? boardSearchText(html.slice(0, 1024 * 1024)).slice(0, 64 * 1024)
@@ -1414,7 +1414,7 @@ export async function serve({
         stamp,
         title,
         nextStep,
-        revisionLabel: hubArtifactRevision(html),
+        revisionLabel,
         fileModifiedAt,
         searchText,
       });
