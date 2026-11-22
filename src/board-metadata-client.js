@@ -62,7 +62,7 @@
             )}</div><p class="tag-label">Board attention</p><button type="button" data-needs-input aria-pressed="${needsInput}">${needsInput ? "✓" : "+"} Needs input</button><form class="tag-form" data-previous-tag="${escape(previousTag)}"><input name="tag" aria-label="Tag" placeholder="Add a tag" maxlength="64" value="${escape(draft)}" required><button type="submit">${previousTag ? "Change tag" : "Add tag"}</button><button type="button" data-cancel${previousTag ? "" : " hidden"}>Cancel change</button></form>`) +
       `</details>` +
       (root.dataset.chrome === "true"
-        ? `<details class="metadata-details"${detailsOpen ? " open" : ""}><summary>Details</summary><p class="board-provenance">Created by ${escape(metadata.creator || "Unknown")} · ${metadata.created_version ? `Created on ${escape(metadata.created_version)}` : "Created before version tracking"} · ${metadata.served_version ? `Last served on ${escape(metadata.served_version)}` : "Last served before version tracking"}</p><p class="board-provenance">${escape(root.dataset.file || "")}</p></details>`
+        ? `<details class="metadata-details"${detailsOpen ? " open" : ""}><summary>Details</summary><div class="metadata-dropdown"><p class="board-provenance">Created by ${escape(metadata.creator || "Unknown")} · ${metadata.created_version ? `Created on ${escape(metadata.created_version)}` : "Created before version tracking"} · ${metadata.served_version ? `Last served on ${escape(metadata.served_version)}` : "Last served before version tracking"}</p><p class="board-provenance">${escape(root.dataset.file || "")}</p></div></details>`
         : "");
     const lifecycle = document.getElementById?.("boardLifecycle");
     if (root.dataset.chrome === "true" && lifecycle) {
