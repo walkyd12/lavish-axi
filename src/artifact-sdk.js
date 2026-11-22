@@ -2656,7 +2656,8 @@ export function createArtifactSdk(
 
   // Evidence previews stay inside a dismissible viewer rather than navigating the board frame.
   function openEvidenceImage(event) {
-    if (event.defaultPrevented || event.button !== 0 || event.shiftKey || event.altKey) return;
+    if (event.defaultPrevented || event.button !== 0 || event.shiftKey || event.altKey || isLavishAction(event.target))
+      return;
     const link = /** @type {HTMLAnchorElement | null} */ (/** @type {Element} */ (event.target)?.closest?.("a[href]"));
     if (!link || link.hasAttribute("download") || isLavishUi(link)) return;
     const followModifier = isApplePlatform() ? event.metaKey : event.ctrlKey;

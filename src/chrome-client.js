@@ -922,6 +922,13 @@ function updateSendState() {
   chatInput.disabled = ended || terminalReserved;
   chatAttachButton.disabled = ended || terminalReserved;
   endButton.disabled = ended || terminalReserved;
+  const lifecycle = document.getElementById("boardLifecycle");
+  if (lifecycle) {
+    lifecycle.dataset.endDisabled = String(terminalReserved);
+    for (const button of lifecycle.querySelectorAll("[data-lifecycle-close], [data-lifecycle-cancel]")) {
+      /** @type {HTMLButtonElement} */ (button).disabled = terminalReserved;
+    }
+  }
   if (warningsQueueButton) updateWarningSelectionState();
 }
 
@@ -2549,6 +2556,7 @@ function sendQueued(endAfter) {
     if (endAfter && !terminalSubmission.inFlight) retryTerminalSubmission();
     return;
   }
+  if (agentPresence === "waiting") return;
   closeMenus();
   // Send delivers what the panel shows, so an open edit is kept rather than sent stale.
   if (commitQueuedEdit()) render();
@@ -3677,6 +3685,11 @@ async function endSession(terminal = null) {
   if (!response.ok) throw new Error("failed to end session");
   markSessionEnded();
 }
+
+window.addEventListener("lavish:end-session-request", () => {
+  closeMenus();
+  endSession().catch(() => showSendHint("Could not end the session. Try again."));
+});
 
 function markSessionEnded() {
   if (ended) return;

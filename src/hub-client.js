@@ -76,7 +76,6 @@ let wsReconnectTimer;
 let wsReconnectAttempt = 0;
 let sawWsDisconnect = false;
 let notifySaveChain = Promise.resolve();
-let notifyDestinations = [];
 
 const list = /** @type {HTMLOListElement} */ (document.getElementById("boards"));
 const moreWrap = /** @type {HTMLDivElement | null} */ (document.getElementById("hubMoreWrap"));
@@ -296,9 +295,6 @@ function peerActionsHtml(board) {
   const actions = [];
   if (isClosed(board)) {
     actions.push(`<button type="button" class="act" data-act="reopen" data-key="${key}"${disabled}>Reopen</button>`);
-    if (href && board.state !== "file-gone") {
-      actions.push(`<a class="act" href="${escapeHtml(href)}">Open on ${escapeHtml(board.source)} →</a>`);
-    }
     return actions.join("");
   }
   if (href) {
@@ -354,7 +350,7 @@ function boardHtml(board) {
               .split("/")
               .pop(),
           )}`
-    }${board.artifact_revision > 1 ? ` · Revision ${escapeHtml(board.artifact_revision)}` : ""}</p>` +
+    }${board.revision_label ? ` · Revision: ${escapeHtml(board.revision_label)}` : ""}</p>` +
     `<div class="board-summary">${clientHtml(board)}<span class="st st-${escapeHtml(badge.tone)}">${escapeHtml(badge.label)}</span><span class="activity">${escapeHtml(relativeTime(board.last_activity))}</span></div>` +
     (waiting ? `<p class="next-step">Waiting on ${escapeHtml(waiting)}</p>` : "") +
     (board.next_step
@@ -425,33 +421,23 @@ function applyViewData(data) {
   if (typeof data.needs_you_count === "number") needsYouCount = data.needs_you_count;
 }
 
-// The box shows a friendly name ("Zach's Cortana DM") for known destinations; the stored value
-// stays the route id. Typing a known name maps back to its id; anything else is taken as typed.
+// Destination values are shown and saved verbatim; only the configured hook interprets them.
 function displaySendTo(value) {
-  const hit = notifyDestinations.find((item) => item.id === value);
-  return hit ? hit.label : String(value || "");
+  return String(value || "");
 }
 function storedSendTo(text) {
-  const clean = String(text || "").trim();
-  const hit = notifyDestinations.find((item) => item.label.toLowerCase() === clean.toLowerCase());
-  return hit ? hit.id : clean;
+  return String(text || "").trim();
 }
 
 function destinationStatus(value) {
-  const destination = notifyDestinations.find((item) => item.id === value);
-  if (destination) return { label: destination.ready ? "Ready" : "Not connected", ready: destination.ready };
   return {
     label: value
       ? /^https?:\/\//i.test(value)
         ? "URL · use Send test to check"
-        : "Custom · use Send test to check"
-      : "Choose a destination",
+        : "Paste a webhook or channel URL to replace this saved destination"
+      : "Paste a Discord webhook or channel link",
     ready: false,
   };
-}
-
-function destinationOptions(value) {
-  return `<option value="">Choose a destination…</option>${notifyDestinations.map((item) => `<option value="${escapeHtml(item.id)}"${value === item.id ? " selected" : ""}>${escapeHtml(item.label)} · ${item.ready ? "Ready" : "Not connected"}</option>`).join("")}`;
 }
 
 function syncDestinationRow(row, value) {
@@ -461,8 +447,6 @@ function syncDestinationRow(row, value) {
     statusElement.textContent = status.label;
     statusElement.setAttribute("data-ready", String(status.ready));
   }
-  const picker = row.querySelector("select[data-notify-pick]");
-  if (picker) picker.innerHTML = destinationOptions(value);
 }
 
 function notifyRowHtml(person, cfg) {
@@ -477,9 +461,9 @@ function notifyRowHtml(person, cfg) {
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="tagged"${cfg.tagged ? " checked" : ""}><span>When tagged</span></label>` +
     `<label class="notify-check"><input type="checkbox" data-notify-person="${safeName}" data-notify-field="done"${cfg.done ? " checked" : ""}><span>When board is done</span></label>` +
     `</div>` +
-    `<label class="notify-sendto"><span>Destination</span><input type="text" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(displaySendTo(cfg.send_to))}" placeholder="Pick below, or paste a webhook URL" maxlength="2048"></label>` +
-    `<label class="notify-sendto"><span>Suggested destinations</span><select data-notify-pick="${safeName}" aria-describedby="destination-status-${index}">${destinationOptions(cfg.send_to)}</select></label>` +
+    `<label class="notify-sendto"><span>Destination URL</span><input type="text" inputmode="url" data-notify-person="${safeName}" data-notify-field="send_to" value="${escapeHtml(displaySendTo(cfg.send_to))}" placeholder="Paste a Discord webhook or channel link" aria-describedby="destination-status-${index}" maxlength="2048"></label>` +
     `<div class="destination-check"><span class="destination-status" id="destination-status-${index}" data-ready="${status.ready}">${escapeHtml(status.label)}</span><button type="button" class="act" data-notify-test="${safeName}" aria-label="Send test for ${safeName}">Send test</button></div>` +
+    `<p class="meta notify-status" data-notify-test-result role="status" hidden></p>` +
     `</div>`
   );
 }
@@ -1044,17 +1028,6 @@ function setNotifyPanelOpen(open) {
     settings.showModal();
     renderNotificationsPanel();
     renderPeersPanel();
-    void fetch("/api/hub/notification-destinations", { cache: "no-store" })
-      .then(async (response) => {
-        if (!response.ok) throw new Error();
-        return response.json();
-      })
-      .then((data) => {
-        notifyDestinations = Array.isArray(data.destinations) ? data.destinations : [];
-        renderNotificationsPanel();
-        if (data.error) setNotifyStatus(data.error, true);
-      })
-      .catch(() => setNotifyStatus("Suggested destinations are unavailable. You can still paste a URL.", true));
   } else settings.close();
   settingsToggle?.setAttribute("aria-expanded", String(open));
 }
@@ -1079,21 +1052,6 @@ settings?.addEventListener("click", (event) => {
 });
 
 notifyRows?.addEventListener("change", (event) => {
-  const select = /** @type {HTMLSelectElement} */ (event.target);
-  const pickedPerson = select.dataset?.notifyPick;
-  if (pickedPerson && select.value && Object.hasOwn(notifySettings, pickedPerson)) {
-    const timer = sendToSaveTimers.get(pickedPerson);
-    if (timer) clearTimeout(timer);
-    sendToSaveTimers.delete(pickedPerson);
-    const field = /** @type {HTMLInputElement | null} */ (
-      select.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
-    );
-    if (field) field.value = displaySendTo(select.value);
-    notifySettings[pickedPerson] = { ...notifySettings[pickedPerson], send_to: select.value };
-    void queueNotifyMutation({ patch: { person: pickedPerson, send_to: select.value } }, { rerender: true });
-    renderNotificationsPanel();
-    return;
-  }
   const input = /** @type {HTMLInputElement | null} */ (event.target);
   const person = input?.dataset?.notifyPerson;
   const field = input?.dataset?.notifyField;
@@ -1137,6 +1095,19 @@ notifyRows?.addEventListener("click", async (event) => {
   const testPerson = testButton?.dataset.notifyTest;
   if (testButton && testPerson && !testButton.disabled && Object.hasOwn(notifySettings, testPerson)) {
     testButton.disabled = true;
+    const showTestResult = (message, isError = false) => {
+      // Preference writes can rerender a row while its test is running. Resolve the current row.
+      for (const row of /** @type {NodeListOf<HTMLElement>} */ (notifyRows.querySelectorAll("[data-notify-row]"))) {
+        if (row.dataset.notifyRow !== testPerson) continue;
+        const result = /** @type {HTMLElement | null} */ (row.querySelector("[data-notify-test-result]"));
+        if (result) {
+          result.textContent = message;
+          result.dataset.tone = isError ? "error" : "saved";
+          result.hidden = false;
+        }
+      }
+    };
+    showTestResult("Sending test…");
     const field = /** @type {HTMLInputElement | null} */ (
       testButton.closest("[data-notify-row]")?.querySelector('input[data-notify-field="send_to"]')
     );
@@ -1150,9 +1121,9 @@ notifyRows?.addEventListener("click", async (event) => {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not send test");
-      setNotifyStatus(data.message);
+      showTestResult(data.message);
     } catch (error) {
-      setNotifyStatus(error.message || "Could not send test", true);
+      showTestResult(error.message || "Could not send test", true);
     } finally {
       testButton.disabled = false;
     }

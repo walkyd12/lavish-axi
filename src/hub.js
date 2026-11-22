@@ -8,7 +8,7 @@ import { serializeOwnerStatus } from "./owner-status.js";
 import { hostThemeMarkup } from "./host-theme.js";
 
 /**
- * @typedef {{ listener?: string | null, tabs?: number, fileExists?: boolean, title?: string, nextStep?: string, searchText?: string, includeSearchText?: boolean, version?: string, now?: number }} HubFacts
+ * @typedef {{ listener?: string | null, tabs?: number, fileExists?: boolean, title?: string, nextStep?: string, revisionLabel?: string, searchText?: string, includeSearchText?: boolean, version?: string, now?: number }} HubFacts
  */
 
 // One state per board, most urgent first. Each is something the reviewer can act on:
@@ -90,6 +90,7 @@ export function serializeHubBoard(session, facts = {}) {
     version_behind: boardVersionBehind(session, facts.version),
     ...(includeSearch ? { search_text: facts.searchText || "" } : {}),
     artifact_revision: Number(session.artifact_revision) || 0,
+    revision_label: facts.revisionLabel || "",
     key: String(session.key),
     file: String(session.file || ""),
     title: boardTitle(session, facts.title),

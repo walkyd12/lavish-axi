@@ -10179,3 +10179,56 @@ test("chat send is disabled and explained without a listener, then recovers on a
   assert.equal(chrome.element("presenceBanner").hidden, true);
   assert.equal(chrome.element("chatInput").value, "Draft for later");
 });
+
+test("annotation send shortcut preserves a disabled composer draft without a listener", async () => {
+  const chrome = await createChromeHarness({ initialPresence: "waiting" });
+  chrome.element("chatInput").value = "Draft for later";
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Annotation", selector: "p", tag: "element" },
+  });
+  const before = chrome.queued();
+  assert.equal(before.length, 1);
+  chrome.sendFrameMessage({ type: "lavish:sendQueuedPrompts" });
+  assert.equal(chrome.element("chatInput").value, "Draft for later");
+  assert.deepEqual(chrome.queued(), before);
+  assert.equal(
+    chrome.postedToFrame.some((msg) => msg.type === "lavish:requestSnapshot"),
+    false,
+  );
+});
+
+test("composer and menu End session share the terminal submission guard and board end route", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      if (init?.method === "POST") posts.push(url);
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.element("chatInput").value = "Final feedback";
+  chrome.element("sendAndEnd").click();
+  const event = { type: "lavish:end-session-request", preventDefault() {} };
+  for (const listener of chrome.windowListeners.get(event.type) || []) listener(event);
+  await flushPromises();
+  assert.equal(
+    posts.some((url) => url.endsWith("/end")),
+    false,
+  );
+  assert.equal(chrome.element("end").disabled, true);
+  assert.equal(chrome.element("boardLifecycle").dataset.endDisabled, "true");
+});
+
+test("composer End session request uses the board end route when no final feedback is pending", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init) => {
+      if (init?.method === "POST") posts.push(url);
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  for (const listener of chrome.windowListeners.get("lavish:end-session-request") || []) listener({});
+  await flushPromises();
+  assert.ok(posts.includes("/api/abc/end"));
+  assert.equal(chrome.element("endedOverlay").hidden, false);
+});

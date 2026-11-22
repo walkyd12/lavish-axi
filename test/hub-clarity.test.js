@@ -39,13 +39,46 @@ test("missing files in Closed offer Reopen only and plainly explain availability
   }
 });
 
-test("card tags precede Details and date and revision distinguish matching titles", () => {
+test("card tags precede Details and only declared revisions distinguish matching titles", () => {
   const ui = hubFunctions();
-  const html = ui.boardHtml({ key: "abc", title: "Board", created_at: "2026-11-21T10:30:00Z", artifact_revision: 3 });
+  const board = { key: "abc", title: "Board", created_at: "2026-11-21T10:30:00Z", artifact_revision: 3 };
+  assert.doesNotMatch(ui.boardHtml(board), /Revision 3/);
+  const html = ui.boardHtml({ ...board, revision_label: "Review round 2" });
   assert.ok(html.indexOf("data-board-metadata") < html.indexOf('class="board-details"'));
   assert.match(html, /Created/);
-  assert.match(html, /Revision 3/);
+  assert.match(html, /Review round 2/);
   assert.match(html, /No client/);
+});
+
+test("closed and cancelled peer cards offer only Reopen even with an available file", () => {
+  const ui = hubFunctions();
+  for (const cancelled of [false, true]) {
+    const html = ui.peerActionsHtml({
+      key: "peer:remote:abc",
+      source: "remote",
+      status: "ended",
+      cancelled,
+      url: "http://localhost/session/abc",
+    });
+    assert.match(html, />Reopen</);
+    assert.doesNotMatch(html, /<a|data-act="(?:close|cancel)"/);
+  }
+});
+
+test("notification settings show the exact destination with no internal label picker", () => {
+  const context = vm.createContext({
+    notifySettings: { Reviewer: {} },
+    notifyDestinations: [{ id: "route-id", label: "Reviewer's bot", ready: true }],
+    escapeHtml: (value) => String(value),
+  });
+  vm.runInContext(
+    hub.slice(hub.indexOf("function displaySendTo("), hub.indexOf("function renderNotificationsPanel(")),
+    context,
+  );
+  const html = context.notifyRowHtml("Reviewer", { send_to: "https://discord.com/channels/team/channel" });
+  assert.match(html, /value="https:\/\/discord.com\/channels\/team\/channel"/);
+  assert.match(html, /Paste a Discord webhook or channel link/);
+  assert.doesNotMatch(html, /data-notify-pick|Reviewer's bot/);
 });
 
 test("board tag entry point is outside the conversation sheet, beside its title", () => {
@@ -54,6 +87,8 @@ test("board tag entry point is outside the conversation sheet, beside its title"
   assert.match(html, /id="boardTitle">Review board/);
   assert.match(html, /Message agent/);
   assert.match(html, /Message &amp; end session/);
+  assert.match(html, /href="\/">Back to hub</);
+  assert.doesNotMatch(html, /Fusion Hub/);
 });
 
 test("shared editor distinguishes applied tags and people and preserves disclosure after saving", async () => {
@@ -94,6 +129,45 @@ test("shared editor distinguishes applied tags and people and preserves disclosu
   assert.match(root.innerHTML, /class="tag-editor" open/);
   assert.match(root.innerHTML, /Added/);
   assert.match(root.innerHTML, /✓ Reviewer/);
+});
+
+test("shared board End session delegates to chrome and rerenders retain terminal reservation state", async () => {
+  const source = await readFile(new URL("../src/board-metadata-client.js", import.meta.url), "utf8");
+  const listeners = {};
+  const events = [];
+  const button = { disabled: false, dataset: {}, hasAttribute: (name) => name === "data-lifecycle-close" };
+  const lifecycle = { dataset: { endDisabled: "true" }, innerHTML: "", querySelectorAll: () => [button] };
+  const root = {
+    dataset: { boardMetadata: "abc", chrome: "true", metadata: '{"tags":[]}' },
+    innerHTML: "",
+    querySelector: () => null,
+  };
+  const context = vm.createContext({
+    document: {
+      querySelectorAll: () => [root],
+      querySelector: () => root,
+      getElementById: () => lifecycle,
+      addEventListener: (name, fn) => {
+        listeners[name] = fn;
+      },
+    },
+    window: { addEventListener() {}, dispatchEvent: (event) => events.push(event.type) },
+    CustomEvent: class {
+      constructor(type) {
+        this.type = type;
+      }
+    },
+    fetch: () => {
+      throw new Error("End session must use the chrome's guarded operation");
+    },
+  });
+  vm.runInContext(source, context);
+  assert.equal(button.disabled, true);
+  context.window.lavishBoardMetadata.update({ key: "abc", tags: ["review"] });
+  assert.equal(button.disabled, true);
+  button.disabled = false;
+  await listeners.click({ target: { closest: (selector) => (selector === "[data-reactivate]" ? null : button) } });
+  assert.deepEqual(events, ["lavish:end-session-request"]);
 });
 
 test("creation time survives opening and reopening and remains distinct from last viewed time", async () => {

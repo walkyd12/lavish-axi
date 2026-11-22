@@ -1,4 +1,25 @@
 import { boardSearchText } from "./board-metadata.js";
+import { parseFragment } from "parse5";
+import { parseRevisionRegistry } from "./artifact-revisions.js";
+
+// Match the board legend's validated registry, never the layout audit's load sequence.
+export function hubArtifactRevision(html) {
+  const root = parseFragment(String(html).slice(0, 65536));
+  const pending = [...root.childNodes].reverse();
+  while (pending.length) {
+    const node = pending.pop();
+    if (
+      "tagName" in node &&
+      node.tagName === "script" &&
+      node.attrs.some((attr) => attr.name === "data-lavish-revisions")
+    ) {
+      const textContent = node.childNodes.map((child) => ("value" in child ? child.value : "")).join("");
+      return parseRevisionRegistry({ querySelector: () => ({ textContent }) }).at(-1)?.label || "";
+    }
+    if ("childNodes" in node) pending.push(...[...node.childNodes].reverse());
+  }
+  return "";
+}
 
 // Use the same bounded 64 KiB slice already read for cards. Never execute page code.
 export function hubArtifactSummary(html) {
