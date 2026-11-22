@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,7 +17,7 @@ test("hub title is configurable and settings and technical metadata start tucked
   assert.match(html, /Team &lt;Hub&gt;/);
   assert.doesNotMatch(html, /Fusion/);
   assert.match(html, /<dialog[^>]*id="hubSettings"/);
-  assert.match(html, /Include closed/);
+  assert.match(html, /Also search closed &amp; cancelled/);
   assert.doesNotMatch(html, /Closed <span/);
   assert.doesNotMatch(html, /Cancelled <span/);
 });

@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,11 +7,88 @@ import test from "node:test";
 import vm from "node:vm";
 import { serve } from "../src/server.js";
 import { createHubHtml } from "../src/hub.js";
-import { hubArtifactSummary } from "../src/hub-summary.js";
+import { hubArtifactSummary, hubArtifactRevision } from "../src/hub-summary.js";
 import { createNotifyDestinations } from "../src/notify-destinations.js";
+import { serializePeerBoard } from "../src/hub-peers.js";
+
+test("notification test waits for hook completion and reports nonzero exit honestly", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "notify-completion-"));
+  process.env.LAVISH_AXI_STATE_DIR = dir;
+  const hook = path.join(dir, "notify.mjs");
+  await writeFile(
+    hook,
+    '#!/usr/bin/env node\nconst event = JSON.parse(process.argv[2]); setTimeout(() => process.exit(event.send_to.endsWith("failure") ? 7 : 0), 100);\n',
+  );
+  await chmod(hook, 0o700);
+  const server = await serve({
+    port: 0,
+    hosts: ["127.0.0.1"],
+    stateFile: path.join(dir, "state.json"),
+    hubPeers: "",
+    env: { ...process.env, LAVISH_AXI_NOTIFY_PEOPLE: "Reviewer", LAVISH_AXI_ON_EVENT: hook },
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    for (const outcome of ["failure", "success"]) {
+      const response = await fetch(base + "/api/hub/notifications/test", {
+        method: "POST",
+        headers: { origin: base, "content-type": "application/json" },
+        body: JSON.stringify({ person: "Reviewer", send_to: "https://example.invalid/" + outcome }),
+      });
+      const body = await response.json();
+      assert.equal(response.status, outcome === "failure" ? 503 : 200);
+      assert.match(body.error || body.message, outcome === "failure" ? /exit.*7|failed/i : /hook completed/i);
+      assert.doesNotMatch(body.error || body.message, /queued/i);
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 process.env.LAVISH_AXI_HOST = "127.0.0.1";
 process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
+
+test("hub revision labels come from the declared registry and ignore template and malformed registries", () => {
+  const registry =
+    '<script type="application/json" data-lavish-revisions>[{"id":"r1","label":"First review"},{"id":"r2","label":"Second review"}]</script>';
+  assert.equal(hubArtifactRevision(registry), "Second review");
+  assert.equal(hubArtifactRevision("<p>" + "x".repeat(70000) + "</p>" + registry), "Second review");
+  assert.equal(hubArtifactRevision("<template>" + registry + "</template>"), "");
+  assert.equal(hubArtifactRevision("<script data-lavish-revisions>invalid</script>"), "");
+  assert.equal(hubArtifactRevision("<p>Unchanged board</p>"), "");
+});
+
+test("hub and peer cards keep declared revision labels when unchanged boards reload", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "hub-revision-label-"));
+  process.env.LAVISH_AXI_STATE_DIR = dir;
+  const file = path.join(dir, "board.html");
+  await writeFile(
+    file,
+    "<title>Review</title>" +
+      " ".repeat(70000) +
+      '<script type="application/json" data-lavish-revisions>[{"id":"r2","label":"Second review"}]</script>',
+  );
+  const server = await serve({ port: 0, hosts: ["127.0.0.1"], stateFile: path.join(dir, "state.json"), hubPeers: "" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    const response = await fetch(base + "/api/sessions", {
+      method: "POST",
+      headers: { origin: base, "content-type": "application/json" },
+      body: JSON.stringify({ file }),
+    });
+    const { key } = await response.json();
+    for (let i = 0; i < 3; i++) {
+      await fetch(base + "/session/" + key);
+      const { boards } = await fetch(base + "/api/hub").then((r) => r.json());
+      assert.equal(boards[0].revision_label, "Second review");
+      assert.equal(serializePeerBoard({ name: "remote", origin: base }, boards[0]).revision_label, "Second review");
+    }
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 async function clientHarness(board) {
   const elements = new Map();
@@ -65,7 +143,13 @@ async function clientHarness(board) {
     CustomEvent: class {},
     fetch: async (url, init) => {
       requests.push({ url, init });
-      return { ok: true, json: async () => ({ client: "New" }) };
+      return {
+        ok: true,
+        json: async () =>
+          url === "/api/hub/notifications/test"
+            ? { message: "Notification hook completed successfully." }
+            : { client: "New" },
+      };
     },
   });
   vm.runInContext(await readFile(new URL("../src/hub-client.js", import.meta.url), "utf8"), context);
@@ -177,36 +261,42 @@ test("failed tab navigation stays empty with Retry and recovers within the selec
   assert.equal(h.elements.get("hubLoadError").hidden, true);
 });
 
-test("notification picker replaces a focused destination and Send test uses the visible field", async () => {
+test("notification URL saves literally and Send test uses the focused visible field", async () => {
   const h = await clientHarness({ key: "a", status: "open" });
   const field = {
     value: "Legacy destination",
     dataset: { notifyPerson: "Reviewer", notifyField: "send_to" },
     matches: () => true,
   };
-  const picker = { dataset: { notifyPick: "Reviewer" }, value: "dm" };
   const status = { setAttribute() {} };
+  const result = { dataset: {}, hidden: true, textContent: "" };
   const row = {
     dataset: { notifyRow: "Reviewer" },
-    querySelector: (selector) => (selector.includes("select") ? picker : selector.includes("input") ? field : status),
+    querySelector: (selector) =>
+      selector === "[data-notify-test-result]" ? result : selector.includes("input") ? field : status,
     querySelectorAll: () => [field],
   };
-  picker.closest = () => row;
+  field.closest = () => row;
   const rows = h.elements.get("notifyRows");
   rows.contains = () => true;
   rows.querySelectorAll = () => [row];
-  h.run(
-    'notifySettings = {Reviewer:{tagged:false,done:false,send_to:"Legacy destination"}}; notifyDestinations = [{id:"dm",label:"Reviewer DM",ready:true}]',
-  );
-  // Keep the field focused while the picker changes, as with a delayed provider response.
+  h.run('notifySettings = {Reviewer:{tagged:false,done:false,send_to:"Legacy destination"}}');
   h.document.activeElement = field;
-  await h.emit("notifyRows", "change", picker);
-  assert.equal(field.value, "Reviewer DM"); // the box shows the friendly name; the stored route is "dm"
   field.value = "https://hooks.example/visible";
+  await h.emit("notifyRows", "change", field);
+  await h.run("notifySaveChain");
+  const saved = h.requests.find((r) => r.url === "/api/hub/notifications" && r.init?.body);
+  assert.equal(JSON.parse(saved.init.body).patch.send_to, field.value);
   const button = { dataset: { notifyTest: "Reviewer" }, closest: () => row };
   await h.emit("notifyRows", "click", { closest: () => button });
   const request = h.requests.find((r) => r.url === "/api/hub/notifications/test");
   assert.equal(JSON.parse(request.init.body).send_to, field.value);
+  assert.match(result.textContent, /hook completed successfully/);
+  assert.equal(result.hidden, false);
+  h.run('fetch = async () => ({ok:false,json:async()=>({error:"Notification hook failed (exit 7)."})})');
+  await h.emit("notifyRows", "click", { closest: () => button });
+  assert.match(result.textContent, /exit 7/);
+  assert.equal(result.dataset.tone, "error");
 });
 
 test("compact hub omits decoration and offers a plain theme", () => {
@@ -258,7 +348,7 @@ test("notification destinations are server supplied and test notifications use t
     assert.equal((await post(testRoute, { person: "Missing", send_to: "dm" })).status, 400);
     for (const send_to of ["dm", "https://hooks.example/secret?token=a", "legacy custom"]) {
       const response = await post(testRoute, { person: "Reviewer", send_to });
-      assert.equal(response.status, 202);
+      assert.equal(response.status, 200);
       const event = events.at(-1);
       assert.equal(event.event, "notify_test");
       assert.equal(event.person, "Reviewer");
@@ -363,7 +453,7 @@ test("Send test reports an unconnected hook and launches a configured executable
     assert.equal(
       (await post("/api/hub/notifications/test", { person: "Reviewer", send_to: "https://example.invalid/hook" }))
         .status,
-      202,
+      200,
     );
     let rows = [];
     for (let i = 0; i < 100; i++) {
@@ -382,6 +472,40 @@ test("Send test reports an unconnected hook and launches a configured executable
     assert.equal(rows[0].event, "notify_test");
     assert.equal(rows[0].notify_settings.Reviewer.send_to, "https://example.invalid/hook");
     assert.equal(rows[0].notify_settings.Reviewer.tagged, false, "tests work even when automatic pings are off");
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy card creation falls back to mtime without rewriting session history; last board close leaves health up", async () => {
+  const { mkdir, utimes } = await import("node:fs/promises");
+  const dir = await mkdtemp(path.join(tmpdir(), "legacy-cards-"));
+  process.env.LAVISH_AXI_STATE_DIR = dir;
+  const file = path.join(dir, "project-a", "index.html");
+  await mkdir(path.dirname(file));
+  await writeFile(file, "<title>Project review</title>");
+  const modified = new Date("2026-11-20T09:00:00Z");
+  await utimes(file, modified, modified);
+  const stateFile = path.join(dir, "state.json");
+  await writeFile(
+    stateFile,
+    JSON.stringify({ sessions: { legacy: { key: "legacy", file, status: "open", chat: [] } } }),
+  );
+  const server = await serve({ port: 0, hosts: ["127.0.0.1"], stateFile, hubPeers: "" });
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    for (let i = 0; i < 2; i++) {
+      const { boards } = await fetch(base + "/api/hub").then((r) => r.json());
+      assert.equal(boards[0].created_at, modified.toISOString());
+      assert.equal(boards[0].created_at_source, "file");
+      assert.equal(serializePeerBoard({ name: "remote", origin: base }, boards[0]).created_at_source, "file");
+    }
+    const closed = await fetch(base + "/api/hub/legacy/close", { method: "POST", headers: { origin: base } });
+    assert.equal(closed.status, 200);
+    assert.equal((await fetch(base + "/health")).status, 200);
+    const stored = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal(stored.sessions.legacy.created_at || "", "");
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });

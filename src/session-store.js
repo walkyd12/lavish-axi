@@ -146,6 +146,7 @@ export class SessionStore {
       tags: serializeBoardMetadata(existing).tags,
       creator: existing.creator || creator,
       client: existing.client || "",
+      created_at: existing.created_at || (!existing.key ? new Date().toISOString() : ""),
       created_version: existing.created_version || (!existing.key ? version : ""),
       served_version: version || existing.served_version || "",
       pending_prompts: existing.pending_prompts || 0,

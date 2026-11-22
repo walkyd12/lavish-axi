@@ -57,6 +57,7 @@ export function serializeBoardMetadata(session) {
     tags: Array.isArray(session.tags) ? session.tags : [],
     creator: session.creator || "",
     client: session.client || "",
+    created_at: session.created_at || "",
     created_version: session.created_version || "",
     served_version: session.served_version || "",
     opened_at: session.opened_at || "",

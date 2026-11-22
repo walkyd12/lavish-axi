@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";

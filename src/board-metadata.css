@@ -14,13 +14,18 @@
   --metadata-bg: var(--bg-panel);
   --metadata-line: var(--border);
   --metadata-accent: var(--accent);
-  padding: 0 16px 12px;
-  border-bottom: 1px solid var(--metadata-line);
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 16px;
 }
 .board-provenance {
   margin: 0 0 8px;
   line-height: 1.5;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .board-provenance strong {
   color: var(--metadata-accent);
@@ -44,7 +49,8 @@
   border-radius: 8px;
   padding: 6px 10px;
   max-width: 100%;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 [data-board-metadata] button,
 .tag-editor summary {
@@ -98,4 +104,36 @@ span.board-tag:not(:has(button)) {
 }
 .metadata-notice {
   margin: 8px 0 0;
+}
+
+.tag-label {
+  margin: 14px 0 6px;
+  font-weight: 600;
+}
+.tag-help {
+  margin: 4px 0;
+  line-height: 1.5;
+}
+.tag-editor > summary,
+.metadata-details > summary {
+  cursor: pointer;
+  min-height: 28px;
+}
+.tag-editor {
+  margin: 0;
+}
+.board-workflow-state {
+  font-weight: 600;
+  cursor: default;
+}
+.chrome-board-metadata .tag-editor[open] {
+  flex-basis: 100%;
+  max-width: 600px;
+}
+.chrome-board-metadata .metadata-details[open] {
+  flex-basis: 100%;
+}
+
+.chrome-board-metadata .metadata-notice:not([hidden]) {
+  margin: 0;
 }

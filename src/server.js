@@ -2,14 +2,14 @@ import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { open as openFile, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { createServer, get as httpGet } from "node:http";
 import { isIP } from "node:net";
 import { homedir, hostname as osHostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { hubArtifactSummary } from "./hub-summary.js";
+import { hubArtifactSummary, readHubArtifact } from "./hub-summary.js";
 import { runApprovalPreview } from "./approval-preview.js";
 
 import chokidar from "chokidar";
@@ -790,23 +790,23 @@ export async function serve({
 
   function runDetachedHookOrdered(envVar, command, args, extraEnv = {}) {
     if (!command) {
-      return { configured: false, launched: Promise.resolve({ ok: true, error: "" }) };
+      return { configured: false, completed: Promise.resolve({ ok: true, error: "" }) };
     }
     if (!path.isAbsolute(command)) {
       const msg = `${envVar} must be an absolute path to an executable; skipped`;
       writeLog(`[lavish] ${msg}`);
-      return { configured: true, launched: Promise.resolve({ ok: false, error: msg }) };
+      return { configured: true, completed: Promise.resolve({ ok: false, error: msg }) };
     }
     /** @type {(res: { ok: boolean, error: string }) => void} */
-    let resolveLaunched;
-    const launched = new Promise((resolve) => {
-      resolveLaunched = resolve;
+    let resolveCompleted;
+    const completed = new Promise((resolve) => {
+      resolveCompleted = resolve;
     });
-    let launchSettled = false;
-    const settleLaunch = (ok, error = "") => {
-      if (launchSettled) return;
-      launchSettled = true;
-      resolveLaunched({ ok, error });
+    let completionSettled = false;
+    const settleCompletion = (ok, error = "") => {
+      if (completionSettled) return;
+      completionSettled = true;
+      resolveCompleted({ ok, error });
     };
     hookQueue = hookQueue
       .then(
@@ -820,7 +820,7 @@ export async function serve({
               resolve();
             };
             const timer = setTimeout(() => {
-              settleLaunch(false, `event hook ${command} timed out`);
+              settleCompletion(false, `event hook ${command} timed out`);
               finish();
             }, HOOK_STEP_TIMEOUT_MS);
             timer.unref?.();
@@ -830,29 +830,31 @@ export async function serve({
                 stdio: "ignore",
                 env: { ...process.env, ...env, ...extraEnv },
               });
-              child.once("spawn", () => settleLaunch(true));
               child.on("error", (error) => {
                 writeLog(`[lavish] event hook ${command} failed to start: ${error.message}`);
-                settleLaunch(false, error.message);
+                settleCompletion(false, error.message);
                 finish();
               });
-              child.once("close", () => {
-                settleLaunch(true);
+              child.once("close", (code, signal) => {
+                const ok = code === 0;
+                const error = ok ? "" : `Notification hook failed (${signal ? `signal ${signal}` : `exit ${code}`}).`;
+                if (!ok) writeLog(`[lavish] ${error}`);
+                settleCompletion(ok, error);
                 finish();
               });
               child.unref();
             } catch (error) {
               const message = String(error?.message || error);
               writeLog(`[lavish] event hook ${command} failed: ${message}`);
-              settleLaunch(false, message);
+              settleCompletion(false, message);
               finish();
             }
           }),
       )
       .catch(() => {
-        settleLaunch(false, "event hook queue failed");
+        settleCompletion(false, "event hook queue failed");
       });
-    return { configured: true, launched };
+    return { configured: true, completed };
   }
 
   // LAVISH_AXI_ON_EVENT (and optional LAVISH_AXI_ON_ACTION for board_action) names an executable run
@@ -882,28 +884,47 @@ export async function serve({
       notifyHubViewers();
     }
     const hookPayload = { ...eventPayload, notify_settings: notifySnapshot };
-    if (typeof onEvent === "function") {
-      Promise.resolve()
-        .then(() => onEvent(hookPayload))
-        .catch((error) => writeLog(`[lavish] onEvent callback failed: ${error?.message || error}`));
-    }
+    const callbackCompletion =
+      typeof onEvent === "function"
+        ? new Promise((resolve) => {
+            const timer = setTimeout(
+              () => resolve({ ok: false, error: "Notification hook timed out." }),
+              HOOK_STEP_TIMEOUT_MS,
+            );
+            timer.unref?.();
+            Promise.resolve()
+              .then(() => onEvent(hookPayload))
+              .then(
+                () => {
+                  clearTimeout(timer);
+                  resolve({ ok: true, error: "" });
+                },
+                (error) => {
+                  clearTimeout(timer);
+                  writeLog(`[lavish] onEvent callback failed: ${error?.message || error}`);
+                  resolve({ ok: false, error: "Notification hook failed." });
+                },
+              );
+          })
+        : null;
     const serialized = serializeBoundedHookPayload(eventPayload, notifySnapshot, MAX_HOOK_ARG_BYTES);
     const hookEnv = { LAVISH_AXI_EVENT: String(eventPayload.event || "") };
     const eventCommand = String(env.LAVISH_AXI_ON_EVENT || process.env.LAVISH_AXI_ON_EVENT || "").trim();
-    const launchResults = [runDetachedHookOrdered("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv)];
+    const hookResults = [runDetachedHookOrdered("LAVISH_AXI_ON_EVENT", eventCommand, [serialized], hookEnv)];
     if (eventPayload.event === "board_action") {
       const actionCommand = String(env.LAVISH_AXI_ON_ACTION || process.env.LAVISH_AXI_ON_ACTION || "").trim();
       if (actionCommand && actionCommand !== eventCommand) {
-        launchResults.push(runDetachedHookOrdered("LAVISH_AXI_ON_ACTION", actionCommand, [serialized], hookEnv));
+        hookResults.push(runDetachedHookOrdered("LAVISH_AXI_ON_ACTION", actionCommand, [serialized], hookEnv));
       }
     }
-    const configuredLaunches = launchResults.filter((item) => item.configured).map((item) => item.launched);
+    const configuredHooks = hookResults.filter((item) => item.configured).map((item) => item.completed);
+    if (callbackCompletion) configuredHooks.push(callbackCompletion);
     return {
-      configured: configuredLaunches.length > 0,
-      launched:
-        configuredLaunches.length === 0
+      configured: configuredHooks.length > 0,
+      completed:
+        configuredHooks.length === 0
           ? Promise.resolve({ ok: true, error: "" })
-          : Promise.all(configuredLaunches).then((outcomes) => {
+          : Promise.all(configuredHooks).then((outcomes) => {
               const failedOutcome = outcomes.find((item) => !item.ok);
               return failedOutcome || { ok: true, error: "" };
             }),
@@ -1323,7 +1344,7 @@ export async function serve({
   const MAX_HUB_LIMIT = 200;
   const BOARD_IO_CONCURRENCY = 32;
   const MAX_BOARD_HEAD_CACHE = 2048;
-  /** @type {Map<string, { stamp: string, title: string, nextStep?: string, searchText: string | null }>} */
+  /** @type {Map<string, { stamp: string, title: string, nextStep?: string, revisionLabel?: string, fileModifiedAt?: string, searchText: string | null }>} */
   const boardHeadCache = new Map();
 
   /**
@@ -1375,21 +1396,13 @@ export async function serve({
     if (cached && cached.stamp === stamp && (!includeSearchText || cached.searchText !== null)) {
       return { exists: true, title: cached.title, searchText: cached.searchText || "" };
     }
-    const maxBytes = includeSearchText ? 1024 * 1024 : 64 * 1024;
-    const toRead = Math.min(Number(st.size), maxBytes);
-    if (toRead === 0) {
-      boardHeadCache.set(file, { stamp, title: "", searchText: "" });
-      return { exists: true, title: "", searchText: "" };
-    }
-    let handle;
+    const fileModifiedAt = new Date(Number(st.mtimeMs)).toISOString();
     try {
-      handle = await openFile(file, "r");
-      const buffer = Buffer.allocUnsafe(toRead);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      const html = buffer.subarray(0, bytesRead).toString("utf8");
+      // Cache bounded metadata and revision windows by file stamp.
+      const { html, revisionLabel } = await readHubArtifact(file, { includeSearchText });
       const { title, nextStep } = hubArtifactSummary(html);
       const searchText = includeSearchText
-        ? boardSearchText(html).slice(0, 64 * 1024)
+        ? boardSearchText(html.slice(0, 1024 * 1024)).slice(0, 64 * 1024)
         : cached && cached.stamp === stamp
           ? cached.searchText
           : null;
@@ -1397,12 +1410,17 @@ export async function serve({
         const oldestKey = boardHeadCache.keys().next().value;
         if (oldestKey !== undefined) boardHeadCache.delete(oldestKey);
       }
-      boardHeadCache.set(file, { stamp, title, nextStep, searchText });
+      boardHeadCache.set(file, {
+        stamp,
+        title,
+        nextStep,
+        revisionLabel,
+        fileModifiedAt,
+        searchText,
+      });
       return { exists: true, title, searchText: searchText || "" };
     } catch (error) {
       return { exists: error?.code !== "ENOENT" && error?.code !== "ENOTDIR", title: "", searchText: "" };
-    } finally {
-      await handle?.close().catch(() => {});
     }
   }
 
@@ -1722,6 +1740,8 @@ export async function serve({
         fileExists: facts.fileExists !== undefined ? facts.fileExists : (existsByKey.get(String(session.key)) ?? true),
         title: facts.title !== undefined ? facts.title : cachedHead?.title || "",
         nextStep: cachedHead?.nextStep || "",
+        revisionLabel: cachedHead?.revisionLabel || "",
+        fileModifiedAt: cachedHead?.fileModifiedAt || "",
         ...(facts.includeSearchText ? { searchText: facts.searchText || "", includeSearchText: true } : {}),
         version,
         now,
@@ -1960,12 +1980,14 @@ export async function serve({
         },
         { broadcast: false, notifySnapshot: { ...settings, [person]: { ...settings[person], send_to: sendTo } } },
       );
-      const launched = await delivery.launched;
-      if (!launched.ok) {
-        res.status(503).json({ error: "Could not start the notification hook. Check the server log." });
+      const completed = await delivery.completed;
+      if (!completed.ok) {
+        res.status(503).json({ error: completed.error || "Notification hook failed. Check the server log." });
         return;
       }
-      res.status(202).json({ message: "Test queued. Check your destination." });
+      res
+        .status(200)
+        .json({ message: "Notification hook completed successfully. Check your destination to confirm receipt." });
     } catch (error) {
       if (error instanceof NotifySettingsError) res.status(error.statusCode).json({ error: error.message });
       else next(error);
@@ -5371,10 +5393,11 @@ ${themed.style}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><span class="presence-pill" id="presencePill" role="status" aria-live="polite" data-tone="off"><span class="presence-dot" aria-hidden="true"></span><span class="presence-text" id="presencePillText">Connecting…</span></span><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="panel" aria-expanded="true" aria-label="Hide conversation" title="Hide conversation">${chromeIcons.sidebar}<span class="sidebar-toggle-count" id="sidebarToggleCount" aria-hidden="true" hidden></span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="layoutToggle" type="button" title="Switch between the phone and desktop layouts. Remembered on this device.">${chromeIcons.phone}<span id="layoutToggleText">Layout: Auto</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}" data-people="${escapeHtml(JSON.stringify(Array.isArray(notifyPeople) ? notifyPeople : []))}" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><pre id="approvalPreview" class="approval-preview" aria-live="polite"></pre><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><label class="approval-author-wrap" id="approvalTokenWrap" for="approvalTokenInput" hidden><span>Token</span><input id="approvalTokenInput" type="password" maxlength="200" placeholder="Approval token"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<section class="board-context" aria-label="Board"><h1 id="boardTitle">${escapeHtml(title.replace(/ · Lavish$/, ""))}</h1><div class="chrome-board-metadata" data-board-metadata="${session.key}" data-chrome="true" data-action-label="${escapeHtml(actionLabel)}" data-people="${escapeHtml(JSON.stringify(Array.isArray(notifyPeople) ? notifyPeople : []))}" data-file="${escapeHtml(session.file)}" data-metadata="${escapeHtml(JSON.stringify(serializeBoardMetadata(session)))}"></div></section>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner handoff-banner approval-banner" id="approvalBanner" hidden><span id="approvalBannerText"></span><pre id="approvalPreview" class="approval-preview" aria-live="polite"></pre><label class="approval-author-wrap" for="approvalAuthorInput"><span>Reviewer</span><input id="approvalAuthorInput" type="text" maxlength="80" placeholder="Your name"></label><label class="approval-author-wrap" id="approvalTokenWrap" for="approvalTokenInput" hidden><span>Token</span><input id="approvalTokenInput" type="password" maxlength="200" placeholder="Approval token"></label><span class="outdated-actions"><button class="handoff-takeover" id="approvalConfirm" type="button">Confirm</button><button class="handoff-takeover" id="approvalCancel" type="button">Cancel</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Message sending is unavailable while no agent is listening. You can draft a message, use the work action below, or return to your agent to resume listening.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Nothing queued in this tab. Unsent notes are saved with this review, so reopening the link in a new tab or window brings them back.</div><p class="composer-label">Message the agent</p><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Message &amp; end session</span></button><button class="button" id="send">Message agent</button></div><div id="boardLifecycle" class="board-lifecycle-actions"></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
-<div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p><button type="button" class="button ended-action" data-reactivate data-key="${session.key}" data-file="${escapeHtml(session.file)}">Reactivate board</button><p><a href="/">Fusion Hub</a></p></div></div>
+<div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p><button type="button" class="button ended-action" data-reactivate data-key="${session.key}" data-file="${escapeHtml(session.file)}">Reactivate board</button><p><a href="/">Back to hub</a></p></div></div>
 <div class="whiteboard-overlay" id="whiteboardOverlay" hidden><div class="whiteboard-shell"><div class="whiteboard-error" id="whiteboardError" hidden></div><button class="whiteboard-close" id="whiteboardClose" type="button" aria-label="Close whiteboard"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button><iframe id="whiteboardFrame" title="Excalidraw whiteboard" sandbox="allow-scripts allow-popups"></iframe></div></div>
 <script id="lavish-session" type="application/json">${sessionJson}</script>
 <script>${CHROME_BOOT_FAILSAFE_JS}</script>

@@ -1,3 +1,4 @@
+import "./isolate-hooks.js";
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -145,7 +146,7 @@ for (const outcome of ["success", "edited", "failure", "uploading", "error"]) {
       },
     });
     assert.ok(click);
-    await click({ target: { closest: (selector) => (selector === "[data-reactivate]" ? null : button) } });
+    await click({ target: { closest: (selector) => (selector === "[data-board-metadata] button" ? button : null) } });
     if (outcome === "uploading" || outcome === "error") {
       assert.equal(requests.length, 0);
     } else {

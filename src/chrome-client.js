@@ -347,9 +347,9 @@ const SNAPSHOT_REQUEST_TIMEOUT_MS = 5000;
 const SEND_STALLED_COPY =
   "Still trying to send. Your feedback is saved in this tab. Keep this tab open while Lavish catches up, and check that the server is running.";
 const SEND_FAILED_COPY =
-  "Could not send. Your feedback is still queued in this tab. Check that Lavish is running, then click Send to Agent to retry.";
+  "Could not send. Your feedback is still queued in this tab. Check that Lavish is running, then click Message agent to retry.";
 const TERMINAL_SEND_FAILED_COPY =
-  "Could not send. Your terminal feedback is still queued in this tab. Check that Lavish is running, then click Send & End to retry the same batch.";
+  "Could not send. Your terminal feedback is still queued in this tab. Check that Lavish is running, then click Message & end session to retry the same batch.";
 const HEALTH_NO_ANSWER_TITLE = "Lavish did not answer.";
 const HEALTH_NO_ANSWER_COPY =
   "Lavish did not answer the check, so this page cannot tell whether it is running. Try again in a moment.";
@@ -915,12 +915,20 @@ function updateSendState() {
   // artifact without disabling annotation mode. Disabling annotation mode closes the
   // SDK card and destroys an unsent draft before delivery has actually succeeded.
   frame.inert = ended || terminalReserved;
-  sendButton.disabled = ended || terminalReserved;
-  sendAndEndButton.disabled = ended || Boolean(terminalSubmission?.inFlight);
+  sendButton.disabled = ended || terminalReserved || agentPresence === "waiting";
+  sendAndEndButton.disabled =
+    ended || Boolean(terminalSubmission?.inFlight) || (agentPresence === "waiting" && !terminalReserved);
   annotationSwitch.disabled = ended || terminalReserved;
   chatInput.disabled = ended || terminalReserved;
   chatAttachButton.disabled = ended || terminalReserved;
   endButton.disabled = ended || terminalReserved;
+  const lifecycle = document.getElementById("boardLifecycle");
+  if (lifecycle) {
+    lifecycle.dataset.endDisabled = String(terminalReserved);
+    for (const button of lifecycle.querySelectorAll("[data-lifecycle-close], [data-lifecycle-cancel]")) {
+      /** @type {HTMLButtonElement} */ (button).disabled = terminalReserved;
+    }
+  }
   if (warningsQueueButton) updateWarningSelectionState();
 }
 
@@ -2771,7 +2779,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
       }
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
       showQueuedSendFailure(
-        "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Send to Agent to retry.",
+        "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Message agent to retry.",
         { kind: "submission", operation: submission },
       );
       if (submission.terminal) releaseTerminalSubmission(submission.terminal);
@@ -3676,6 +3684,11 @@ async function endSession(terminal = null) {
   if (!response.ok) throw new Error("failed to end session");
   markSessionEnded();
 }
+
+window.addEventListener("lavish:end-session-request", () => {
+  closeMenus();
+  endSession().catch(() => showSendHint("Could not end the session. Try again."));
+});
 
 function markSessionEnded() {
   if (ended) return;
@@ -4835,6 +4848,8 @@ function applyDocumentMeta(msg) {
       .trim();
     document.title = title ? title + " · Lavish" : loadTimeTitle;
   }
+  const heading = document.getElementById("boardTitle");
+  if (heading) heading.textContent = document.title.replace(/ · Lavish$/, "");
   if (msg.icon === null) setDocumentIcon(loadTimeIconHref);
   else if (
     typeof msg.icon === "string" &&
@@ -4856,6 +4871,27 @@ function setDocumentIcon(href) {
   else document.head.appendChild(link);
 }
 
+// The opaque artifact cannot inspect local response headers. Return only the MIME type.
+async function probeEvidenceType(msg, loadToken) {
+  let contentType = "";
+  try {
+    const url = new URL(msg.href, location.href);
+    if (url.origin !== new URL(location.href).origin || !/^https?:$/.test(url.protocol)) return;
+    const response = await fetch(url.href, {
+      method: "HEAD",
+      credentials: "omit",
+      redirect: "error",
+      signal: AbortSignal.timeout(3000),
+    });
+    if (response.ok) contentType = response.headers.get("content-type") || "";
+  } catch {
+    // An unsupported HEAD falls back to the ordinary link behavior or known image suffix.
+  } finally {
+    if (loadToken === artifactLoadToken)
+      postToFrame({ type: "lavish:evidenceType", request_id: msg.request_id, content_type: contentType });
+  }
+}
+
 window.addEventListener("message", (event) => {
   if (event.source !== frame.contentWindow) return;
 
@@ -4865,6 +4901,10 @@ window.addEventListener("message", (event) => {
     // A pass can be stamped by the load that just lost a token race. Ask the current artifact
     // document to run the audit again instead of consuming the only pass for this cycle.
     if (msg.type === "lavish:layoutDiagnostics") postToFrame({ type: "lavish:requestLayoutDiagnostics" });
+    return;
+  }
+  if (msg.type === "lavish:probeEvidenceType") {
+    void probeEvidenceType(msg, messageToken);
     return;
   }
   const messageSequence = ++artifactMessageSequence;
@@ -5084,8 +5124,12 @@ function toggleAnnotationMode() {
 
 annotationSwitch.onclick = toggleAnnotationMode;
 
-sendButton.onclick = () => sendQueued(false);
-sendAndEndButton.onclick = () => sendQueued(true);
+sendButton.onclick = () => {
+  if (!sendButton.disabled) sendQueued(false);
+};
+sendAndEndButton.onclick = () => {
+  if (!sendAndEndButton.disabled) sendQueued(true);
+};
 moreButton.onclick = () => {
   closeWarningsDrawer();
   closeRevisionsDrawer();
@@ -5183,7 +5227,7 @@ chatAttachments.addEventListener("click", (event) => {
 chatInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
-    sendQueued(false);
+    if (!sendButton.disabled) sendQueued(false);
   }
 });
 chatInput.addEventListener("input", () => hideSendHint());
