@@ -130,8 +130,26 @@ span.board-tag:not(:has(button)) {
   flex-basis: 100%;
   max-width: 600px;
 }
-.chrome-board-metadata .metadata-details[open] {
-  flex-basis: 100%;
+/* Details opens as a drop-down under its own toggle; the toggle never moves (Zach 2026-11-22). */
+.chrome-board-metadata .metadata-details {
+  position: relative;
+}
+.chrome-board-metadata .metadata-details[open] > .metadata-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  width: max-content;
+  max-width: min(600px, calc(100vw - 32px));
+  padding: 6px 10px;
+  background: var(--metadata-surface, #fff);
+  border: 1px solid var(--metadata-border, rgba(0, 0, 0, 0.15));
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  overflow-wrap: anywhere;
+}
+.chrome-board-metadata .metadata-dropdown .board-provenance {
+  margin: 2px 0;
 }
 
 .chrome-board-metadata .metadata-notice:not([hidden]) {
