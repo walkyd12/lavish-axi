@@ -1252,3 +1252,5 @@ li.board:has(a.act.primary[href]) {
   font-weight: 600;
   font-size: 0.9em;
 }
+
+#clientRows .client-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 4px; border-bottom: 1px solid var(--line, #e5e7eb); }
