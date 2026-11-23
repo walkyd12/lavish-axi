@@ -1263,8 +1263,15 @@ function jobCard(job) {
   }).join("");
   return `<li class="job-row"><details><summary><span class="job-title">${escapeHtml(String(job.title || job.job || "Job"))}</span>` +
     `<span class="meta job-meta">${meta}</span><span class="meta job-age">${escapeHtml(jobAge(job.started))}</span></summary>` +
-    `<div class="job-detail"><p class="meta">${escapeHtml(String(job.job || ""))}${job.project ? ` · ${escapeHtml(String(job.project))}` : ""}</p>` +
+    `<div class="job-detail">${jobFields(job)}` +
     `<table class="job-steps"><thead><tr><th>Time</th><th>Result</th><th>Step</th></tr></thead><tbody>${steps}</tbody></table></div></details></li>`;
+}
+
+/** @param {any} job  Generic label -> value details from the feed (e.g. models, project, id). */
+function jobFields(job) {
+  const fields = job && typeof job.fields === "object" && job.fields ? Object.entries(job.fields) : [];
+  if (!fields.length) return `<p class="meta">${escapeHtml(String(job.job || ""))}</p>`;
+  return `<dl class="job-fields">${fields.map(([k, v]) => `<dt>${escapeHtml(String(k))}</dt><dd>${escapeHtml(String(v))}</dd>`).join("")}</dl>`;
 }
 
 /** @param {string} a @param {string} b */

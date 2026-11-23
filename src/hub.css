@@ -1266,3 +1266,6 @@ main.jobs-mode > :not(#jobsPanel) { display: none; }
 #jobsPanel .job-steps th, #jobsPanel .job-steps td { text-align: left; vertical-align: top; padding: 4px 8px 4px 0; border-top: 1px solid rgba(127,127,127,.15); overflow-wrap: anywhere; }
 #jobsPanel .job-steps td:first-child { white-space: nowrap; }
 @media (max-width: 640px) { #jobsPanel summary { flex-wrap: wrap; } #jobsPanel .job-meta { white-space: normal; } }
+#jobsPanel .job-fields { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0 0 10px; font-size: 13px; }
+#jobsPanel .job-fields dt { font-weight: 600; }
+#jobsPanel .job-fields dd { margin: 0; overflow-wrap: anywhere; }
