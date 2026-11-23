@@ -1226,7 +1226,107 @@ retry?.addEventListener("click", () => {
   return refresh({ resetLimit: true });
 });
 
+// Jobs tab: a read-only view of running agent jobs from the configured feed (/api/hub/jobs).
+const tabJobs = /** @type {HTMLButtonElement | null} */ (document.getElementById("tabJobs"));
+const jobsPanel = document.getElementById("jobsPanel");
+const jobsList = document.getElementById("jobsList");
+const jobsNote = document.getElementById("jobsNote");
+const countJobs = document.getElementById("countJobs");
+const hubMain = document.querySelector("main");
+
+/** @param {string | null | undefined} stamp */
+function jobAge(stamp) {
+  if (!stamp) return "";
+  const started = Date.parse(String(stamp).replace(" ", "T") + (/[zZ+]/.test(String(stamp)) ? "" : "Z"));
+  if (!Number.isFinite(started)) return "";
+  const minutes = Math.max(0, Math.round((Date.now() - started) / 60000));
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+/** @param {string | null | undefined} stamp */
+function jobClock(stamp) {
+  const at = Date.parse(String(stamp || "").replace(" ", "T") + (/[zZ+]/.test(String(stamp)) ? "" : "Z"));
+  return Number.isFinite(at) ? new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+}
+
+/** @param {any} job */
+function jobCard(job) {
+  // One compact row per job; click it to see the detail (50 running jobs stay scannable).
+  const meta = [job.client, job.stage, job.model].filter(Boolean).map((v) => escapeHtml(String(v))).join(" · ");
+  const steps = (Array.isArray(job.steps) ? job.steps : []).slice(0, 10).map((step) => {
+    const took = step.finished ? jobAge2(step.started, step.finished) : "";
+    return `<tr><td>${escapeHtml(jobClock(step.started))}</td><td>${escapeHtml(String(step.state || ""))}` +
+      `${step.exit_code !== null && step.exit_code !== undefined && step.exit_code !== 0 ? ` (exit ${escapeHtml(String(step.exit_code))})` : ""}` +
+      `${took ? `<br><span class="meta">${escapeHtml(took)}</span>` : ""}</td>` +
+      `<td>${escapeHtml(String(step.what || ""))}${step.output ? `<br><span class="meta">${escapeHtml(String(step.output))}</span>` : ""}` +
+      `${step.agent ? `<br><span class="meta">${escapeHtml(String(step.agent))}</span>` : ""}</td></tr>`;
+  }).join("");
+  return `<li class="job-row"><details><summary><span class="job-title">${escapeHtml(String(job.title || job.job || "Job"))}</span>` +
+    `<span class="meta job-meta">${meta}</span><span class="meta job-age">${escapeHtml(jobAge(job.started))}</span></summary>` +
+    `<div class="job-detail">${jobFields(job)}` +
+    `<table class="job-steps"><thead><tr><th>Time</th><th>Result</th><th>Step</th></tr></thead><tbody>${steps}</tbody></table></div></details></li>`;
+}
+
+/** @param {any} job  Generic label -> value details from the feed (e.g. models, project, id). */
+function jobFields(job) {
+  const fields = job && typeof job.fields === "object" && job.fields ? Object.entries(job.fields) : [];
+  if (!fields.length) return `<p class="meta">${escapeHtml(String(job.job || ""))}</p>`;
+  return `<dl class="job-fields">${fields.map(([k, v]) => `<dt>${escapeHtml(String(k))}</dt><dd>${escapeHtml(String(v))}</dd>`).join("")}</dl>`;
+}
+
+/** @param {string} a @param {string} b */
+function jobAge2(a, b) {
+  const x = Date.parse(String(a).replace(" ", "T") + "Z");
+  const y = Date.parse(String(b).replace(" ", "T") + "Z");
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return "";
+  const sec = Math.max(0, Math.round((y - x) / 1000));
+  return sec < 90 ? `${sec}s` : `${Math.round(sec / 60)} min`;
+}
+
+async function loadJobs() {
+  if (!jobsList || !jobsNote) return;
+  jobsNote.textContent = "Loading…";
+  try {
+    const response = await fetch("/api/hub/jobs", { cache: "no-store" });
+    const data = await response.json();
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    if (countJobs) countJobs.textContent = jobs.length ? String(jobs.length) : "";
+    const open = new Set(Array.from(jobsList.querySelectorAll("details[open]")).map((d) => d.dataset.job));
+    jobsList.innerHTML = jobs.map(jobCard).join("");
+    jobsList.querySelectorAll("details").forEach((d, i) => {
+      d.dataset.job = String(jobs[i]?.job || i);
+      if (open.has(d.dataset.job)) d.open = true;
+    });
+    jobsNote.textContent = data.configured === false ? "No jobs feed is configured on this hub."
+      : data.error ? String(data.error)
+      : jobs.length ? `Updated ${new Date().toLocaleTimeString()}` : "Nothing running right now.";
+  } catch {
+    jobsNote.textContent = "Could not load jobs.";
+  }
+}
+
+function showJobs(on) {
+  if (!jobsPanel || !hubMain) return;
+  jobsPanel.hidden = !on;
+  hubMain.classList.toggle("jobs-mode", on);
+  tabJobs?.setAttribute("aria-pressed", on ? "true" : "false");
+  if (on) {
+    for (const tab of [tabOpen, tabNeedsInput, tabClosed, tabCancelled]) tab?.setAttribute("aria-pressed", "false");
+    void loadJobs();
+  }
+}
+
+tabJobs?.addEventListener("click", () => showJobs(true));
+document.getElementById("jobsRefresh")?.addEventListener("click", () => void loadJobs());
+
 function switchTab(nextTab) {
+  if (hubMain?.classList.contains("jobs-mode")) {
+    showJobs(false);
+    if (showing === nextTab) {
+      render();
+      return;
+    }
+  }
   if (showing === nextTab && !search.value.trim() && !tagFilter.value && !includeClosed?.checked) return;
   clearTimeout(searchDebounceTimer);
   searchDebounceTimer = undefined;

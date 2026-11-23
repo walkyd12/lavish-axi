@@ -2039,6 +2039,28 @@ export async function serve({
     }
   });
 
+  // Jobs tab (Zach 2026-11-23): running agent jobs, from an operator-configured read-only feed
+  // command that prints {"jobs": [...]} JSON. Unset -> the tab says it is not configured.
+  app.get("/api/hub/jobs", async (_req, res) => {
+    const command = process.env.LAVISH_JOBS_COMMAND;
+    if (!command) return res.json({ jobs: [], configured: false });
+    const child = spawn("bash", ["-c", command], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    child.stdout.on("data", (chunk) => {
+      if (out.length < 2_000_000) out += chunk;
+    });
+    child.on("close", () => {
+      clearTimeout(timer);
+      try {
+        const data = JSON.parse(out);
+        res.json({ configured: true, ...data });
+      } catch {
+        res.status(502).json({ configured: true, jobs: [], error: "Jobs feed returned no data" });
+      }
+    });
+  });
+
   app.get("/api/hub", async (req, res, next) => {
     try {
       // `?peers=0` is what a peer hub asks for: this server's own boards only, so hubs that list
