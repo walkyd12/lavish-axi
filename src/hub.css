@@ -1252,3 +1252,5 @@ li.board:has(a.act.primary[href]) {
   font-weight: 600;
   font-size: 0.9em;
 }
+
+.note-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 2px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; background: var(--well, #f5f6f7); color: var(--ink, #17191c); border: 1px solid var(--line-strong, #cbd0d6); }

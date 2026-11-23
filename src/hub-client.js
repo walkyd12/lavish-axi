@@ -323,7 +323,7 @@ function actionsHtml(board) {
 function clientHtml(board) {
   const key = escapeHtml(board.key);
   if (editingClient === board.key) {
-    return `<form class="client-edit" data-client-key="${key}"><label>Client<input name="client" aria-label="Client for ${escapeHtml(board.title)}" value="${escapeHtml(clientDraft)}" maxlength="64" list="clientSuggestions" autocomplete="off"${savingClient ? " disabled" : ""}></label><button type="submit"${savingClient ? " disabled" : ""}>${savingClient ? "Saving…" : "Save"}</button><button type="button" data-client-cancel${savingClient ? " disabled" : ""}>Cancel</button></form>`;
+    return `<form class="client-edit" data-client-key="${key}"><label>Client<input name="client" aria-label="Client for ${escapeHtml(board.title)}" value="${escapeHtml(clientDraft)}" placeholder="${escapeHtml(board.client || "Pick or type a client")}" maxlength="64" list="clientSuggestions" autocomplete="off"${savingClient ? " disabled" : ""}></label><button type="submit"${savingClient ? " disabled" : ""}>${savingClient ? "Saving…" : "Save"}</button><button type="button" data-client-cancel${savingClient ? " disabled" : ""}>Cancel</button></form>`;
   }
   return `<button type="button" class="client-chip" data-client-edit="${key}" aria-label="Edit client for ${escapeHtml(board.title)}">${escapeHtml(board.client || "No client")}</button>`;
 }
@@ -336,14 +336,28 @@ function waitingOn(board) {
 }
 
 // Tagged people are always visible on the card (Zach 2026-11-22), not only through the People filter.
+// Gibson 2026-11-23: a custom tag ("Response needs review before sending") says what's needed,
+// so it shows on the card next to the @names instead of only inside Edit tags.
+const SYSTEM_TAGS = new Set(["needs-input", "needs input", "board", "fusion-hub", "working", "done"]);
+function customTags(board) {
+  const people = new Set((serverPeople || []).map((name) => String(name).toLowerCase()));
+  const client = String(board.client || "").toLowerCase();
+  return (board.tags || []).filter((tag) => {
+    const low = String(tag).trim().toLowerCase();
+    return low && !people.has(low) && !SYSTEM_TAGS.has(low) && low !== client && !low.includes(":");
+  });
+}
+
 function taggedHtml(board) {
   const names = waitingOn(board);
-  if (!names) return "";
-  const chips = names
-    .split(", ")
+  const custom = customTags(board);
+  if (!names && !custom.length) return "";
+  const chips = (names ? names.split(", ") : [])
     .map((name) => `<span class="person-chip">@${escapeHtml(name)}</span>`)
     .join("");
-  return `<p class="tagged-people"><span class="tagged-label">${isNeedsInput(board) ? "Waiting on" : "Tagged"}</span>${chips}</p>`;
+  const notes = custom.map((tag) => `<span class="note-chip">${escapeHtml(tag)}</span>`).join("");
+  const label = names ? (isNeedsInput(board) ? "Waiting on" : "Tagged") : "Tags";
+  return `<p class="tagged-people"><span class="tagged-label">${label}</span>${chips}${notes}</p>`;
 }
 
 function boardHtml(board) {
@@ -1371,7 +1385,7 @@ document.addEventListener("click", async (event) => {
   editingClient = board.key;
   clientEditOrigin = board.peer_origin || "";
   clientEditIsPeer = Boolean(board.source);
-  clientDraft = board.client || "";
+  clientDraft = "";  // empty so the browser's list shows every client, not just matches for the current one
   render();
   const input = /** @type {HTMLInputElement | null} */ (document.querySelector(".client-edit input"));
   input?.focus();
@@ -1399,6 +1413,12 @@ document.addEventListener("submit", async (event) => {
     editingClient = "";
     render();
     showNote("This board is no longer in this view. Refresh to edit it.", "error");
+    return;
+  }
+  if (!clientDraft.trim()) {
+    // Opened empty to show the full list: leaving it blank keeps the current client.
+    editingClient = "";
+    render();
     return;
   }
   savingClient = true;
