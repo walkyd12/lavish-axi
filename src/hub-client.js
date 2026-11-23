@@ -1251,14 +1251,29 @@ function jobClock(stamp) {
 
 /** @param {any} job */
 function jobCard(job) {
-  const chips = [job.client, job.project, job.model, job.stage].filter(Boolean)
-    .map((chip) => `<span class="chip">${escapeHtml(String(chip))}</span>`).join(" ");
-  const steps = (Array.isArray(job.steps) ? job.steps : []).slice(0, 5).map((step) =>
-    `<li><span class="meta">${escapeHtml(jobClock(step.started))}</span> ${escapeHtml(String(step.state || ""))}` +
-    `${step.agent ? ` <span class="meta">· ${escapeHtml(String(step.agent))}</span>` : ""}</li>`).join("");
-  return `<li class="board job"><div class="board-head"><strong>${escapeHtml(String(job.title || job.job || "Job"))}</strong>` +
-    ` <span class="meta">running ${escapeHtml(jobAge(job.started))}</span></div><div>${chips}</div>` +
-    `<ol class="job-steps">${steps}</ol></li>`;
+  // One compact row per job; click it to see the detail (50 running jobs stay scannable).
+  const meta = [job.client, job.stage, job.model].filter(Boolean).map((v) => escapeHtml(String(v))).join(" · ");
+  const steps = (Array.isArray(job.steps) ? job.steps : []).slice(0, 10).map((step) => {
+    const took = step.finished ? jobAge2(step.started, step.finished) : "";
+    return `<tr><td>${escapeHtml(jobClock(step.started))}</td><td>${escapeHtml(String(step.state || ""))}` +
+      `${step.exit_code !== null && step.exit_code !== undefined && step.exit_code !== 0 ? ` (exit ${escapeHtml(String(step.exit_code))})` : ""}` +
+      `${took ? `<br><span class="meta">${escapeHtml(took)}</span>` : ""}</td>` +
+      `<td>${escapeHtml(String(step.what || ""))}${step.output ? `<br><span class="meta">${escapeHtml(String(step.output))}</span>` : ""}` +
+      `${step.agent ? `<br><span class="meta">${escapeHtml(String(step.agent))}</span>` : ""}</td></tr>`;
+  }).join("");
+  return `<li class="job-row"><details><summary><span class="job-title">${escapeHtml(String(job.title || job.job || "Job"))}</span>` +
+    `<span class="meta job-meta">${meta}</span><span class="meta job-age">${escapeHtml(jobAge(job.started))}</span></summary>` +
+    `<div class="job-detail"><p class="meta">${escapeHtml(String(job.job || ""))}${job.project ? ` · ${escapeHtml(String(job.project))}` : ""}</p>` +
+    `<table class="job-steps"><thead><tr><th>Time</th><th>Result</th><th>Step</th></tr></thead><tbody>${steps}</tbody></table></div></details></li>`;
+}
+
+/** @param {string} a @param {string} b */
+function jobAge2(a, b) {
+  const x = Date.parse(String(a).replace(" ", "T") + "Z");
+  const y = Date.parse(String(b).replace(" ", "T") + "Z");
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return "";
+  const sec = Math.max(0, Math.round((y - x) / 1000));
+  return sec < 90 ? `${sec}s` : `${Math.round(sec / 60)} min`;
 }
 
 async function loadJobs() {
@@ -1269,7 +1284,12 @@ async function loadJobs() {
     const data = await response.json();
     const jobs = Array.isArray(data.jobs) ? data.jobs : [];
     if (countJobs) countJobs.textContent = jobs.length ? String(jobs.length) : "";
+    const open = new Set(Array.from(jobsList.querySelectorAll("details[open]")).map((d) => d.dataset.job));
     jobsList.innerHTML = jobs.map(jobCard).join("");
+    jobsList.querySelectorAll("details").forEach((d, i) => {
+      d.dataset.job = String(jobs[i]?.job || i);
+      if (open.has(d.dataset.job)) d.open = true;
+    });
     jobsNote.textContent = data.configured === false ? "No jobs feed is configured on this hub."
       : data.error ? String(data.error)
       : jobs.length ? `Updated ${new Date().toLocaleTimeString()}` : "Nothing running right now.";
