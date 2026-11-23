@@ -1449,3 +1449,24 @@ document.addEventListener("click", (event) => {
   const open = /** @type {HTMLAnchorElement | null} */ (card.querySelector("a.act.primary[href]"));
   if (open) location.href = open.href;
 });
+
+// Per-viewer dark/light toggle (remembered in this browser only; the hub's configured theme stays the default).
+const themeToggle = document.getElementById("themeToggle");
+function applyUserTheme(dark) {
+  if (dark) document.documentElement.dataset.userTheme = "dark";
+  else delete document.documentElement.dataset.userTheme;
+  if (themeToggle) {
+    themeToggle.setAttribute("aria-pressed", dark ? "true" : "false");
+    themeToggle.textContent = dark ? "Light" : "Dark";
+  }
+}
+applyUserTheme(document.documentElement.dataset.userTheme === "dark");
+themeToggle?.addEventListener("click", () => {
+  const dark = document.documentElement.dataset.userTheme !== "dark";
+  applyUserTheme(dark);
+  try {
+    localStorage.setItem("lavish-hub-theme", dark ? "dark" : "light");
+  } catch {
+    /* storage unavailable: the toggle still applies for this page */
+  }
+});

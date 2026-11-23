@@ -5,7 +5,7 @@
 
 import { serializeBoardMetadata, boardVersionBehind } from "./board-metadata.js";
 import { serializeOwnerStatus } from "./owner-status.js";
-import { hostThemeMarkup } from "./host-theme.js";
+import { hostThemeCss, hostThemeMarkup } from "./host-theme.js";
 
 /**
  * @typedef {{ listener?: string | null, tabs?: number, fileExists?: boolean, title?: string, nextStep?: string, revisionLabel?: string, fileModifiedAt?: string, searchText?: string, includeSearchText?: boolean, version?: string, now?: number }} HubFacts
@@ -369,9 +369,11 @@ ${theme === "minimal" ? '<link rel="preconnect" href="https://fonts.googleapis.c
 <link rel="stylesheet" href="/board-metadata.css">
 <link rel="stylesheet" href="/hub.css">
 ${themed.style}
+<style id="lavish-dark-toggle">${hostThemeCss("night", "hub", 'html[data-user-theme="dark"]')}</style>
+<script>try{if(localStorage.getItem("lavish-hub-theme")==="dark")document.documentElement.dataset.userTheme="dark"}catch(e){}</script>
 </head>
 <body>
-<header class="hero"><div class="wrap inner"><div class="topline">${title ? `<h1 class="mark">${escapeHtml(title)}</h1>` : markHtml(mark)}<button type="button" class="notify-toggle" id="settingsToggle" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="hubSettings">${GEAR_ICON}<span>Settings</span></button></div><p class="lede" id="hubLede" hidden>Open a board to review it or send a message.</p><span class="pill" id="hubPill" role="status" hidden></span></div></header>
+<header class="hero"><div class="wrap inner"><div class="topline">${title ? `<h1 class="mark">${escapeHtml(title)}</h1>` : markHtml(mark)}<button type="button" class="notify-toggle theme-toggle" id="themeToggle" aria-pressed="false" aria-label="Dark mode">Dark</button><button type="button" class="notify-toggle" id="settingsToggle" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="hubSettings">${GEAR_ICON}<span>Settings</span></button></div><p class="lede" id="hubLede" hidden>Open a board to review it or send a message.</p><span class="pill" id="hubPill" role="status" hidden></span></div></header>
 <div class="ctaband"><div class="wrap"><nav class="tabs" aria-label="Boards"><button type="button" class="tab" id="tabOpen" aria-pressed="true">Open <span id="countOpen">0</span></button><button type="button" class="tab" id="tabNeedsInput" aria-pressed="false">Needs you <span id="countNeedsInput">0</span></button><button type="button" class="tab" id="tabClosed" aria-pressed="false">Closed</button><button type="button" class="tab" id="tabCancelled" aria-pressed="false">Cancelled</button></nav></div></div>
 <main class="wrap">
 <div class="hub-search"><label>Search boards<input id="hubSearch" type="search" placeholder="Search titles, clients, tags or text" aria-describedby="searchHint"></label><label class="include-closed"><input id="includeClosed" type="checkbox">Also search closed &amp; cancelled</label></div>
