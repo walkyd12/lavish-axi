@@ -1226,7 +1226,80 @@ retry?.addEventListener("click", () => {
   return refresh({ resetLimit: true });
 });
 
+// Jobs tab: a read-only view of running agent jobs from the configured feed (/api/hub/jobs).
+const tabJobs = /** @type {HTMLButtonElement | null} */ (document.getElementById("tabJobs"));
+const jobsPanel = document.getElementById("jobsPanel");
+const jobsList = document.getElementById("jobsList");
+const jobsNote = document.getElementById("jobsNote");
+const countJobs = document.getElementById("countJobs");
+const hubMain = document.querySelector("main");
+
+/** @param {string | null | undefined} stamp */
+function jobAge(stamp) {
+  if (!stamp) return "";
+  const started = Date.parse(String(stamp).replace(" ", "T") + (/[zZ+]/.test(String(stamp)) ? "" : "Z"));
+  if (!Number.isFinite(started)) return "";
+  const minutes = Math.max(0, Math.round((Date.now() - started) / 60000));
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+/** @param {string | null | undefined} stamp */
+function jobClock(stamp) {
+  const at = Date.parse(String(stamp || "").replace(" ", "T") + (/[zZ+]/.test(String(stamp)) ? "" : "Z"));
+  return Number.isFinite(at) ? new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+}
+
+/** @param {any} job */
+function jobCard(job) {
+  const chips = [job.client, job.project, job.model, job.stage].filter(Boolean)
+    .map((chip) => `<span class="chip">${escapeHtml(String(chip))}</span>`).join(" ");
+  const steps = (Array.isArray(job.steps) ? job.steps : []).slice(0, 5).map((step) =>
+    `<li><span class="meta">${escapeHtml(jobClock(step.started))}</span> ${escapeHtml(String(step.state || ""))}` +
+    `${step.agent ? ` <span class="meta">· ${escapeHtml(String(step.agent))}</span>` : ""}</li>`).join("");
+  return `<li class="board job"><div class="board-head"><strong>${escapeHtml(String(job.title || job.job || "Job"))}</strong>` +
+    ` <span class="meta">running ${escapeHtml(jobAge(job.started))}</span></div><div>${chips}</div>` +
+    `<ol class="job-steps">${steps}</ol></li>`;
+}
+
+async function loadJobs() {
+  if (!jobsList || !jobsNote) return;
+  jobsNote.textContent = "Loading…";
+  try {
+    const response = await fetch("/api/hub/jobs", { cache: "no-store" });
+    const data = await response.json();
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    if (countJobs) countJobs.textContent = jobs.length ? String(jobs.length) : "";
+    jobsList.innerHTML = jobs.map(jobCard).join("");
+    jobsNote.textContent = data.configured === false ? "No jobs feed is configured on this hub."
+      : data.error ? String(data.error)
+      : jobs.length ? `Updated ${new Date().toLocaleTimeString()}` : "Nothing running right now.";
+  } catch {
+    jobsNote.textContent = "Could not load jobs.";
+  }
+}
+
+function showJobs(on) {
+  if (!jobsPanel || !hubMain) return;
+  jobsPanel.hidden = !on;
+  hubMain.classList.toggle("jobs-mode", on);
+  tabJobs?.setAttribute("aria-pressed", on ? "true" : "false");
+  if (on) {
+    for (const tab of [tabOpen, tabNeedsInput, tabClosed, tabCancelled]) tab?.setAttribute("aria-pressed", "false");
+    void loadJobs();
+  }
+}
+
+tabJobs?.addEventListener("click", () => showJobs(true));
+document.getElementById("jobsRefresh")?.addEventListener("click", () => void loadJobs());
+
 function switchTab(nextTab) {
+  if (hubMain?.classList.contains("jobs-mode")) {
+    showJobs(false);
+    if (showing === nextTab) {
+      render();
+      return;
+    }
+  }
   if (showing === nextTab && !search.value.trim() && !tagFilter.value && !includeClosed?.checked) return;
   clearTimeout(searchDebounceTimer);
   searchDebounceTimer = undefined;

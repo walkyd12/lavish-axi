@@ -1252,3 +1252,8 @@ li.board:has(a.act.primary[href]) {
   font-weight: 600;
   font-size: 0.9em;
 }
+
+/* Jobs tab: a separate read-only view; the board list hides while it is open. */
+main.jobs-mode > :not(#jobsPanel) { display: none; }
+#jobsPanel .job-steps { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
+#jobsPanel .job-steps li { margin: 2px 0; overflow-wrap: anywhere; }
