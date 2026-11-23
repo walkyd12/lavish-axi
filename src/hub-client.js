@@ -323,7 +323,9 @@ function actionsHtml(board) {
 function clientHtml(board) {
   const key = escapeHtml(board.key);
   if (editingClient === board.key) {
-    return `<form class="client-edit" data-client-key="${key}"><label>Client<input name="client" aria-label="Client for ${escapeHtml(board.title)}" value="${escapeHtml(clientDraft)}" maxlength="64" list="clientSuggestions" autocomplete="off"${savingClient ? " disabled" : ""}></label><button type="submit"${savingClient ? " disabled" : ""}>${savingClient ? "Saving…" : "Save"}</button><button type="button" data-client-cancel${savingClient ? " disabled" : ""}>Cancel</button></form>`;
+    const list = [...new Set([...(managedClients || serverClients || []), ...(board.client ? [board.client] : [])])];
+    const options = ['<option value="">No client</option>', ...list.map((name) => `<option value="${escapeHtml(name)}"${name === (clientDraft || board.client || "") ? " selected" : ""}>${escapeHtml(name)}</option>`)].join("");
+    return `<form class="client-edit" data-client-key="${key}"><label>Client<select name="client" aria-label="Client for ${escapeHtml(board.title)}"${savingClient ? " disabled" : ""}>${options}</select></label><button type="submit"${savingClient ? " disabled" : ""}>${savingClient ? "Saving…" : "Save"}</button><button type="button" data-client-cancel${savingClient ? " disabled" : ""}>Cancel</button></form>`;
   }
   return `<button type="button" class="client-chip" data-client-edit="${key}" aria-label="Edit client for ${escapeHtml(board.title)}">${escapeHtml(board.client || "No client")}</button>`;
 }
@@ -1039,16 +1041,74 @@ function setNotifyPanelOpen(open) {
 }
 settingsToggle?.addEventListener("click", () => setNotifyPanelOpen(true));
 settingsClose?.addEventListener("click", () => setNotifyPanelOpen(false));
-function switchSettingsPanel(peersOpen) {
-  const notifications = document.getElementById("notifyPanel");
-  const connections = document.getElementById("peerPanel");
-  if (notifications) notifications.hidden = peersOpen;
-  if (connections) connections.hidden = !peersOpen;
-  document.getElementById("settingsNotifications")?.setAttribute("aria-pressed", String(!peersOpen));
-  document.getElementById("settingsPeers")?.setAttribute("aria-pressed", String(peersOpen));
+function switchSettingsPanel(which) {
+  const panel = which === true ? "peers" : which === false ? "notifications" : which;
+  const map = { notifications: "notifyPanel", peers: "peerPanel", clients: "clientsPanel" };
+  for (const [name, id] of Object.entries(map)) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = name !== panel;
+  }
+  document.getElementById("settingsNotifications")?.setAttribute("aria-pressed", String(panel === "notifications"));
+  document.getElementById("settingsPeers")?.setAttribute("aria-pressed", String(panel === "peers"));
+  document.getElementById("settingsClients")?.setAttribute("aria-pressed", String(panel === "clients"));
+  if (panel === "clients") void loadManagedClients();
 }
-document.getElementById("settingsNotifications")?.addEventListener("click", () => switchSettingsPanel(false));
-document.getElementById("settingsPeers")?.addEventListener("click", () => switchSettingsPanel(true));
+document.getElementById("settingsNotifications")?.addEventListener("click", () => switchSettingsPanel("notifications"));
+document.getElementById("settingsPeers")?.addEventListener("click", () => switchSettingsPanel("peers"));
+document.getElementById("settingsClients")?.addEventListener("click", () => switchSettingsPanel("clients"));
+
+// Managed client list (Settings > Clients); the board client picker offers exactly this list.
+let managedClients = null;
+async function loadManagedClients() {
+  try {
+    const response = await fetch("/api/hub/clients", { cache: "no-store" });
+    const data = await response.json();
+    managedClients = Array.isArray(data.clients) ? data.clients : [];
+  } catch {
+    managedClients = managedClients || [];
+  }
+  renderManagedClients();
+}
+function renderManagedClients() {
+  const rows = document.getElementById("clientRows");
+  if (!rows) return;
+  rows.innerHTML = (managedClients || [])
+    .map((name) => `<div class="client-row"><span>${escapeHtml(name)}</span><button type="button" class="act" data-client-remove="${escapeHtml(name)}">Remove</button></div>`)
+    .join("") || '<p class="meta">No clients yet.</p>';
+}
+async function changeManagedClients(body) {
+  const status = document.getElementById("clientStatus");
+  try {
+    const response = await fetch("/api/hub/clients", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Could not save");
+    managedClients = data.clients;
+    if (status) status.hidden = true;
+  } catch (error) {
+    if (status) {
+      status.hidden = false;
+      status.textContent = String(error instanceof Error ? error.message : error);
+    }
+  }
+  renderManagedClients();
+}
+document.getElementById("clientAddForm")?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const input = /** @type {HTMLInputElement | null} */ (document.getElementById("clientAddInput"));
+  const name = input?.value.trim();
+  if (!name) return;
+  if (input) input.value = "";
+  void changeManagedClients({ add: name });
+});
+document.addEventListener("click", (event) => {
+  const button = /** @type {HTMLElement | null} */ (/** @type {HTMLElement} */ (event.target).closest?.("[data-client-remove]"));
+  if (button) void changeManagedClients({ remove: button.dataset.clientRemove || "" });
+});
+void loadManagedClients();
 settings?.addEventListener("close", () => {
   settingsToggle?.setAttribute("aria-expanded", "false");
   settingsToggle?.focus();
@@ -1373,13 +1433,12 @@ document.addEventListener("click", async (event) => {
   clientEditIsPeer = Boolean(board.source);
   clientDraft = board.client || "";
   render();
-  const input = /** @type {HTMLInputElement | null} */ (document.querySelector(".client-edit input"));
+  const input = /** @type {HTMLSelectElement | null} */ (document.querySelector(".client-edit select"));
   input?.focus();
-  input?.select();
 });
 document.addEventListener("input", (event) => {
   const input = /** @type {HTMLInputElement} */ (event.target);
-  if (input.matches?.(".client-edit input")) clientDraft = input.value;
+  if (input.matches?.(".client-edit input, .client-edit select")) clientDraft = input.value;
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && editingClient && !savingClient) {

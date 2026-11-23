@@ -514,6 +514,25 @@ export async function serve({
   const notifySettingsStore = createNotifySettingsStore(path.dirname(stateFile), {
     seedPeople: String(env[NOTIFY_PEOPLE_ENV] ?? process.env[NOTIFY_PEOPLE_ENV] ?? ""),
   });
+  // Managed client list (Zach 2026-11-23): one editable list in Settings instead of
+  // "every client name ever typed on a board". Seeds once from existing board clients.
+  const clientsFile = path.join(path.dirname(stateFile), "hub-clients.json");
+  async function readManagedClients() {
+    try {
+      const data = JSON.parse(await readFile(clientsFile, "utf8"));
+      return Array.isArray(data.clients) ? data.clients.map(String) : null;
+    } catch {
+      return null;
+    }
+  }
+  async function writeManagedClients(clients) {
+    const unique = [...new Map(clients.map((c) => String(c).trim()).filter(Boolean).map((c) => [c.toLowerCase(), c])).values()]
+      .sort((a, b) => a.localeCompare(b));
+    const tmp = `${clientsFile}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify({ clients: unique }, null, 2));
+    await rename(tmp, clientsFile);
+    return unique;
+  }
   const events = new EventEmitter();
   const watchers = new Map();
   const activePolls = new Map();
@@ -1991,6 +2010,40 @@ export async function serve({
     } catch (error) {
       if (error instanceof NotifySettingsError) res.status(error.statusCode).json({ error: error.message });
       else next(error);
+    }
+  });
+
+  app.get("/api/hub/clients", async (_req, res, next) => {
+    try {
+      let clients = await readManagedClients();
+      if (!clients) {
+        const view = await queryHub({ peers: false });
+        clients = await writeManagedClients(view.clients || []);
+      }
+      res.json({ clients });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/hub/clients", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ error: "cross-origin client list write rejected" });
+        return;
+      }
+      const body = req.body && typeof req.body === "object" ? req.body : {};
+      let clients = (await readManagedClients()) || [];
+      const name = String(body.add ?? body.remove ?? "").trim().slice(0, 64);
+      if (!name) {
+        res.status(400).json({ error: "Name a client to add or remove" });
+        return;
+      }
+      if (Object.hasOwn(body, "add")) clients = [...clients, name];
+      else clients = clients.filter((c) => c.toLowerCase() !== name.toLowerCase());
+      res.json({ clients: await writeManagedClients(clients) });
+    } catch (error) {
+      next(error);
     }
   });
 
