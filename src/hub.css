@@ -1252,3 +1252,5 @@ li.board:has(a.act.primary[href]) {
   font-weight: 600;
   font-size: 0.9em;
 }
+
+.topline .theme-toggle { margin-left: auto; margin-right: 8px; }
